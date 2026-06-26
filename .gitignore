@@ -1,8 +1,6 @@
-<<<<<<< HEAD
-le-wm/
-models/
 __pycache__/
-=======
 data/**/*
 !data/**/.gitkeep
->>>>>>> origin/dev
+
+le-wm/
+models/
