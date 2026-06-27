@@ -1,2 +1,12 @@
 data/**/*
 !data/**/.gitkeep
+
+# training artifacts
+runs/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+wandb/
