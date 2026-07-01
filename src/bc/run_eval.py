@@ -1,5 +1,6 @@
 import os
 import sys
+import importlib
 import argparse
 import torch
 import numpy as np
@@ -7,7 +8,6 @@ import gymnasium as gym
 import torchvision.transforms as T
 from collections import deque
 from pathlib import Path
-import stable_worldmodel as swm
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,15 +16,18 @@ le_wm_path = os.getenv("LE_WM_PATH")
 if le_wm_path is None:
     raise ValueError("LE_WM_PATH environment variable not set")
 if le_wm_path not in sys.path:
-    sys.path.append(le_wm_path)
+    sys.path.insert(0, le_wm_path)
+swm = importlib.import_module("stable_worldmodel")
 # ------------------------------------------------------------------
 
+from src.bc.dataset import unnormalize_action
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 
 def load_stats(stats_path, device):
     stats = torch.load(stats_path, map_location=device)
-    # The PushTLeWMDataset only saves action statistics
-    return stats['action_min'].to(device), stats['action_max'].to(device)
+    stats['action_min'] = stats['action_min'].to(device)
+    stats['action_max'] = stats['action_max'].to(device)
+    return stats
 
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -45,15 +48,24 @@ def evaluate(args):
     resize = T.Resize((224, 224), antialias=True)
     
     # 3. Load Action Normalization Stats
-    a_min, a_max = load_stats(args.stats_path, device)
+    stats = load_stats(args.stats_path, device)
+    a_min = stats['action_min']
+    a_max = stats['action_max']
+    frame_stack = int(stats.get('frame_stack', args.frame_stack))
+    hidden_dim = int(stats.get('hidden_dim', args.hidden_dim))
+    latent_dim = int(stats.get('latent_dim', args.latent_dim))
+
+    if frame_stack != args.frame_stack:
+        print(f"Using frame_stack={frame_stack} from stats file instead of CLI value {args.frame_stack}.")
+    if hidden_dim != args.hidden_dim:
+        print(f"Using hidden_dim={hidden_dim} from stats file instead of CLI value {args.hidden_dim}.")
     
     # 4. Initialize Latent BC Policy
-    latent_dim = 192 # Must match the LeWM ViT-Tiny hidden size
     policy = LatentBCPolicy(
         latent_dim=latent_dim, 
-        frame_stack=args.frame_stack, 
+        frame_stack=frame_stack, 
         action_dim=2, 
-        hidden_dim=args.hidden_dim
+        hidden_dim=hidden_dim
     ).to(device)
     
     policy.load_state_dict(torch.load(args.checkpoint, map_location=device))
@@ -67,9 +79,10 @@ def evaluate(args):
         obs, info = env.reset()
         done = False
         step_count = 0
+        episode_return = 0.0
         
         # Deque to hold the temporal history of latents
-        latent_deque = deque(maxlen=args.frame_stack)
+        latent_deque = deque(maxlen=frame_stack)
         
         while not done and step_count < args.max_steps:
             # The env returns 'pixels' with shape (96, 96, 3). Convert to (1, 3, 224, 224)
@@ -86,7 +99,7 @@ def evaluate(args):
             
             # Initialization logic: if step 0, duplicate the first frame to fill the history
             if step_count == 0:
-                for _ in range(args.frame_stack):
+                for _ in range(frame_stack):
                     latent_deque.append(current_latent)
             else:
                 latent_deque.append(current_latent)
@@ -100,13 +113,12 @@ def evaluate(args):
                 norm_action = torch.clamp(norm_action, -1.0, 1.0).squeeze(0)
             
             # Un-normalize the action for the environment
-            """ raw_action = ((norm_action + 1) / 2) * (a_max - a_min) + a_min
+            raw_action = unnormalize_action(norm_action, a_min, a_max)
             action_array = raw_action.cpu().numpy()
-            action_array = np.clip(np.squeeze(action_array), env.action_space.low, env.action_space.high) """
-
-            action_array = norm_action.cpu().numpy()
+            action_array = np.clip(np.squeeze(action_array), env.action_space.low, env.action_space.high)
             
             obs, reward, terminated, truncated, info = env.step(action_array)
+            episode_return += float(reward)
             if args.render:
                 import cv2
                 # OpenCV expects BGR color format, so we reverse the RGB channels
@@ -116,7 +128,7 @@ def evaluate(args):
             done = terminated or truncated
             step_count += 1
                 
-        print(f"Episode {ep + 1} finished after {step_count} steps. Reward: {reward}")
+        print(f"Episode {ep + 1} finished after {step_count} steps. Return: {episode_return:.4f}")
         
     env.close()
 
@@ -131,6 +143,7 @@ if __name__ == "__main__":
     
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension of the BC MLP")
     parser.add_argument("--frame_stack", type=int, default=3, help="Number of frames to stack (must match training)")
+    parser.add_argument("--latent_dim", type=int, default=192, help="LeWM encoder hidden size")
 
     args = parser.parse_args()
     evaluate(args)

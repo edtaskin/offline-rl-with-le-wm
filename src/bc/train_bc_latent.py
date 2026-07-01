@@ -1,12 +1,12 @@
 import os
 import sys
+import importlib
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from pathlib import Path
 from src.bc.dataset import PushTLeWMDataset
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
-import stable_worldmodel as swm
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,15 +15,18 @@ le_wm_path = os.getenv("LE_WM_PATH")
 if le_wm_path is None:
     raise ValueError("LE_WM_PATH environment variable not set")
 if le_wm_path not in sys.path:
-    sys.path.append(le_wm_path)
+    sys.path.insert(0, le_wm_path)
+swm = importlib.import_module("stable_worldmodel")
 
 def train_latent_bc(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    os.makedirs(os.path.dirname(args.checkpoint_path), exist_ok=True)
+    checkpoint_dir = os.path.dirname(args.checkpoint_path)
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # 1. Load Dataset with 5-step history
-    dataset = PushTLeWMDataset(args.data_path, frame_stack=3)
+    # 1. Load Dataset with temporal frame history
+    dataset = PushTLeWMDataset(args.data_path, frame_stack=args.frame_stack)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     # 2. Load the Pre-Trained LeWM Encoder (Frozen)
@@ -52,7 +55,7 @@ def train_latent_bc(args):
     latent_dim = 192
     policy = LatentBCPolicy(
         latent_dim=latent_dim, 
-        frame_stack=3, # TODO Dynamic
+        frame_stack=args.frame_stack,
         action_dim=2, 
         hidden_dim=args.hidden_dim
     ).to(device)
@@ -67,13 +70,13 @@ def train_latent_bc(args):
         epoch_loss = 0.0
         
         for batch_obs_seq, batch_actions in dataloader:
-            batch_obs_seq = batch_obs_seq.to(device) # Shape: (Batch, 5, C, H, W)
+            batch_obs_seq = batch_obs_seq.to(device) # Shape: (Batch, FrameStack, C, H, W)
             batch_actions = batch_actions.to(device)
 
             with torch.no_grad():
-                # Reshape to treat frames as a larger batch: (Batch * 5, C, H, W)
+                # Reshape to treat frames as a larger batch: (Batch * FrameStack, C, H, W)
                 b, f, c, h, w = batch_obs_seq.shape
-                flat_obs = batch_obs_seq.view(b * f, c, h, w)
+                flat_obs = batch_obs_seq.reshape(b * f, c, h, w)
                 
                 # Extract the Hugging Face output object
                 encoder_outputs = lewm_encoder(flat_obs) 
@@ -82,7 +85,7 @@ def train_latent_bc(args):
                 # last_hidden_state shape: (Batch * 5, Sequence_Length, Hidden_Dim)
                 flat_latents = encoder_outputs.last_hidden_state[:, 0, :]
                 
-                # Reshape back to (Batch, 5, LatentDim)
+                # Reshape back to (Batch, FrameStack, LatentDim)
                 stacked_latents = flat_latents.reshape(b, f, latent_dim)
 
             # Predict action and calculate loss
@@ -104,7 +107,16 @@ def train_latent_bc(args):
             torch.save(policy.state_dict(), checkpoint_name)
 
     torch.save(policy.state_dict(), args.checkpoint_path)
-    torch.save(dataset.stats, args.checkpoint_path.replace('.pth', '_stats.pth'))
+    torch.save(
+        {
+            **dataset.stats,
+            'frame_stack': args.frame_stack,
+            'hidden_dim': args.hidden_dim,
+            'latent_dim': latent_dim,
+            'action_dim': 2,
+        },
+        args.checkpoint_path.replace('.pth', '_stats.pth')
+    )
     print(f"Latent BC Training Complete! Saved to: {args.checkpoint_path}")
 
 if __name__ == "__main__":
