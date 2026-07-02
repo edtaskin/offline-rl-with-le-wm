@@ -21,6 +21,7 @@ swm = importlib.import_module("stable_worldmodel")
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 from src.envs import make_pusht_env
 
+
 def load_stats(stats_path, device):
     stats = torch.load(stats_path, map_location=device)
     if 'action_min' in stats:
@@ -28,6 +29,25 @@ def load_stats(stats_path, device):
     if 'action_max' in stats:
         stats['action_max'] = stats['action_max'].to(device)
     return stats
+
+
+def temporal_ensemble_action(action_predictions, decay):
+    """Average overlapping predictions for one target timestep."""
+    if not action_predictions:
+        raise ValueError("temporal ensemble needs at least one action prediction")
+    stacked_actions = torch.stack(list(action_predictions), dim=0)
+    if decay == 0.0 or len(action_predictions) == 1:
+        return stacked_actions.mean(dim=0)
+
+    prediction_age = torch.arange(
+        len(action_predictions),
+        dtype=stacked_actions.dtype,
+        device=stacked_actions.device,
+    )
+    weights = torch.exp(-decay * prediction_age)
+    weights = weights / weights.sum()
+    return (stacked_actions * weights[:, None]).sum(dim=0)
+
 
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,6 +91,8 @@ def evaluate(args):
         raise ValueError("frame_stride must be at least 1")
     if action_chunk_size < 1:
         raise ValueError("action_chunk_size must be at least 1")
+    if args.temporal_ensemble_decay < 0.0:
+        raise ValueError("temporal_ensemble_decay must be non-negative")
 
     if frame_stack != args.frame_stack:
         print(f"Using frame_stack={frame_stack} from stats file instead of CLI value {args.frame_stack}.")
@@ -114,6 +136,17 @@ def evaluate(args):
     # 5. Initialize PushT Environment. SWM PushT already consumes relative
     # [-1, 1] actions, so the clamped policy output is passed through directly.
     env = make_pusht_env()
+
+    use_temporal_ensemble = args.temporal_ensemble and action_chunk_size > 1
+    if args.temporal_ensemble and action_chunk_size == 1:
+        print("Temporal ensembling requested, but action_chunk_size=1; using one-step evaluation.")
+    if use_temporal_ensemble:
+        print(
+            "Using ACT-style temporal ensembling: querying every step, "
+            f"decay={args.temporal_ensemble_decay:.4f}."
+        )
+    else:
+        print("Using open-loop action chunk execution.")
     
     for ep in range(args.episodes):
         print(f"--- Starting Episode {ep + 1}/{args.episodes} ---")
@@ -127,6 +160,7 @@ def evaluate(args):
         max_history_len = (frame_stack - 1) * frame_stride + 1
         latent_history = deque(maxlen=max_history_len)
         latent_history.append(encode_observation(obs))
+        action_buffers = [deque() for _ in range(args.max_steps + action_chunk_size)]
 
         def build_stacked_latents():
             history = list(latent_history)
@@ -136,7 +170,40 @@ def evaluate(args):
                 history_idx = len(history) - 1 - offset * frame_stride
                 selected.append(history[history_idx] if history_idx >= 0 else oldest_latent)
             return torch.stack(selected, dim=1)
-        
+
+        if use_temporal_ensemble:
+            while not done and step_count < args.max_steps:
+                stacked_latents = build_stacked_latents()
+
+                with torch.no_grad():
+                    norm_action_chunk = policy(stacked_latents)
+                    norm_action_chunk = torch.clamp(norm_action_chunk, -1.0, 1.0).squeeze(0).cpu()
+
+                for offset, predicted_action in enumerate(norm_action_chunk):
+                    action_buffers[step_count + offset].append(predicted_action)
+
+                action_tensor = temporal_ensemble_action(
+                    action_buffers[step_count],
+                    args.temporal_ensemble_decay,
+                )
+                action_array = torch.clamp(action_tensor, -1.0, 1.0).numpy()
+                action_buffers[step_count].clear()
+
+                obs, reward, terminated, truncated, info = env.step(action_array)
+                episode_return += float(reward)
+                if args.render:
+                    import cv2
+                    # OpenCV expects BGR color format, so we reverse the RGB channels.
+                    cv2.imshow("PushT Latent BC Evaluation", obs[..., ::-1])
+                    cv2.waitKey(1)
+
+                done = terminated or truncated
+                step_count += 1
+                if not done and step_count < args.max_steps:
+                    latent_history.append(encode_observation(obs))
+            print(f"Episode {ep + 1} finished after {step_count} steps. Return: {episode_return:.4f}")
+            continue
+
         while not done and step_count < args.max_steps:
             # Stack the deque elements into a single tensor: (Batch, Frame_Stack, Latent_Dim) -> (1, F, 192)
             stacked_latents = build_stacked_latents()
@@ -181,6 +248,17 @@ if __name__ == "__main__":
     parser.add_argument("--latent_dim", type=int, default=192, help="LeWM encoder hidden size")
     parser.add_argument("--action_dim", type=int, default=2, help="Per-step PushT action dimension")
     parser.add_argument("--action_chunk_size", type=int, default=5, help="Number of future actions predicted from one observation")
+    parser.add_argument(
+        "--temporal_ensemble",
+        action="store_true",
+        help="Query every step and average overlapping predicted action chunks, following ACT inference.",
+    )
+    parser.add_argument(
+        "--temporal_ensemble_decay",
+        type=float,
+        default=0.01,
+        help="Exponential decay for temporal ensembling weights; 0.0 gives a uniform average.",
+    )
 
     args = parser.parse_args()
     evaluate(args)
