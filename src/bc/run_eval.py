@@ -2,6 +2,7 @@ import os
 import sys
 import importlib
 import argparse
+import statistics
 import torch
 import torchvision.transforms as T
 from collections import deque
@@ -20,6 +21,49 @@ swm = importlib.import_module("stable_worldmodel")
 
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 from src.envs import make_pusht_env
+
+
+def _json_safe(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _init_wandb(args, config):
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "wandb logging was requested with --wandb, but wandb is not installed. "
+            "Install requirements.txt or run without --wandb."
+        ) from exc
+
+    init_kwargs = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": args.wandb_run_name,
+        "group": args.wandb_group,
+        "tags": args.wandb_tags,
+        "config": _json_safe(config),
+    }
+    if args.wandb_mode is not None:
+        init_kwargs["mode"] = args.wandb_mode
+    return wandb.init(**init_kwargs)
+
+
+def _success_from_info(info):
+    for key in ("success", "is_success", "task_success"):
+        if key in info:
+            return float(info[key])
+    return None
 
 
 def load_stats(stats_path, device):
@@ -120,6 +164,24 @@ def evaluate(args):
             "WARNING: stats file does not declare action_space='swm_relative'. "
             "Old checkpoints trained on absolute pixel actions should be retrained."
         )
+
+    eval_config = {
+        **vars(args),
+        "device": str(device),
+        "checkpoint_contract": {
+            "frame_stack": frame_stack,
+            "frame_stride": frame_stride,
+            "hidden_dim": hidden_dim,
+            "latent_dim": latent_dim,
+            "action_dim": action_dim,
+            "action_chunk_size": action_chunk_size,
+            "action_space": action_space,
+        },
+    }
+    wandb_run = _init_wandb(args, eval_config)
+    if wandb_run is not None:
+        run_url = getattr(wandb_run, "url", None)
+        print(f"Logging evaluation to wandb: {run_url or 'enabled'}")
     
     # 4. Initialize Latent BC Policy
     policy = LatentBCPolicy(
@@ -148,6 +210,10 @@ def evaluate(args):
     else:
         print("Using open-loop action chunk execution.")
     
+    episode_returns = []
+    episode_lengths = []
+    episode_successes = []
+
     for ep in range(args.episodes):
         print(f"--- Starting Episode {ep + 1}/{args.episodes} ---")
         obs, info = env.reset()
@@ -202,6 +268,20 @@ def evaluate(args):
                 if not done and step_count < args.max_steps:
                     latent_history.append(encode_observation(obs))
             print(f"Episode {ep + 1} finished after {step_count} steps. Return: {episode_return:.4f}")
+            episode_returns.append(episode_return)
+            episode_lengths.append(step_count)
+            episode_success = _success_from_info(info)
+            if episode_success is not None:
+                episode_successes.append(episode_success)
+            if wandb_run is not None:
+                metrics = {
+                    "eval/episode_return": episode_return,
+                    "eval/episode_length": step_count,
+                    "eval/episode": ep + 1,
+                }
+                if episode_success is not None:
+                    metrics["eval/episode_success"] = episode_success
+                wandb_run.log(metrics, step=ep + 1)
             continue
 
         while not done and step_count < args.max_steps:
@@ -230,8 +310,51 @@ def evaluate(args):
                 latent_history.append(encode_observation(obs))
                 
         print(f"Episode {ep + 1} finished after {step_count} steps. Return: {episode_return:.4f}")
+        episode_returns.append(episode_return)
+        episode_lengths.append(step_count)
+        episode_success = _success_from_info(info)
+        if episode_success is not None:
+            episode_successes.append(episode_success)
+        if wandb_run is not None:
+            metrics = {
+                "eval/episode_return": episode_return,
+                "eval/episode_length": step_count,
+                "eval/episode": ep + 1,
+            }
+            if episode_success is not None:
+                metrics["eval/episode_success"] = episode_success
+            wandb_run.log(metrics, step=ep + 1)
         
     env.close()
+
+    if episode_returns:
+        summary = {
+            "eval/return_mean": statistics.fmean(episode_returns),
+            "eval/return_min": min(episode_returns),
+            "eval/return_max": max(episode_returns),
+            "eval/length_mean": statistics.fmean(episode_lengths),
+        }
+        if len(episode_returns) > 1:
+            summary["eval/return_std"] = statistics.pstdev(episode_returns)
+        else:
+            summary["eval/return_std"] = 0.0
+        if episode_successes:
+            summary["eval/success_rate"] = statistics.fmean(episode_successes)
+        print(
+            "Evaluation summary: "
+            f"return_mean={summary['eval/return_mean']:.4f}, "
+            f"return_std={summary['eval/return_std']:.4f}, "
+            f"length_mean={summary['eval/length_mean']:.2f}"
+        )
+        if "eval/success_rate" in summary:
+            print(f"Success rate: {summary['eval/success_rate']:.4f}")
+        if wandb_run is not None:
+            for key, value in summary.items():
+                wandb_run.summary[key] = value
+            wandb_run.log(summary, step=args.episodes)
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Latent BC Evaluation Script")
@@ -258,6 +381,19 @@ if __name__ == "__main__":
         type=float,
         default=0.01,
         help="Exponential decay for temporal ensembling weights; 0.0 gives a uniform average.",
+    )
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases evaluation tracking")
+    parser.add_argument("--wandb_project", type=str, default="offline-rl-lewm", help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity/team")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
+    parser.add_argument("--wandb_group", type=str, default="pusht-latent-bc-eval", help="Weights & Biases run group")
+    parser.add_argument("--wandb_tags", nargs="*", default=None, help="Optional Weights & Biases tags")
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default=None,
+        help="Weights & Biases mode; use offline on clusters without network access",
     )
 
     args = parser.parse_args()

@@ -1,6 +1,8 @@
 import os
 import sys
 import importlib
+import json
+from datetime import datetime, timezone
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -18,6 +20,87 @@ if le_wm_path not in sys.path:
     sys.path.insert(0, le_wm_path)
 swm = importlib.import_module("stable_worldmodel")
 
+
+def _json_safe(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _sidecar_path(checkpoint_path, suffix):
+    path = Path(checkpoint_path)
+    if path.suffix:
+        return str(path.with_name(f"{path.stem}{suffix}"))
+    return f"{checkpoint_path}{suffix}"
+
+
+def _write_run_config(args, dataset_stats=None, extra=None):
+    payload = {
+        "script": "src/bc/train_bc_latent.py",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "args": vars(args),
+    }
+    if dataset_stats is not None:
+        payload["dataset_stats"] = dataset_stats
+    if extra is not None:
+        payload.update(extra)
+
+    run_config_path = _sidecar_path(args.checkpoint_path, "_run_config.json")
+    run_config_dir = os.path.dirname(run_config_path)
+    if run_config_dir:
+        os.makedirs(run_config_dir, exist_ok=True)
+    with open(run_config_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload), f, indent=2, sort_keys=True)
+        f.write("\n")
+    return run_config_path
+
+
+def _init_wandb(args, config):
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "wandb logging was requested with --wandb, but wandb is not installed. "
+            "Install requirements.txt or run without --wandb."
+        ) from exc
+
+    init_kwargs = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": args.wandb_run_name,
+        "group": args.wandb_group,
+        "tags": args.wandb_tags,
+        "config": _json_safe(config),
+    }
+    if args.wandb_mode is not None:
+        init_kwargs["mode"] = args.wandb_mode
+    return wandb.init(**init_kwargs)
+
+
+def _log_wandb_artifact(run, artifact_name, artifact_type, file_paths, metadata=None):
+    if run is None:
+        return
+    import wandb
+
+    artifact = wandb.Artifact(
+        name=artifact_name,
+        type=artifact_type,
+        metadata=_json_safe(metadata or {}),
+    )
+    for file_path in file_paths:
+        if file_path and os.path.exists(file_path):
+            artifact.add_file(file_path)
+    run.log_artifact(artifact)
+
+
 def train_latent_bc(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -33,6 +116,40 @@ def train_latent_bc(args):
         action_chunk_size=args.action_chunk_size,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+
+    run_metadata = {
+        **dataset.stats,
+        'frame_stack': args.frame_stack,
+        'frame_stride': args.frame_stride,
+        'hidden_dim': args.hidden_dim,
+        'latent_dim': 192,
+        'action_dim': 2,
+        'action_chunk_size': args.action_chunk_size,
+    }
+    run_config_path = _write_run_config(
+        args,
+        dataset_stats=dataset.stats,
+        extra={
+            "device": str(device),
+            "dataset_size": len(dataset),
+            "num_batches_per_epoch": len(dataloader),
+            "status": "running",
+            "bc_contract": run_metadata,
+        },
+    )
+    wandb_run = _init_wandb(
+        args,
+        {
+            **vars(args),
+            "device": str(device),
+            "dataset_size": len(dataset),
+            "num_batches_per_epoch": len(dataloader),
+            "bc_contract": run_metadata,
+        },
+    )
+    if wandb_run is not None:
+        run_url = getattr(wandb_run, "url", None)
+        print(f"Logging run to wandb: {run_url or 'enabled'}")
 
     # 2. Load the Pre-Trained LeWM Encoder (Frozen)
     print("Loading official LeWM object checkpoint...")
@@ -72,6 +189,8 @@ def train_latent_bc(args):
     print("Starting Latent-Space Behavior Cloning training loop...")
 
     policy.train()
+    best_loss = float("inf")
+    best_epoch = None
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         
@@ -105,6 +224,19 @@ def train_latent_bc(args):
             epoch_loss += loss.item()
 
         avg_loss = epoch_loss / len(dataloader)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_epoch = epoch + 1
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "train/loss": avg_loss,
+                    "train/best_loss": best_loss,
+                    "train/epoch": epoch + 1,
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                },
+                step=epoch + 1,
+            )
         if (epoch + 1) % args.log_interval == 0 or epoch == 0:
             print(f"Epoch [{epoch+1}/{args.epochs}] - Average MSE Loss: {avg_loss:.6f}")
 
@@ -125,7 +257,47 @@ def train_latent_bc(args):
         },
         args.checkpoint_path.replace('.pth', '_stats.pth')
     )
+    stats_path = args.checkpoint_path.replace('.pth', '_stats.pth')
+    run_config_path = _write_run_config(
+        args,
+        dataset_stats=dataset.stats,
+        extra={
+            "device": str(device),
+            "dataset_size": len(dataset),
+            "num_batches_per_epoch": len(dataloader),
+            "status": "completed",
+            "bc_contract": run_metadata,
+            "final_checkpoint_path": args.checkpoint_path,
+            "stats_path": stats_path,
+            "run_config_path": run_config_path,
+            "final_train_loss": avg_loss,
+            "best_train_loss": best_loss,
+            "best_train_loss_epoch": best_epoch,
+            "wandb_run_id": getattr(wandb_run, "id", None) if wandb_run is not None else None,
+            "wandb_run_url": getattr(wandb_run, "url", None) if wandb_run is not None else None,
+        },
+    )
+    if wandb_run is not None:
+        wandb_run.summary["final_train_loss"] = avg_loss
+        wandb_run.summary["best_train_loss"] = best_loss
+        wandb_run.summary["best_train_loss_epoch"] = best_epoch
+        _log_wandb_artifact(
+            wandb_run,
+            artifact_name=f"latent-bc-policy-{getattr(wandb_run, 'id', 'local')}",
+            artifact_type="model",
+            file_paths=[args.checkpoint_path, stats_path, run_config_path],
+            metadata={
+                "checkpoint_path": args.checkpoint_path,
+                "stats_path": stats_path,
+                "run_config_path": run_config_path,
+                "best_train_loss": best_loss,
+                "best_train_loss_epoch": best_epoch,
+                "bc_contract": run_metadata,
+            },
+        )
+        wandb_run.finish()
     print(f"Latent BC Training Complete! Saved to: {args.checkpoint_path}")
+    print(f"Run config saved to: {run_config_path}")
 
 if __name__ == "__main__":
     import argparse
@@ -152,6 +324,19 @@ if __name__ == "__main__":
     # Logging and Saving Intervals
     parser.add_argument("--log_interval", type=int, default=10, help="Epochs to wait before logging loss metrics")
     parser.add_argument("--save_interval", type=int, default=10, help="Save policy checkpoint every N epochs")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases experiment tracking")
+    parser.add_argument("--wandb_project", type=str, default="offline-rl-lewm", help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity/team")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name")
+    parser.add_argument("--wandb_group", type=str, default="pusht-latent-bc", help="Weights & Biases run group")
+    parser.add_argument("--wandb_tags", nargs="*", default=None, help="Optional Weights & Biases tags")
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default=None,
+        help="Weights & Biases mode; use offline on clusters without network access",
+    )
 
     args = parser.parse_args()
     
