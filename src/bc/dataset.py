@@ -4,17 +4,17 @@ from torch.utils.data import Dataset
 import torchvision.transforms as T
 
 
-PUSHT_ACTION_LOW = torch.tensor([0.0, 0.0], dtype=torch.float32)
-PUSHT_ACTION_HIGH = torch.tensor([512.0, 512.0], dtype=torch.float32)
+PUSHT_ACTION_LOW = torch.tensor([-1.0, -1.0], dtype=torch.float32)
+PUSHT_ACTION_HIGH = torch.tensor([1.0, 1.0], dtype=torch.float32)
+PUSHT_ACTION_SCALE = 100.0
 
 
-def normalize_action(action, action_min=PUSHT_ACTION_LOW, action_max=PUSHT_ACTION_HIGH):
-    action_range = torch.clamp(action_max - action_min, min=1e-6)
-    return 2.0 * (action - action_min) / action_range - 1.0
-
-
-def unnormalize_action(norm_action, action_min=PUSHT_ACTION_LOW, action_max=PUSHT_ACTION_HIGH):
-    return 0.5 * (norm_action + 1.0) * (action_max - action_min) + action_min
+def absolute_to_relative_action(action, agent_position, action_scale=PUSHT_ACTION_SCALE):
+    """Convert absolute PushT target pixels to SWM PushT relative controls."""
+    relative_action = (action - agent_position) / action_scale
+    action_low = PUSHT_ACTION_LOW.to(relative_action.device)
+    action_high = PUSHT_ACTION_HIGH.to(relative_action.device)
+    return torch.clamp(relative_action, action_low, action_high)
 
 
 class PushTLeWMDataset(Dataset):
@@ -32,28 +32,38 @@ class PushTLeWMDataset(Dataset):
             
         self.images = torch.tensor(raw_images, dtype=torch.float32) / 255.0
         raw_actions = torch.tensor(data['actions'], dtype=torch.float32)
+        raw_states = torch.tensor(data['states'], dtype=torch.float32)
         
         self.episode_ends = data['episode_ends']
         self.frame_stack = frame_stack
 
         if len(self.images) != len(raw_actions):
             raise ValueError(f"images/actions length mismatch: {len(self.images)} vs {len(raw_actions)}")
+        if len(self.images) != len(raw_states):
+            raise ValueError(f"images/states length mismatch: {len(self.images)} vs {len(raw_states)}")
         if raw_actions.shape[-1] != 2:
             raise ValueError(f"expected 2D PushT actions, got shape {tuple(raw_actions.shape)}")
+        if raw_states.shape[-1] < 2:
+            raise ValueError(f"expected PushT states with agent x/y, got shape {tuple(raw_states.shape)}")
         if len(self.episode_ends) == 0 or int(self.episode_ends[-1]) != len(self.images):
             raise ValueError("episode_ends must be non-empty and end at the dataset length")
         
         # Resize to match what LeWM expects
         self.resize = T.Resize((224, 224), antialias=True)
 
-        # The PushT physics arena is strictly 512x512
         action_min = PUSHT_ACTION_LOW.clone()
         action_max = PUSHT_ACTION_HIGH.clone()
         
-        self.stats = {'action_min': action_min, 'action_max': action_max}
+        self.stats = {
+            'action_min': action_min,
+            'action_max': action_max,
+            'action_space': 'swm_relative',
+            'action_scale': PUSHT_ACTION_SCALE,
+        }
         
-        # Normalize expert actions to strictly map to [-1.0, 1.0] relative to the 512x512 box
-        self.actions = normalize_action(raw_actions, action_min, action_max)
+        # The diffusion-policy data stores absolute pixel targets. SWM PushT expects
+        # relative controls: env target = agent_xy + action * action_scale.
+        self.actions = absolute_to_relative_action(raw_actions, raw_states[:, :2])
 
         # Precompute episode boundaries for safe frame stacking
         self.ep_starts = np.zeros_like(self.episode_ends)

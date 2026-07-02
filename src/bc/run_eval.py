@@ -3,8 +3,6 @@ import sys
 import importlib
 import argparse
 import torch
-import numpy as np
-import gymnasium as gym
 import torchvision.transforms as T
 from collections import deque
 from pathlib import Path
@@ -20,13 +18,15 @@ if le_wm_path not in sys.path:
 swm = importlib.import_module("stable_worldmodel")
 # ------------------------------------------------------------------
 
-from src.bc.dataset import unnormalize_action
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
+from src.envs import make_pusht_env
 
 def load_stats(stats_path, device):
     stats = torch.load(stats_path, map_location=device)
-    stats['action_min'] = stats['action_min'].to(device)
-    stats['action_max'] = stats['action_max'].to(device)
+    if 'action_min' in stats:
+        stats['action_min'] = stats['action_min'].to(device)
+    if 'action_max' in stats:
+        stats['action_max'] = stats['action_max'].to(device)
     return stats
 
 def evaluate(args):
@@ -47,18 +47,22 @@ def evaluate(args):
     # 2. Setup Image Preprocessing (Resize to 224x224 to match ViT-Tiny)
     resize = T.Resize((224, 224), antialias=True)
     
-    # 3. Load Action Normalization Stats
+    # 3. Load training metadata
     stats = load_stats(args.stats_path, device)
-    a_min = stats['action_min']
-    a_max = stats['action_max']
     frame_stack = int(stats.get('frame_stack', args.frame_stack))
     hidden_dim = int(stats.get('hidden_dim', args.hidden_dim))
     latent_dim = int(stats.get('latent_dim', args.latent_dim))
+    action_space = stats.get('action_space')
 
     if frame_stack != args.frame_stack:
         print(f"Using frame_stack={frame_stack} from stats file instead of CLI value {args.frame_stack}.")
     if hidden_dim != args.hidden_dim:
         print(f"Using hidden_dim={hidden_dim} from stats file instead of CLI value {args.hidden_dim}.")
+    if action_space != 'swm_relative':
+        print(
+            "WARNING: stats file does not declare action_space='swm_relative'. "
+            "Old checkpoints trained on absolute pixel actions should be retrained."
+        )
     
     # 4. Initialize Latent BC Policy
     policy = LatentBCPolicy(
@@ -71,8 +75,9 @@ def evaluate(args):
     policy.load_state_dict(torch.load(args.checkpoint, map_location=device))
     policy.eval()
 
-    # 5. Initialize PushT Environment
-    env = gym.make("swm/PushT-v1", render_mode="rgb_array")
+    # 5. Initialize PushT Environment. SWM PushT already consumes relative
+    # [-1, 1] actions, so the clamped policy output is passed through directly.
+    env = make_pusht_env()
     
     for ep in range(args.episodes):
         print(f"--- Starting Episode {ep + 1}/{args.episodes} ---")
@@ -85,8 +90,8 @@ def evaluate(args):
         latent_deque = deque(maxlen=frame_stack)
         
         while not done and step_count < args.max_steps:
-            # The env returns 'pixels' with shape (96, 96, 3). Convert to (1, 3, 224, 224)
-            obs_pixels = env.render() 
+            # The wrapped env returns RGB pixels with shape (96, 96, 3).
+            obs_pixels = obs
             
             # 2. Convert to PyTorch tensor (H, W, C) -> (C, H, W)
             obs_tensor = torch.tensor(obs_pixels, dtype=torch.float32).permute(2, 0, 1) / 255.0
@@ -108,15 +113,11 @@ def evaluate(args):
             stacked_latents = torch.stack(list(latent_deque), dim=1)
             
             with torch.no_grad():
-                # Predict normalized action
+                # Predict SWM PushT relative action in [-1, 1].
                 norm_action = policy(stacked_latents)
                 norm_action = torch.clamp(norm_action, -1.0, 1.0).squeeze(0)
             
-            # Un-normalize the action for the environment
-            raw_action = unnormalize_action(norm_action, a_min, a_max)
-            action_array = raw_action.cpu().numpy()
-            action_array = np.clip(np.squeeze(action_array), env.action_space.low, env.action_space.high)
-            
+            action_array = norm_action.cpu().numpy()
             obs, reward, terminated, truncated, info = env.step(action_array)
             episode_return += float(reward)
             if args.render:
