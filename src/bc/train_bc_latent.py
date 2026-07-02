@@ -26,7 +26,11 @@ def train_latent_bc(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     # 1. Load Dataset with temporal frame history
-    dataset = PushTLeWMDataset(args.data_path, frame_stack=args.frame_stack)
+    dataset = PushTLeWMDataset(
+        args.data_path,
+        frame_stack=args.frame_stack,
+        action_chunk_size=args.action_chunk_size,
+    )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     # 2. Load the Pre-Trained LeWM Encoder (Frozen)
@@ -57,7 +61,8 @@ def train_latent_bc(args):
         latent_dim=latent_dim, 
         frame_stack=args.frame_stack,
         action_dim=2, 
-        hidden_dim=args.hidden_dim
+        hidden_dim=args.hidden_dim,
+        action_chunk_size=args.action_chunk_size,
     ).to(device)
     
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
@@ -88,9 +93,9 @@ def train_latent_bc(args):
                 # Reshape back to (Batch, FrameStack, LatentDim)
                 stacked_latents = flat_latents.reshape(b, f, latent_dim)
 
-            # Predict action and calculate loss
-            predicted_actions = policy(stacked_latents)
-            loss = criterion(predicted_actions, batch_actions)
+            # Predict a future action chunk and calculate loss
+            predicted_action_chunks = policy(stacked_latents)
+            loss = criterion(predicted_action_chunks, batch_actions)
 
             optimizer.zero_grad()
             loss.backward()
@@ -114,6 +119,7 @@ def train_latent_bc(args):
             'hidden_dim': args.hidden_dim,
             'latent_dim': latent_dim,
             'action_dim': 2,
+            'action_chunk_size': args.action_chunk_size,
         },
         args.checkpoint_path.replace('.pth', '_stats.pth')
     )
@@ -138,6 +144,7 @@ if __name__ == "__main__":
     # Architecture and Context
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension size of the BC MLP policy")
     parser.add_argument("--frame_stack", type=int, default=3, help="Number of LeWM latents to stack for temporal context")
+    parser.add_argument("--action_chunk_size", type=int, default=5, help="Number of future actions to predict from one observation")
     
     # Logging and Saving Intervals
     parser.add_argument("--log_interval", type=int, default=10, help="Epochs to wait before logging loss metrics")

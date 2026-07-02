@@ -46,18 +46,38 @@ def evaluate(args):
         
     # 2. Setup Image Preprocessing (Resize to 224x224 to match ViT-Tiny)
     resize = T.Resize((224, 224), antialias=True)
+
+    def encode_observation(obs_pixels):
+        # Convert to PyTorch tensor (H, W, C) -> (C, H, W)
+        obs_tensor = torch.tensor(obs_pixels, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        obs_tensor = resize(obs_tensor).unsqueeze(0).to(device)
+        with torch.no_grad():
+            encoder_outputs = lewm_encoder(obs_tensor)
+            return encoder_outputs.last_hidden_state[:, 0, :]
     
     # 3. Load training metadata
     stats = load_stats(args.stats_path, device)
     frame_stack = int(stats.get('frame_stack', args.frame_stack))
     hidden_dim = int(stats.get('hidden_dim', args.hidden_dim))
     latent_dim = int(stats.get('latent_dim', args.latent_dim))
+    action_dim = int(stats.get('action_dim', args.action_dim))
+    action_chunk_size = int(stats.get('action_chunk_size', 1))
     action_space = stats.get('action_space')
 
     if frame_stack != args.frame_stack:
         print(f"Using frame_stack={frame_stack} from stats file instead of CLI value {args.frame_stack}.")
     if hidden_dim != args.hidden_dim:
         print(f"Using hidden_dim={hidden_dim} from stats file instead of CLI value {args.hidden_dim}.")
+    if action_chunk_size != args.action_chunk_size:
+        print(
+            f"Using action_chunk_size={action_chunk_size} from stats file "
+            f"instead of CLI value {args.action_chunk_size}."
+        )
+    if 'action_chunk_size' not in stats:
+        print(
+            "WARNING: stats file does not declare action_chunk_size. "
+            "Assuming an old one-step BC checkpoint; retrain for 5-step chunking."
+        )
     if action_space != 'swm_relative':
         print(
             "WARNING: stats file does not declare action_space='swm_relative'. "
@@ -68,8 +88,9 @@ def evaluate(args):
     policy = LatentBCPolicy(
         latent_dim=latent_dim, 
         frame_stack=frame_stack, 
-        action_dim=2, 
-        hidden_dim=hidden_dim
+        action_dim=action_dim, 
+        hidden_dim=hidden_dim,
+        action_chunk_size=action_chunk_size,
     ).to(device)
     
     policy.load_state_dict(torch.load(args.checkpoint, map_location=device))
@@ -88,46 +109,34 @@ def evaluate(args):
         
         # Deque to hold the temporal history of latents
         latent_deque = deque(maxlen=frame_stack)
+        initial_latent = encode_observation(obs)
+        for _ in range(frame_stack):
+            latent_deque.append(initial_latent)
         
         while not done and step_count < args.max_steps:
-            # The wrapped env returns RGB pixels with shape (96, 96, 3).
-            obs_pixels = obs
-            
-            # 2. Convert to PyTorch tensor (H, W, C) -> (C, H, W)
-            obs_tensor = torch.tensor(obs_pixels, dtype=torch.float32).permute(2, 0, 1) / 255.0
-            obs_tensor = resize(obs_tensor).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                # Extract observation features and isolate the CLS token
-                encoder_outputs = lewm_encoder(obs_tensor)
-                current_latent = encoder_outputs.last_hidden_state[:, 0, :] # Shape: (1, 192)
-            
-            # Initialization logic: if step 0, duplicate the first frame to fill the history
-            if step_count == 0:
-                for _ in range(frame_stack):
-                    latent_deque.append(current_latent)
-            else:
-                latent_deque.append(current_latent)
-            
             # Stack the deque elements into a single tensor: (Batch, Frame_Stack, Latent_Dim) -> (1, F, 192)
             stacked_latents = torch.stack(list(latent_deque), dim=1)
             
             with torch.no_grad():
-                # Predict SWM PushT relative action in [-1, 1].
-                norm_action = policy(stacked_latents)
-                norm_action = torch.clamp(norm_action, -1.0, 1.0).squeeze(0)
+                # Predict an open-loop chunk of SWM PushT relative actions in [-1, 1].
+                norm_action_chunk = policy(stacked_latents)
+                norm_action_chunk = torch.clamp(norm_action_chunk, -1.0, 1.0).squeeze(0)
             
-            action_array = norm_action.cpu().numpy()
-            obs, reward, terminated, truncated, info = env.step(action_array)
-            episode_return += float(reward)
-            if args.render:
-                import cv2
-                # OpenCV expects BGR color format, so we reverse the RGB channels
-                cv2.imshow("PushT Latent BC Evaluation", obs_pixels[..., ::-1])
-                cv2.waitKey(1)
+            action_chunk = norm_action_chunk.cpu().numpy()
+            for action_array in action_chunk:
+                obs, reward, terminated, truncated, info = env.step(action_array)
+                episode_return += float(reward)
+                if args.render:
+                    import cv2
+                    # OpenCV expects BGR color format, so we reverse the RGB channels.
+                    cv2.imshow("PushT Latent BC Evaluation", obs[..., ::-1])
+                    cv2.waitKey(1)
 
-            done = terminated or truncated
-            step_count += 1
+                done = terminated or truncated
+                step_count += 1
+                if done or step_count >= args.max_steps:
+                    break
+                latent_deque.append(encode_observation(obs))
                 
         print(f"Episode {ep + 1} finished after {step_count} steps. Return: {episode_return:.4f}")
         
@@ -145,6 +154,8 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension of the BC MLP")
     parser.add_argument("--frame_stack", type=int, default=3, help="Number of frames to stack (must match training)")
     parser.add_argument("--latent_dim", type=int, default=192, help="LeWM encoder hidden size")
+    parser.add_argument("--action_dim", type=int, default=2, help="Per-step PushT action dimension")
+    parser.add_argument("--action_chunk_size", type=int, default=5, help="Number of future actions predicted from one observation")
 
     args = parser.parse_args()
     evaluate(args)

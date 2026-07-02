@@ -18,10 +18,12 @@ def absolute_to_relative_action(action, agent_position, action_scale=PUSHT_ACTIO
 
 
 class PushTLeWMDataset(Dataset):
-    def __init__(self, data_path, frame_stack=5):
+    def __init__(self, data_path, frame_stack=5, action_chunk_size=5):
         super().__init__()
         if frame_stack < 1:
             raise ValueError("frame_stack must be at least 1")
+        if action_chunk_size < 1:
+            raise ValueError("action_chunk_size must be at least 1")
 
         data = np.load(data_path, allow_pickle=True)
         
@@ -36,6 +38,7 @@ class PushTLeWMDataset(Dataset):
         
         self.episode_ends = data['episode_ends']
         self.frame_stack = frame_stack
+        self.action_chunk_size = action_chunk_size
 
         if len(self.images) != len(raw_actions):
             raise ValueError(f"images/actions length mismatch: {len(self.images)} vs {len(raw_actions)}")
@@ -59,6 +62,7 @@ class PushTLeWMDataset(Dataset):
             'action_max': action_max,
             'action_space': 'swm_relative',
             'action_scale': PUSHT_ACTION_SCALE,
+            'action_chunk_size': action_chunk_size,
         }
         
         # The diffusion-policy data stores absolute pixel targets. SWM PushT expects
@@ -87,7 +91,13 @@ class PushTLeWMDataset(Dataset):
         obs_seq = self.images[frame_indices]
         obs_seq = self.resize(obs_seq)
         
-        # Single target action
-        action = self.actions[idx]
+        # Future action chunk, padded at episode boundaries without crossing into
+        # the next demonstration.
+        action_indices = []
+        ep_end = self.episode_ends[ep_idx]
+        for offset in range(self.action_chunk_size):
+            action_idx = min(ep_end - 1, idx + offset)
+            action_indices.append(action_idx)
+        action_chunk = self.actions[action_indices]
         
-        return obs_seq, action
+        return obs_seq, action_chunk
