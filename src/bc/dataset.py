@@ -7,6 +7,10 @@ import torchvision.transforms as T
 PUSHT_ACTION_LOW = torch.tensor([-1.0, -1.0], dtype=torch.float32)
 PUSHT_ACTION_HIGH = torch.tensor([1.0, 1.0], dtype=torch.float32)
 PUSHT_ACTION_SCALE = 100.0
+LEWM_IMAGE_SIZE = (224, 224)
+LEWM_IMAGE_MEAN = [0.485, 0.456, 0.406]
+LEWM_IMAGE_STD = [0.229, 0.224, 0.225]
+LEWM_IMAGE_NORMALIZATION = "imagenet"
 
 
 def absolute_to_relative_action(action, agent_position, action_scale=PUSHT_ACTION_SCALE):
@@ -54,8 +58,13 @@ class PushTLeWMDataset(Dataset):
         if len(self.episode_ends) == 0 or int(self.episode_ends[-1]) != len(self.images):
             raise ValueError("episode_ends must be non-empty and end at the dataset length")
         
-        # Resize to match what LeWM expects
-        self.resize = T.Resize((224, 224), antialias=True)
+        # Match the preprocessing used by the official LeWM evaluation path.
+        self.image_transform = T.Compose(
+            [
+                T.Resize(LEWM_IMAGE_SIZE, antialias=True),
+                T.Normalize(mean=LEWM_IMAGE_MEAN, std=LEWM_IMAGE_STD),
+            ]
+        )
 
         action_min = PUSHT_ACTION_LOW.clone()
         action_max = PUSHT_ACTION_HIGH.clone()
@@ -67,6 +76,10 @@ class PushTLeWMDataset(Dataset):
             'action_scale': PUSHT_ACTION_SCALE,
             'frame_stride': frame_stride,
             'action_chunk_size': action_chunk_size,
+            'image_size': LEWM_IMAGE_SIZE,
+            'image_normalization': LEWM_IMAGE_NORMALIZATION,
+            'image_mean': LEWM_IMAGE_MEAN,
+            'image_std': LEWM_IMAGE_STD,
         }
         
         # The diffusion-policy data stores absolute pixel targets. SWM PushT expects
@@ -97,7 +110,7 @@ class PushTLeWMDataset(Dataset):
             
         # Extract and stack images: Shape (FrameStack, C, H, W)
         obs_seq = self.images[frame_indices]
-        obs_seq = self.resize(obs_seq)
+        obs_seq = self.image_transform(obs_seq)
         
         # Future action chunk, padded at episode boundaries without crossing into
         # the next demonstration.

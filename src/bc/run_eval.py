@@ -12,6 +12,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+repo_root = Path(__file__).resolve().parents[2]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
 le_wm_path = os.getenv("LE_WM_PATH")
 if le_wm_path is None:
     raise ValueError("LE_WM_PATH environment variable not set")
@@ -21,6 +25,12 @@ swm = importlib.import_module("stable_worldmodel")
 # ------------------------------------------------------------------
 
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
+from src.bc.dataset import (
+    LEWM_IMAGE_MEAN,
+    LEWM_IMAGE_NORMALIZATION,
+    LEWM_IMAGE_SIZE,
+    LEWM_IMAGE_STD,
+)
 from src.envs import make_pusht_env
 
 
@@ -167,13 +177,19 @@ def evaluate(args):
     for param in lewm_encoder.parameters():
         param.requires_grad = False
         
-    # 2. Setup Image Preprocessing (Resize to 224x224 to match ViT-Tiny)
-    resize = T.Resize((224, 224), antialias=True)
+    # 2. Setup image preprocessing. Whether ImageNet normalization is applied
+    # is decided from checkpoint metadata after stats are loaded below.
+    resize = T.Resize(LEWM_IMAGE_SIZE, antialias=True)
+    normalize = T.Normalize(mean=LEWM_IMAGE_MEAN, std=LEWM_IMAGE_STD)
+    use_imagenet_normalization = False
 
     def encode_observation(obs_pixels):
         # Convert to PyTorch tensor (H, W, C) -> (C, H, W)
         obs_tensor = torch.tensor(obs_pixels, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        obs_tensor = resize(obs_tensor).unsqueeze(0).to(device)
+        obs_tensor = resize(obs_tensor)
+        if use_imagenet_normalization:
+            obs_tensor = normalize(obs_tensor)
+        obs_tensor = obs_tensor.unsqueeze(0).to(device)
         with torch.no_grad():
             encoder_outputs = lewm_encoder(obs_tensor)
             return encoder_outputs.last_hidden_state[:, 0, :]
@@ -187,6 +203,8 @@ def evaluate(args):
     action_dim = int(stats.get('action_dim', args.action_dim))
     action_chunk_size = int(stats.get('action_chunk_size', 1))
     action_space = stats.get('action_space')
+    image_normalization = stats.get('image_normalization', 'legacy_div255')
+    use_imagenet_normalization = image_normalization == LEWM_IMAGE_NORMALIZATION
 
     if frame_stack < 1:
         raise ValueError("frame_stack must be at least 1")
@@ -223,6 +241,13 @@ def evaluate(args):
             "WARNING: stats file does not declare action_space='swm_relative'. "
             "Old checkpoints trained on absolute pixel actions should be retrained."
         )
+    if image_normalization != LEWM_IMAGE_NORMALIZATION:
+        print(
+            "WARNING: stats file does not declare image_normalization='imagenet'. "
+            "This checkpoint used legacy /255-only LeWM preprocessing, which made "
+            "the latent BC policy collapse to near-mean actions in diagnostics. "
+            "Retrain with the current dataset preprocessing."
+        )
 
     eval_config = {
         **vars(args),
@@ -235,6 +260,7 @@ def evaluate(args):
             "action_dim": action_dim,
             "action_chunk_size": action_chunk_size,
             "action_space": action_space,
+            "image_normalization": image_normalization,
         },
     }
     wandb_run = _init_wandb(args, eval_config)
