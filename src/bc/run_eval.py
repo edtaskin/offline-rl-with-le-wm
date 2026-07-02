@@ -5,6 +5,7 @@ import argparse
 import statistics
 import torch
 import torchvision.transforms as T
+import numpy as np
 from collections import deque
 from pathlib import Path
 from dotenv import load_dotenv
@@ -64,6 +65,64 @@ def _success_from_info(info):
         if key in info:
             return float(info[key])
     return None
+
+
+def save_evaluation_video(frames, video_path, fps=30):
+    """Save RGB evaluation frames to a video file."""
+    if video_path is None:
+        return None
+    if frames is None:
+        frames = []
+    elif isinstance(frames, np.ndarray):
+        frames = list(frames)
+    else:
+        frames = list(frames)
+    if len(frames) == 0:
+        print(f"No evaluation frames captured; skipping video save to {video_path}.")
+        return None
+    if fps <= 0:
+        raise ValueError("video fps must be positive")
+
+    output_path = Path(video_path)
+    if output_path.suffix == "":
+        output_path = output_path.with_suffix(".mp4")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def prepare_frame(frame, expected_shape=None):
+        frame = np.asarray(frame)
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(
+                "evaluation video frames must be RGB arrays with shape (height, width, 3)"
+            )
+        if expected_shape is not None and frame.shape[:2] != expected_shape:
+            raise ValueError("all evaluation video frames must have the same size")
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return frame
+
+    first_frame = prepare_frame(frames[0])
+    height, width = first_frame.shape[:2]
+
+    import cv2
+
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for {output_path}")
+
+    try:
+        writer.write(first_frame[..., ::-1])
+        for frame in frames[1:]:
+            writer.write(prepare_frame(frame, (height, width))[..., ::-1])
+    finally:
+        writer.release()
+
+    print(f"Saved evaluation video to: {output_path}")
+    return output_path
 
 
 def load_stats(stats_path, device):
@@ -213,10 +272,13 @@ def evaluate(args):
     episode_returns = []
     episode_lengths = []
     episode_successes = []
+    video_frames = [] if args.video_path is not None else None
 
     for ep in range(args.episodes):
         print(f"--- Starting Episode {ep + 1}/{args.episodes} ---")
         obs, info = env.reset()
+        if video_frames is not None:
+            video_frames.append(np.asarray(obs).copy())
         done = False
         step_count = 0
         episode_return = 0.0
@@ -257,6 +319,8 @@ def evaluate(args):
 
                 obs, reward, terminated, truncated, info = env.step(action_array)
                 episode_return += float(reward)
+                if video_frames is not None:
+                    video_frames.append(np.asarray(obs).copy())
                 if args.render:
                     import cv2
                     # OpenCV expects BGR color format, so we reverse the RGB channels.
@@ -297,6 +361,8 @@ def evaluate(args):
             for action_array in action_chunk:
                 obs, reward, terminated, truncated, info = env.step(action_array)
                 episode_return += float(reward)
+                if video_frames is not None:
+                    video_frames.append(np.asarray(obs).copy())
                 if args.render:
                     import cv2
                     # OpenCV expects BGR color format, so we reverse the RGB channels.
@@ -326,6 +392,7 @@ def evaluate(args):
             wandb_run.log(metrics, step=ep + 1)
         
     env.close()
+    save_evaluation_video(video_frames, args.video_path, args.video_fps)
 
     if episode_returns:
         summary = {
@@ -364,6 +431,8 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=10, help="Number of evaluation episodes")
     parser.add_argument("--max_steps", type=int, default=300, help="Maximum steps per episode")
     parser.add_argument("--render", action='store_true', help="Render the environment visually")
+    parser.add_argument("--video_path", type=str, default=None, help="Optional path to save evaluation video")
+    parser.add_argument("--video_fps", type=int, default=30, help="Frames per second for saved evaluation video")
     
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension of the BC MLP")
     parser.add_argument("--frame_stack", type=int, default=3, help="Number of frames to stack (must match training)")
