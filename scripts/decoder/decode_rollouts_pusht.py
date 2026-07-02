@@ -7,7 +7,8 @@ decodes each imagined latent to an RGB frame, and saves:
   * side-by-side videos of real future frames vs decoded imagined frames,
   * a grid at model steps 1..10, i.e. environment steps 5..50 by default.
 
-The default paths assume this script is run from the top-level wrapper repo.
+Relative paths are resolved from the top-level wrapper repo, regardless of the
+current working directory used to launch the script.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -27,11 +29,20 @@ import torch
 from PIL import Image, ImageDraw
 from torch import nn
 
-from train_latent_decoder_pusht import LatentImageDecoder
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.decoder.train_decoder_pusht import LatentImageDecoder
 
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+
+
+def repo_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else REPO_ROOT / path
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,7 +178,7 @@ def rollout_embeddings(
 def load_decoder(path: Path, device: torch.device) -> nn.Module:
     if not path.exists():
         raise FileNotFoundError(
-            f"Missing decoder checkpoint: {path}. Train one with train_latent_decoder_pusht.py first."
+            f"Missing decoder checkpoint: {path}. Train one with scripts/decoder/train_decoder_pusht.py first."
         )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     config = payload["config"]
@@ -279,19 +290,23 @@ def save_timestep_grid(
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
+    output_dir = repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=args.checkpoint_cache_dir)
+    dataset_path = repo_path(args.dataset_path)
+    checkpoint_cache_dir = repo_path(args.checkpoint_cache_dir)
+    decoder_checkpoint = repo_path(args.decoder_checkpoint)
+
+    model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=checkpoint_cache_dir)
     model = model.to(device).eval()
     model.requires_grad_(False)
     history_size = int(getattr(model.predictor, "num_frames", 3))
-    decoder = load_decoder(Path(args.decoder_checkpoint), device)
+    decoder = load_decoder(decoder_checkpoint, device)
     grid_env_steps = parse_grid_steps(args.grid_steps, args.frameskip, args.horizon)
 
     sampled: list[tuple[int, int]] = []
-    with h5py.File(args.dataset_path, "r") as h5:
+    with h5py.File(dataset_path, "r") as h5:
         action_mean, action_std = action_stats(h5)
         starts = sample_starts(
             h5=h5,

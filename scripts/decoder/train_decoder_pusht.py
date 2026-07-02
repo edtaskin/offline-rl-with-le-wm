@@ -30,6 +30,12 @@ from torchvision.utils import save_image
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def repo_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else REPO_ROOT / path
 
 
 @dataclass
@@ -380,8 +386,8 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    h5_path = Path(args.dataset_path)
-    output_dir = Path(args.output_dir)
+    h5_path = repo_path(args.dataset_path)
+    output_dir = repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
@@ -390,7 +396,8 @@ def main() -> None:
     with (output_dir / "rows.json").open("w") as f:
         json.dump({k: v.tolist() for k, v in rows.items()}, f)
 
-    lewm = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=args.checkpoint_cache_dir)
+    checkpoint_cache_dir = repo_path(args.checkpoint_cache_dir)
+    lewm = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=checkpoint_cache_dir)
     lewm = lewm.to(device).eval()
     lewm.requires_grad_(False)
 

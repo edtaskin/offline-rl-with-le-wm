@@ -30,6 +30,12 @@ from torch.utils.data import DataLoader, TensorDataset
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def repo_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else REPO_ROOT / path
 
 FEATURES = {
     "agent_pos": (0, 2),
@@ -98,7 +104,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def dataset_path(cache_dir: str | Path, dataset: str) -> Path:
-    return Path(cache_dir, "datasets", f"{dataset}.h5")
+    return repo_path(cache_dir) / "datasets" / f"{dataset}.h5"
 
 
 def split_episodes(num_episodes: int, cfg: SplitConfig) -> dict[str, np.ndarray]:
@@ -675,7 +681,7 @@ def train_all_probes(data: dict[str, dict[str, np.ndarray]], args: argparse.Name
         "probes": {},
     }
 
-    output_dir = Path(args.output_dir)
+    output_dir = repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "metrics.json"
     if results_path.exists() and "all" not in args.probes:
@@ -805,14 +811,16 @@ def main() -> None:
         raise FileNotFoundError(f"Dataset not found: {h5_path}")
 
     split_cfg = SplitConfig(seed=3072)
-    latent_cache = Path(args.latent_cache) if args.latent_cache else Path(args.output_dir, "latents.npz")
+    output_dir = repo_path(args.output_dir)
+    cache_dir = repo_path(args.cache_dir)
+    latent_cache = repo_path(args.latent_cache) if args.latent_cache else output_dir / "latents.npz"
 
     if latent_cache.exists() and not args.force_recache:
         data, metadata = load_latent_cache(latent_cache)
         print(f"loaded latent cache: {latent_cache}")
     else:
         rows = sample_rows(h5_path, args.max_samples, args.sample_block_size, split_cfg)
-        model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=args.cache_dir)
+        model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=cache_dir)
         data = encode_rows(
             model=model,
             h5_path=h5_path,
@@ -823,7 +831,7 @@ def main() -> None:
         metadata = {
             "dataset": args.dataset,
             "checkpoint": args.checkpoint,
-            "cache_dir": args.cache_dir,
+            "cache_dir": str(cache_dir),
             "max_samples": args.max_samples,
             "sample_block_size": args.sample_block_size,
             "split": asdict(split_cfg),
@@ -833,7 +841,7 @@ def main() -> None:
 
     results = train_all_probes(data, args)
     results["latent_cache_metadata"] = metadata
-    results_path = Path(args.output_dir, "metrics.json")
+    results_path = output_dir / "metrics.json"
     with results_path.open("w") as f:
         json.dump(results, f, indent=2)
     print(f"saved metrics: {results_path}")

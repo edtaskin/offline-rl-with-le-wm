@@ -6,8 +6,8 @@ For each sampled trajectory, this script:
   3. decodes each imagined latent with the saved linear probes,
   4. compares decoded physical quantities to ground-truth states over time.
 
-The default paths assume this script is run from the top-level wrapper repo:
-dataset/checkpoint under le-wm/models, probes under models/probes.
+Relative paths are resolved from the top-level wrapper repo: dataset/checkpoint
+under le-wm/models, probes under models/probes.
 """
 
 from __future__ import annotations
@@ -31,6 +31,14 @@ from einops import rearrange
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def repo_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
 REGRESSION_FEATURES = (
     "agent_pos",
     "block_pos",
@@ -582,12 +590,16 @@ def plot_latent_similarity(
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir or f"models/rollout_probe/pusht_lewm_200k_{args.probe_kind}")
+    output_dir = repo_path(args.output_dir or f"models/rollout_probe/pusht_lewm_200k_{args.probe_kind}")
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
-    probes, classifier_probes = load_probes(Path(args.probe_dir), args.probe_kind)
-    model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=args.checkpoint_cache_dir)
+    dataset_path = repo_path(args.dataset_path)
+    checkpoint_cache_dir = repo_path(args.checkpoint_cache_dir)
+    probe_dir = repo_path(args.probe_dir)
+
+    probes, classifier_probes = load_probes(probe_dir, args.probe_kind)
+    model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=checkpoint_cache_dir)
     model = model.to(device).eval()
     model.requires_grad_(False)
     history_size = int(getattr(model.predictor, "num_frames", 3))
@@ -597,7 +609,7 @@ def main() -> None:
     states = []
     sampled = []
 
-    with h5py.File(args.dataset_path, "r") as h5:
+    with h5py.File(dataset_path, "r") as h5:
         action_mean, action_std = action_stats(h5)
         starts = sample_starts(
             h5=h5,
