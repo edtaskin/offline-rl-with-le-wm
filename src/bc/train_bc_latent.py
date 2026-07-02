@@ -29,6 +29,7 @@ def train_latent_bc(args):
     dataset = PushTLeWMDataset(
         args.data_path,
         frame_stack=args.frame_stack,
+        frame_stride=args.frame_stride,
         action_chunk_size=args.action_chunk_size,
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
@@ -87,7 +88,7 @@ def train_latent_bc(args):
                 encoder_outputs = lewm_encoder(flat_obs) 
                 
                 # Extract the CLS token (the 0th token) from the last hidden state
-                # last_hidden_state shape: (Batch * 5, Sequence_Length, Hidden_Dim)
+                # last_hidden_state shape: (Batch * FrameStack, Sequence_Length, Hidden_Dim)
                 flat_latents = encoder_outputs.last_hidden_state[:, 0, :]
                 
                 # Reshape back to (Batch, FrameStack, LatentDim)
@@ -116,6 +117,7 @@ def train_latent_bc(args):
         {
             **dataset.stats,
             'frame_stack': args.frame_stack,
+            'frame_stride': args.frame_stride,
             'hidden_dim': args.hidden_dim,
             'latent_dim': latent_dim,
             'action_dim': 2,
@@ -144,6 +146,7 @@ if __name__ == "__main__":
     # Architecture and Context
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension size of the BC MLP policy")
     parser.add_argument("--frame_stack", type=int, default=3, help="Number of LeWM latents to stack for temporal context")
+    parser.add_argument("--frame_stride", type=int, default=5, help="Environment steps between stacked history frames")
     parser.add_argument("--action_chunk_size", type=int, default=5, help="Number of future actions to predict from one observation")
     
     # Logging and Saving Intervals

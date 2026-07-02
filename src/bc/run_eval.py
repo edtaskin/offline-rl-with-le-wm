@@ -58,14 +58,24 @@ def evaluate(args):
     # 3. Load training metadata
     stats = load_stats(args.stats_path, device)
     frame_stack = int(stats.get('frame_stack', args.frame_stack))
+    frame_stride = int(stats.get('frame_stride', args.frame_stride))
     hidden_dim = int(stats.get('hidden_dim', args.hidden_dim))
     latent_dim = int(stats.get('latent_dim', args.latent_dim))
     action_dim = int(stats.get('action_dim', args.action_dim))
     action_chunk_size = int(stats.get('action_chunk_size', 1))
     action_space = stats.get('action_space')
 
+    if frame_stack < 1:
+        raise ValueError("frame_stack must be at least 1")
+    if frame_stride < 1:
+        raise ValueError("frame_stride must be at least 1")
+    if action_chunk_size < 1:
+        raise ValueError("action_chunk_size must be at least 1")
+
     if frame_stack != args.frame_stack:
         print(f"Using frame_stack={frame_stack} from stats file instead of CLI value {args.frame_stack}.")
+    if frame_stride != args.frame_stride:
+        print(f"Using frame_stride={frame_stride} from stats file instead of CLI value {args.frame_stride}.")
     if hidden_dim != args.hidden_dim:
         print(f"Using hidden_dim={hidden_dim} from stats file instead of CLI value {args.hidden_dim}.")
     if action_chunk_size != args.action_chunk_size:
@@ -77,6 +87,11 @@ def evaluate(args):
         print(
             "WARNING: stats file does not declare action_chunk_size. "
             "Assuming an old one-step BC checkpoint; retrain for 5-step chunking."
+        )
+    if 'frame_stride' not in stats:
+        print(
+            "WARNING: stats file does not declare frame_stride. "
+            f"Using CLI/default value {frame_stride}."
         )
     if action_space != 'swm_relative':
         print(
@@ -107,15 +122,24 @@ def evaluate(args):
         step_count = 0
         episode_return = 0.0
         
-        # Deque to hold the temporal history of latents
-        latent_deque = deque(maxlen=frame_stack)
-        initial_latent = encode_observation(obs)
-        for _ in range(frame_stack):
-            latent_deque.append(initial_latent)
+        # Keep enough step-level latents to select a dilated history ending at
+        # the current observation.
+        max_history_len = (frame_stack - 1) * frame_stride + 1
+        latent_history = deque(maxlen=max_history_len)
+        latent_history.append(encode_observation(obs))
+
+        def build_stacked_latents():
+            history = list(latent_history)
+            oldest_latent = history[0]
+            selected = []
+            for offset in range(frame_stack - 1, -1, -1):
+                history_idx = len(history) - 1 - offset * frame_stride
+                selected.append(history[history_idx] if history_idx >= 0 else oldest_latent)
+            return torch.stack(selected, dim=1)
         
         while not done and step_count < args.max_steps:
             # Stack the deque elements into a single tensor: (Batch, Frame_Stack, Latent_Dim) -> (1, F, 192)
-            stacked_latents = torch.stack(list(latent_deque), dim=1)
+            stacked_latents = build_stacked_latents()
             
             with torch.no_grad():
                 # Predict an open-loop chunk of SWM PushT relative actions in [-1, 1].
@@ -136,7 +160,7 @@ def evaluate(args):
                 step_count += 1
                 if done or step_count >= args.max_steps:
                     break
-                latent_deque.append(encode_observation(obs))
+                latent_history.append(encode_observation(obs))
                 
         print(f"Episode {ep + 1} finished after {step_count} steps. Return: {episode_return:.4f}")
         
@@ -153,6 +177,7 @@ if __name__ == "__main__":
     
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension of the BC MLP")
     parser.add_argument("--frame_stack", type=int, default=3, help="Number of frames to stack (must match training)")
+    parser.add_argument("--frame_stride", type=int, default=1, help="Environment steps between stacked history frames")
     parser.add_argument("--latent_dim", type=int, default=192, help="LeWM encoder hidden size")
     parser.add_argument("--action_dim", type=int, default=2, help="Per-step PushT action dimension")
     parser.add_argument("--action_chunk_size", type=int, default=5, help="Number of future actions predicted from one observation")

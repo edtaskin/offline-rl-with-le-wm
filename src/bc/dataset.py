@@ -18,10 +18,12 @@ def absolute_to_relative_action(action, agent_position, action_scale=PUSHT_ACTIO
 
 
 class PushTLeWMDataset(Dataset):
-    def __init__(self, data_path, frame_stack=5, action_chunk_size=5):
+    def __init__(self, data_path, frame_stack=5, frame_stride=1, action_chunk_size=5):
         super().__init__()
         if frame_stack < 1:
             raise ValueError("frame_stack must be at least 1")
+        if frame_stride < 1:
+            raise ValueError("frame_stride must be at least 1")
         if action_chunk_size < 1:
             raise ValueError("action_chunk_size must be at least 1")
 
@@ -38,6 +40,7 @@ class PushTLeWMDataset(Dataset):
         
         self.episode_ends = data['episode_ends']
         self.frame_stack = frame_stack
+        self.frame_stride = frame_stride
         self.action_chunk_size = action_chunk_size
 
         if len(self.images) != len(raw_actions):
@@ -62,6 +65,7 @@ class PushTLeWMDataset(Dataset):
             'action_max': action_max,
             'action_space': 'swm_relative',
             'action_scale': PUSHT_ACTION_SCALE,
+            'frame_stride': frame_stride,
             'action_chunk_size': action_chunk_size,
         }
         
@@ -76,16 +80,20 @@ class PushTLeWMDataset(Dataset):
     def __len__(self):
         return len(self.images)
 
+    def _get_frame_indices(self, idx, ep_start):
+        frame_indices = []
+        for i in range(self.frame_stack - 1, -1, -1):
+            frame_idx = max(ep_start, idx - i * self.frame_stride)
+            frame_indices.append(frame_idx)
+        return frame_indices
+
     def __getitem__(self, idx):
         # Find which episode this index belongs to
         ep_idx = np.searchsorted(self.episode_ends, idx, side='right')
         ep_start = self.ep_starts[ep_idx]
         
-        # Build the frame history without crossing episode boundaries
-        frame_indices = []
-        for i in range(self.frame_stack - 1, -1, -1):
-            frame_idx = max(ep_start, idx - i)
-            frame_indices.append(frame_idx)
+        # Build the dilated frame history without crossing episode boundaries.
+        frame_indices = self._get_frame_indices(idx, ep_start)
             
         # Extract and stack images: Shape (FrameStack, C, H, W)
         obs_seq = self.images[frame_indices]
