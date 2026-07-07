@@ -2,7 +2,9 @@ import os
 import sys
 import importlib
 import argparse
+import math
 import statistics
+import tempfile
 import torch
 import torchvision.transforms as T
 import numpy as np
@@ -31,7 +33,7 @@ from src.bc.dataset import (
     LEWM_IMAGE_SIZE,
     LEWM_IMAGE_STD,
 )
-from src.envs import make_pusht_env
+from src.envs import PUSHT_FIXED_TARGET_POSE, make_pusht_env
 
 
 def _json_safe(value):
@@ -75,6 +77,13 @@ def _success_from_info(info):
         if key in info:
             return float(info[key])
     return None
+
+
+def _episode_success(info, episode_terminated):
+    info_success = _success_from_info(info)
+    if info_success is not None:
+        return info_success
+    return float(episode_terminated)
 
 
 def save_evaluation_video(frames, video_path, fps=30):
@@ -135,6 +144,83 @@ def save_evaluation_video(frames, video_path, fps=30):
     return output_path
 
 
+def _is_video_file_path(path):
+    return Path(path).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv"}
+
+
+def combine_world_panel_videos(video_dir, output_path, fps=None):
+    """Combine swm.World per-env panel videos into one grid video."""
+    import cv2
+
+    video_dir = Path(video_dir)
+    output_path = Path(output_path)
+    video_paths = sorted(
+        video_dir.glob("env_*.mp4"),
+        key=lambda path: int(path.stem.split("_")[-1]),
+    )
+    if not video_paths:
+        print(f"No swm.World env_*.mp4 videos found in {video_dir}; skipping combine.")
+        return None
+
+    captures = [cv2.VideoCapture(str(path)) for path in video_paths]
+    writer = None
+    try:
+        first_frames = []
+        for capture, path in zip(captures, video_paths):
+            ok, frame = capture.read()
+            if not ok:
+                raise RuntimeError(f"Could not read first frame from {path}")
+            first_frames.append(frame)
+
+        tile_h, tile_w = first_frames[0].shape[:2]
+        source_fps = captures[0].get(cv2.CAP_PROP_FPS) or 15.0
+        output_fps = float(fps or source_fps)
+        cols = math.ceil(math.sqrt(len(video_paths)))
+        rows = math.ceil(len(video_paths) / cols)
+        grid_w = cols * tile_w
+        grid_h = rows * tile_h
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            output_fps,
+            (grid_w, grid_h),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not open video writer for {output_path}")
+
+        last_frames = first_frames
+        while True:
+            canvas = np.full((grid_h, grid_w, 3), 250, dtype=np.uint8)
+            for idx, frame in enumerate(last_frames):
+                row, col = divmod(idx, cols)
+                y0, x0 = row * tile_h, col * tile_w
+                canvas[y0 : y0 + tile_h, x0 : x0 + tile_w] = frame
+            writer.write(canvas)
+
+            any_active = False
+            next_frames = []
+            for capture, last_frame in zip(captures, last_frames):
+                ok, frame = capture.read()
+                if ok:
+                    any_active = True
+                    next_frames.append(frame)
+                else:
+                    next_frames.append(last_frame)
+            if not any_active:
+                break
+            last_frames = next_frames
+    finally:
+        for capture in captures:
+            capture.release()
+        if writer is not None:
+            writer.release()
+
+    print(f"Saved combined swm.World video to: {output_path}")
+    return output_path
+
+
 def load_stats(stats_path, device):
     stats = torch.load(stats_path, map_location=device)
     if 'action_min' in stats:
@@ -142,6 +228,187 @@ def load_stats(stats_path, device):
     if 'action_max' in stats:
         stats['action_max'] = stats['action_max'].to(device)
     return stats
+
+
+def _to_swm_state(state):
+    state = np.asarray(state, dtype=np.float64)
+    if state.shape[0] >= 7:
+        return state[:7].copy()
+    if state.shape[0] == 5:
+        return np.concatenate([state, np.zeros(2, dtype=np.float64)])
+    raise ValueError(f"expected PushT state with 5 or 7 values, got shape {state.shape}")
+
+
+class PushTNPZWorldDataset:
+    """Minimal dataset adapter for swm.World.evaluate(dataset=...)."""
+
+    column_names = ("pixels", "state", "proprio", "action")
+
+    def __init__(self, data_path, image_size=LEWM_IMAGE_SIZE):
+        data = np.load(data_path, allow_pickle=True)
+        self.images = np.asarray(data["images"])
+        self.image_size = tuple(image_size)
+        self.states = np.stack([_to_swm_state(state) for state in data["states"]])
+        self.actions = np.asarray(data["actions"], dtype=np.float32)
+        self.episode_ends = np.asarray(data["episode_ends"], dtype=np.int64)
+        self.episode_starts = np.zeros_like(self.episode_ends)
+        self.episode_starts[1:] = self.episode_ends[:-1]
+
+        if self.images.shape[-1] != 3:
+            raise ValueError(f"expected images with last channel RGB, got {self.images.shape}")
+        if len(self.images) != len(self.states):
+            raise ValueError("images/states length mismatch")
+        if len(self.actions) != len(self.states):
+            raise ValueError("actions/states length mismatch")
+
+    def episode_length(self, episode_index):
+        return int(self.episode_ends[episode_index] - self.episode_starts[episode_index])
+
+    def _resize_images(self, images):
+        if images.shape[1:3] == self.image_size:
+            return images
+        import cv2
+
+        return np.stack(
+            [
+                cv2.resize(
+                    image,
+                    (self.image_size[1], self.image_size[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                for image in images
+            ],
+            axis=0,
+        )
+
+    def load_chunk(self, episode_indices, start_steps, end_steps):
+        chunks = []
+        for episode_index, start_step, end_step in zip(episode_indices, start_steps, end_steps):
+            abs_start = int(self.episode_starts[int(episode_index)] + int(start_step))
+            abs_end = int(self.episode_starts[int(episode_index)] + int(end_step))
+            states = self.states[abs_start:abs_end]
+            images = self._resize_images(self.images[abs_start:abs_end])
+            actions = self.actions[abs_start:abs_end]
+            proprio = np.concatenate([states[:, :2], states[:, -2:]], axis=-1)
+            chunks.append(
+                {
+                    "pixels": torch.as_tensor(images).permute(0, 3, 1, 2),
+                    "state": states.copy(),
+                    "proprio": proprio,
+                    "action": actions.copy(),
+                }
+            )
+        return chunks
+
+
+def _sample_world_eval_starts(dataset, num_episodes, goal_offset_steps, seed):
+    valid = []
+    for episode_index in range(len(dataset.episode_ends)):
+        max_start = dataset.episode_length(episode_index) - goal_offset_steps - 1
+        for start_step in range(max_start + 1):
+            valid.append((episode_index, start_step))
+    if not valid:
+        raise ValueError(
+            f"No valid dataset starts for goal_offset_steps={goal_offset_steps}."
+        )
+
+    rng = np.random.default_rng(seed)
+    replace = num_episodes > len(valid)
+    sampled = rng.choice(len(valid), size=num_episodes, replace=replace)
+    episode_indices, start_steps = zip(*(valid[int(idx)] for idx in sampled))
+    return list(episode_indices), list(start_steps)
+
+
+def _install_pusht_goal_pose_setter():
+    from stable_worldmodel.envs.pusht.env import PushT
+
+    def _set_goal_state_and_pose(self, goal_state):
+        goal_state = _to_swm_state(goal_state)
+        self._set_goal_state(goal_state)
+        self.goal_pose = goal_state[2:5].copy()
+
+    PushT._set_goal_state_and_pose = _set_goal_state_and_pose
+
+
+class LatentBCWorldPolicy:
+    def __init__(
+        self,
+        *,
+        encoder,
+        policy,
+        resize,
+        normalize,
+        use_imagenet_normalization,
+        frame_stack,
+        frame_stride,
+        action_chunk_size,
+        device,
+    ):
+        self.encoder = encoder
+        self.policy = policy
+        self.resize = resize
+        self.normalize = normalize
+        self.use_imagenet_normalization = use_imagenet_normalization
+        self.frame_stack = frame_stack
+        self.frame_stride = frame_stride
+        self.action_chunk_size = action_chunk_size
+        self.device = device
+        self.env = None
+        self.latent_histories = None
+        self.action_buffers = None
+
+    def set_env(self, env):
+        self.env = env
+        max_history_len = (self.frame_stack - 1) * self.frame_stride + 1
+        self.latent_histories = [
+            deque(maxlen=max_history_len) for _ in range(env.num_envs)
+        ]
+        self.action_buffers = [deque() for _ in range(env.num_envs)]
+
+    def _encode_pixels(self, pixels):
+        pixels = torch.as_tensor(pixels, dtype=torch.float32, device=self.device)
+        pixels = pixels.permute(0, 3, 1, 2) / 255.0
+        pixels = self.resize(pixels)
+        if self.use_imagenet_normalization:
+            pixels = self.normalize(pixels)
+        with torch.no_grad():
+            outputs = self.encoder(pixels)
+            return outputs.last_hidden_state[:, 0, :].detach().cpu()
+
+    def _stack_history(self, env_index):
+        history = list(self.latent_histories[env_index])
+        oldest_latent = history[0]
+        selected = []
+        for offset in range(self.frame_stack - 1, -1, -1):
+            history_idx = len(history) - 1 - offset * self.frame_stride
+            selected.append(history[history_idx] if history_idx >= 0 else oldest_latent)
+        return torch.stack(selected, dim=0).unsqueeze(0).to(self.device)
+
+    def get_action(self, info_dict, **kwargs):
+        if self.env is None:
+            raise RuntimeError("LatentBCWorldPolicy.set_env must be called before get_action")
+
+        needs_flush = info_dict.get("_needs_flush")
+        if needs_flush is not None:
+            needs_flush = np.asarray(needs_flush).reshape(-1)
+            for env_index, should_flush in enumerate(needs_flush):
+                if should_flush:
+                    self.latent_histories[env_index].clear()
+                    self.action_buffers[env_index].clear()
+
+        pixels = np.asarray(info_dict["pixels"])[:, -1]
+        latents = self._encode_pixels(pixels)
+        actions = []
+        for env_index in range(self.env.num_envs):
+            self.latent_histories[env_index].append(latents[env_index])
+            if not self.action_buffers[env_index]:
+                stacked_latents = self._stack_history(env_index)
+                with torch.no_grad():
+                    action_chunk = self.policy(stacked_latents).squeeze(0).cpu()
+                action_chunk = torch.clamp(action_chunk, -1.0, 1.0).numpy()
+                self.action_buffers[env_index].extend(action_chunk)
+            actions.append(self.action_buffers[env_index].popleft())
+        return np.asarray(actions, dtype=np.float32)
 
 
 def temporal_ensemble_action(action_predictions, decay):
@@ -165,6 +432,11 @@ def temporal_ensemble_action(action_predictions, decay):
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Evaluating on device: {device}")
+    np.random.seed(args.eval_seed)
+    torch.manual_seed(args.eval_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.eval_seed)
+    print(f"Using eval_seed={args.eval_seed}.")
     
     # 1. Load the Official LeWM Encoder
     print("Loading official LeWM object checkpoint...")
@@ -280,9 +552,129 @@ def evaluate(args):
     policy.load_state_dict(torch.load(args.checkpoint, map_location=device))
     policy.eval()
 
+    if args.swm_world_eval:
+        if args.fixed_target_eval:
+            print(
+                "WARNING: --fixed_target_eval is ignored with --swm_world_eval; "
+                "swm.World dataset eval defines its own start and goal states."
+            )
+        if args.temporal_ensemble:
+            print(
+                "WARNING: --temporal_ensemble is ignored by --swm_world_eval; "
+                "the World policy adapter uses open-loop action chunks."
+            )
+        _install_pusht_goal_pose_setter()
+        world_dataset = PushTNPZWorldDataset(args.eval_data_path)
+        episode_indices, start_steps = _sample_world_eval_starts(
+            world_dataset,
+            args.episodes,
+            args.goal_offset_steps,
+            args.eval_seed,
+        )
+        print(
+            "Using swm.World.evaluate(dataset=...) for PushT BC: "
+            f"episodes={args.episodes}, goal_offset_steps={args.goal_offset_steps}, "
+            f"eval_budget={args.lewm_eval_budget}, seed={args.eval_seed}."
+        )
+        print(f"Sampled dataset episode indices: {episode_indices}")
+        print(f"Sampled dataset start steps: {start_steps}")
+
+        combine_world_video = (
+            args.video_path is not None and _is_video_file_path(args.video_path)
+        )
+        with tempfile.TemporaryDirectory(prefix="pusht-world-video-") as tmp_video_dir:
+            world_video_path = tmp_video_dir if combine_world_video else args.video_path
+            if combine_world_video:
+                print(
+                    "Writing swm.World per-env panel videos to a temporary directory "
+                    f"before combining into {args.video_path}."
+                )
+
+            world = swm.World(
+                "swm/PushT-v1",
+                num_envs=args.episodes,
+                image_shape=LEWM_IMAGE_SIZE,
+                max_episode_steps=2 * args.lewm_eval_budget,
+            )
+            world_policy = LatentBCWorldPolicy(
+                encoder=lewm_encoder,
+                policy=policy,
+                resize=resize,
+                normalize=normalize,
+                use_imagenet_normalization=use_imagenet_normalization,
+                frame_stack=frame_stack,
+                frame_stride=frame_stride,
+                action_chunk_size=action_chunk_size,
+                device=device,
+            )
+            world.set_policy(world_policy)
+            try:
+                metrics = world.evaluate(
+                    dataset=world_dataset,
+                    episodes_idx=episode_indices,
+                    start_steps=start_steps,
+                    goal_offset=args.goal_offset_steps,
+                    eval_budget=args.lewm_eval_budget,
+                    callables=[
+                        {
+                            "method": "_set_state",
+                            "args": {"state": {"value": "state"}},
+                        },
+                        {
+                            "method": "_set_goal_state_and_pose",
+                            "args": {"goal_state": {"value": "goal_state"}},
+                        },
+                    ],
+                    video=world_video_path,
+                )
+            finally:
+                world.close()
+
+            if combine_world_video:
+                combine_world_panel_videos(
+                    world_video_path,
+                    args.video_path,
+                )
+
+        print(f"swm.World metrics: {metrics}")
+        world_success_rate = float(metrics.get("success_rate", 0.0))
+        normalized_world_success_rate = world_success_rate / 100.0
+        print(f"World success rate: {world_success_rate:.2f}%")
+        print(f"Success rate: {normalized_world_success_rate:.4f}")
+        if wandb_run is not None:
+            wandb_run.summary["eval/world_success_rate_percent"] = world_success_rate
+            wandb_run.summary["eval/success_rate"] = normalized_world_success_rate
+            wandb_run.summary["eval/world_episode_successes"] = _json_safe(
+                metrics.get("episode_successes")
+            )
+            wandb_run.log(
+                {
+                    "eval/world_success_rate_percent": world_success_rate,
+                    "eval/world_success_rate": normalized_world_success_rate,
+                    "eval/success_rate": normalized_world_success_rate,
+                },
+                step=args.episodes,
+            )
+            wandb_run.finish()
+        return
+
     # 5. Initialize PushT Environment. SWM PushT already consumes relative
     # [-1, 1] actions, so the clamped policy output is passed through directly.
-    env = make_pusht_env()
+    if args.fixed_target_eval:
+        success_mode = "block pose" if not args.fixed_target_full_state_success else "full state"
+        print(
+            "Using fixed-target PushT eval: "
+            f"target_pose={np.round(args.fixed_target_pose, 3).tolist()}, "
+            f"success_mode={success_mode}."
+        )
+    env = make_pusht_env(
+        align_sampled_goal_to_fixed_target=args.fixed_target_eval,
+        fixed_target_pose=args.fixed_target_pose,
+        fixed_target_block_success=not args.fixed_target_full_state_success,
+        fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
+    )
+    env.action_space.seed(args.eval_seed)
+    env.observation_space.seed(args.eval_seed)
 
     use_temporal_ensemble = args.temporal_ensemble and action_chunk_size > 1
     if args.temporal_ensemble and action_chunk_size == 1:
@@ -302,12 +694,13 @@ def evaluate(args):
 
     for ep in range(args.episodes):
         print(f"--- Starting Episode {ep + 1}/{args.episodes} ---")
-        obs, info = env.reset()
+        obs, info = env.reset(seed=args.eval_seed + ep)
         if video_frames is not None:
             video_frames.append(np.asarray(obs).copy())
         done = False
         step_count = 0
         episode_return = 0.0
+        episode_terminated = False
         
         # Keep enough step-level latents to select a dilated history ending at
         # the current observation.
@@ -345,6 +738,7 @@ def evaluate(args):
 
                 obs, reward, terminated, truncated, info = env.step(action_array)
                 episode_return += float(reward)
+                episode_terminated = episode_terminated or bool(terminated)
                 if video_frames is not None:
                     video_frames.append(np.asarray(obs).copy())
                 if args.render:
@@ -360,17 +754,15 @@ def evaluate(args):
             print(f"Episode {ep + 1} finished after {step_count} steps. Return: {episode_return:.4f}")
             episode_returns.append(episode_return)
             episode_lengths.append(step_count)
-            episode_success = _success_from_info(info)
-            if episode_success is not None:
-                episode_successes.append(episode_success)
+            episode_success = _episode_success(info, episode_terminated)
+            episode_successes.append(episode_success)
             if wandb_run is not None:
                 metrics = {
                     "eval/episode_return": episode_return,
                     "eval/episode_length": step_count,
                     "eval/episode": ep + 1,
+                    "eval/episode_success": episode_success,
                 }
-                if episode_success is not None:
-                    metrics["eval/episode_success"] = episode_success
                 wandb_run.log(metrics, step=ep + 1)
             continue
 
@@ -387,6 +779,7 @@ def evaluate(args):
             for action_array in action_chunk:
                 obs, reward, terminated, truncated, info = env.step(action_array)
                 episode_return += float(reward)
+                episode_terminated = episode_terminated or bool(terminated)
                 if video_frames is not None:
                     video_frames.append(np.asarray(obs).copy())
                 if args.render:
@@ -404,17 +797,15 @@ def evaluate(args):
         print(f"Episode {ep + 1} finished after {step_count} steps. Return: {episode_return:.4f}")
         episode_returns.append(episode_return)
         episode_lengths.append(step_count)
-        episode_success = _success_from_info(info)
-        if episode_success is not None:
-            episode_successes.append(episode_success)
+        episode_success = _episode_success(info, episode_terminated)
+        episode_successes.append(episode_success)
         if wandb_run is not None:
             metrics = {
                 "eval/episode_return": episode_return,
                 "eval/episode_length": step_count,
                 "eval/episode": ep + 1,
+                "eval/episode_success": episode_success,
             }
-            if episode_success is not None:
-                metrics["eval/episode_success"] = episode_success
             wandb_run.log(metrics, step=ep + 1)
         
     env.close()
@@ -459,6 +850,65 @@ if __name__ == "__main__":
     parser.add_argument("--render", action='store_true', help="Render the environment visually")
     parser.add_argument("--video_path", type=str, default=None, help="Optional path to save evaluation video")
     parser.add_argument("--video_fps", type=int, default=30, help="Frames per second for saved evaluation video")
+    parser.add_argument(
+        "--fixed_target_eval",
+        action="store_true",
+        help=(
+            "For normal eval, rigidly align each sampled PushT task to the fixed "
+            "expert target pose and use block-pose success by default."
+        ),
+    )
+    parser.add_argument(
+        "--fixed_target_pose",
+        type=float,
+        nargs=3,
+        default=PUSHT_FIXED_TARGET_POSE.tolist(),
+        metavar=("X", "Y", "ANGLE"),
+        help="Fixed PushT target pose used by --fixed_target_eval.",
+    )
+    parser.add_argument(
+        "--fixed_target_full_state_success",
+        action="store_true",
+        help=(
+            "With --fixed_target_eval, keep SWM full-state reward/success instead "
+            "of standard block-pose reward/success."
+        ),
+    )
+    parser.add_argument(
+        "--fixed_target_max_reset_attempts",
+        type=int,
+        default=100,
+        help="Maximum resampling attempts when aligned fixed-target starts leave the board.",
+    )
+    parser.add_argument(
+        "--swm_world_eval",
+        action="store_true",
+        help="Evaluate through swm.World.evaluate(dataset=...), matching the LeWM dataset-conditioned eval path.",
+    )
+    parser.add_argument(
+        "--eval_data_path",
+        type=str,
+        default="data/expert_trajectories/pusht_expert.npz",
+        help="NPZ PushT expert dataset used by --swm_world_eval.",
+    )
+    parser.add_argument(
+        "--goal_offset_steps",
+        type=int,
+        default=25,
+        help="Future dataset offset used as the goal by --swm_world_eval.",
+    )
+    parser.add_argument(
+        "--lewm_eval_budget",
+        type=int,
+        default=50,
+        help="Number of env steps for --swm_world_eval, matching the LeWM PushT default.",
+    )
+    parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=42,
+        help="Random seed for eval sampling, policy/env resets, and reproducible rollouts.",
+    )
     
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension of the BC MLP")
     parser.add_argument("--frame_stack", type=int, default=3, help="Number of frames to stack (must match training)")
