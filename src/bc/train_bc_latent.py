@@ -2,7 +2,9 @@ import os
 import sys
 import importlib
 import json
+import random
 from datetime import datetime, timezone
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -106,7 +108,33 @@ def _log_wandb_artifact(run, artifact_name, artifact_type, file_paths, metadata=
     run.log_artifact(artifact)
 
 
+def seed_everything(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+
+
+def seed_dataloader_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def train_latent_bc(args):
+    if args.num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    seed_everything(args.seed, args.deterministic)
+    print(f"Using seed: {args.seed} (deterministic={args.deterministic})")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     checkpoint_dir = os.path.dirname(args.checkpoint_path)
@@ -120,7 +148,17 @@ def train_latent_bc(args):
         frame_stride=args.frame_stride,
         action_chunk_size=args.action_chunk_size,
     )
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    dataloader_generator = torch.Generator()
+    dataloader_generator.manual_seed(args.seed)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        worker_init_fn=seed_dataloader_worker,
+        generator=dataloader_generator,
+    )
 
     run_metadata = {
         **dataset.stats,
@@ -130,6 +168,9 @@ def train_latent_bc(args):
         'latent_dim': 192,
         'action_dim': 2,
         'action_chunk_size': args.action_chunk_size,
+        'seed': args.seed,
+        'deterministic': args.deterministic,
+        'num_workers': args.num_workers,
     }
     run_config_path = _write_run_config(
         args,
@@ -259,6 +300,9 @@ def train_latent_bc(args):
             'latent_dim': latent_dim,
             'action_dim': 2,
             'action_chunk_size': args.action_chunk_size,
+            'seed': args.seed,
+            'deterministic': args.deterministic,
+            'num_workers': args.num_workers,
         },
         args.checkpoint_path.replace('.pth', '_stats.pth')
     )
@@ -319,6 +363,14 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=64, help="Minibatch size for training")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for the Adam optimizer")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible training")
+    parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader workers")
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable deterministic PyTorch/CuDNN behavior where available",
+    )
     
     # Architecture and Context
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension size of the BC MLP policy")
