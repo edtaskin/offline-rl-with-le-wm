@@ -1,0 +1,98 @@
+{
+  "args": {
+    "action_chunk_size": 5,
+    "batch_size": 64,
+    "checkpoint_path": "checkpoints/trained_policies/pusht_latent_bc.pth",
+    "data_path": "data/expert_trajectories/pusht_expert.npz",
+    "epochs": 100,
+    "frame_stack": 3,
+    "frame_stride": 5,
+    "hidden_dim": 256,
+    "log_interval": 10,
+    "lr": 0.001,
+    "save_interval": 10,
+    "wandb": false,
+    "wandb_entity": null,
+    "wandb_group": "pusht-latent-bc",
+    "wandb_mode": null,
+    "wandb_project": "offline-rl-lewm",
+    "wandb_run_name": null,
+    "wandb_tags": null
+  },
+  "bc_contract": {
+    "action_chunk_size": 5,
+    "action_dim": 2,
+    "action_max": [
+      1.0,
+      1.0
+    ],
+    "action_min": [
+      -1.0,
+      -1.0
+    ],
+    "action_scale": 100.0,
+    "action_space": "swm_relative",
+    "frame_stack": 3,
+    "frame_stride": 5,
+    "hidden_dim": 256,
+    "image_mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "image_normalization": "imagenet",
+    "image_size": [
+      224,
+      224
+    ],
+    "image_std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "latent_dim": 192
+  },
+  "best_train_loss": 0.003289941138937138,
+  "best_train_loss_epoch": 100,
+  "created_at": "2026-07-02T13:06:25.914945+00:00",
+  "dataset_size": 25650,
+  "dataset_stats": {
+    "action_chunk_size": 5,
+    "action_max": [
+      1.0,
+      1.0
+    ],
+    "action_min": [
+      -1.0,
+      -1.0
+    ],
+    "action_scale": 100.0,
+    "action_space": "swm_relative",
+    "frame_stride": 5,
+    "image_mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "image_normalization": "imagenet",
+    "image_size": [
+      224,
+      224
+    ],
+    "image_std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "device": "cuda",
+  "final_checkpoint_path": "checkpoints/trained_policies/pusht_latent_bc.pth",
+  "final_train_loss": 0.003289941138937138,
+  "num_batches_per_epoch": 400,
+  "run_config_path": "checkpoints/trained_policies/pusht_latent_bc_run_config.json",
+  "script": "src/bc/train_bc_latent.py",
+  "stats_path": "checkpoints/trained_policies/pusht_latent_bc_stats.pth",
+  "status": "completed",
+  "wandb_run_id": null,
+  "wandb_run_url": null
+}

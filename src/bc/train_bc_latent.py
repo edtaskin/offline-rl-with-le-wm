@@ -26,6 +26,10 @@ swm = importlib.import_module("stable_worldmodel")
 
 from src.bc.dataset import PushTLeWMDataset
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
+from src.utils.hf_hub import push_files_to_hub
+
+
+SENSITIVE_ARG_PATTERNS = ("token", "password", "secret")
 
 
 def _json_safe(value):
@@ -40,6 +44,14 @@ def _json_safe(value):
     return value
 
 
+def _args_for_config(args):
+    config_args = vars(args).copy()
+    for key, value in config_args.items():
+        if value is not None and any(pattern in key.lower() for pattern in SENSITIVE_ARG_PATTERNS):
+            config_args[key] = "***"
+    return config_args
+
+
 def _sidecar_path(checkpoint_path, suffix):
     path = Path(checkpoint_path)
     if path.suffix:
@@ -51,7 +63,7 @@ def _write_run_config(args, dataset_stats=None, extra=None):
     payload = {
         "script": "src/bc/train_bc_latent.py",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "args": vars(args),
+        "args": _args_for_config(args),
     }
     if dataset_stats is not None:
         payload["dataset_stats"] = dataset_stats
@@ -186,7 +198,7 @@ def train_latent_bc(args):
     wandb_run = _init_wandb(
         args,
         {
-            **vars(args),
+            **_args_for_config(args),
             "device": str(device),
             "dataset_size": len(dataset),
             "num_batches_per_epoch": len(dataloader),
@@ -326,10 +338,63 @@ def train_latent_bc(args):
             "wandb_run_url": getattr(wandb_run, "url", None) if wandb_run is not None else None,
         },
     )
+
+    hf_upload_result = None
+    if args.push_to_hf:
+        hf_upload_result = push_files_to_hub(
+            repo_id=args.hf_repo_id,
+            file_paths=[args.checkpoint_path, stats_path, run_config_path],
+            repo_type=args.hf_repo_type,
+            private=args.hf_private,
+            token=args.hf_token,
+            revision=args.hf_revision,
+            path_prefix=args.hf_path_prefix,
+            commit_message=args.hf_commit_message,
+        )
+        run_config_path = _write_run_config(
+            args,
+            dataset_stats=dataset.stats,
+            extra={
+                "device": str(device),
+                "dataset_size": len(dataset),
+                "num_batches_per_epoch": len(dataloader),
+                "status": "completed",
+                "bc_contract": run_metadata,
+                "final_checkpoint_path": args.checkpoint_path,
+                "stats_path": stats_path,
+                "run_config_path": run_config_path,
+                "final_train_loss": avg_loss,
+                "best_train_loss": best_loss,
+                "best_train_loss_epoch": best_epoch,
+                "wandb_run_id": getattr(wandb_run, "id", None) if wandb_run is not None else None,
+                "wandb_run_url": getattr(wandb_run, "url", None) if wandb_run is not None else None,
+                "hf_upload": {
+                    "repo_id": hf_upload_result.repo_id,
+                    "repo_type": hf_upload_result.repo_type,
+                    "repo_url": hf_upload_result.repo_url,
+                    "uploaded_files": hf_upload_result.uploaded_files,
+                },
+            },
+        )
+        push_files_to_hub(
+            repo_id=args.hf_repo_id,
+            file_paths=[run_config_path],
+            repo_type=args.hf_repo_type,
+            private=args.hf_private,
+            token=args.hf_token,
+            revision=args.hf_revision,
+            path_prefix=args.hf_path_prefix,
+            commit_message=args.hf_commit_message,
+            create_repo=False,
+        )
+        print(f"Pushed checkpoint artifacts to Hugging Face Hub: {hf_upload_result.repo_url}")
+
     if wandb_run is not None:
         wandb_run.summary["final_train_loss"] = avg_loss
         wandb_run.summary["best_train_loss"] = best_loss
         wandb_run.summary["best_train_loss_epoch"] = best_epoch
+        if hf_upload_result is not None:
+            wandb_run.summary["hf/repo_url"] = hf_upload_result.repo_url
         _log_wandb_artifact(
             wandb_run,
             artifact_name=f"latent-bc-policy-{getattr(wandb_run, 'id', 'local')}",
@@ -342,6 +407,7 @@ def train_latent_bc(args):
                 "best_train_loss": best_loss,
                 "best_train_loss_epoch": best_epoch,
                 "bc_contract": run_metadata,
+                "hf_repo_url": hf_upload_result.repo_url if hf_upload_result is not None else None,
             },
         )
         wandb_run.finish()
@@ -394,8 +460,39 @@ if __name__ == "__main__":
         default=None,
         help="Weights & Biases mode; use offline on clusters without network access",
     )
+    parser.add_argument("--push_to_hf", action="store_true", help="Push final checkpoint artifacts to the Hugging Face Hub")
+    parser.add_argument("--hf_repo_id", type=str, default=None, help="Hugging Face repo id, for example username/repo-name")
+    parser.add_argument(
+        "--hf_repo_type",
+        type=str,
+        choices=["model", "dataset", "space"],
+        default="model",
+        help="Hugging Face repository type",
+    )
+    parser.add_argument(
+        "--hf_private",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Create or keep the Hugging Face repo private",
+    )
+    parser.add_argument(
+        "--hf_token",
+        type=str,
+        default=None,
+        help="Hugging Face token; if omitted, huggingface_hub uses the cached login or environment token",
+    )
+    parser.add_argument("--hf_revision", type=str, default=None, help="Optional Hugging Face branch or revision to upload to")
+    parser.add_argument("--hf_path_prefix", type=str, default=None, help="Optional folder inside the Hugging Face repo")
+    parser.add_argument(
+        "--hf_commit_message",
+        type=str,
+        default="Upload latent BC checkpoint artifacts",
+        help="Commit message for Hugging Face uploads",
+    )
 
     args = parser.parse_args()
+    if args.push_to_hf and not args.hf_repo_id:
+        parser.error("--hf_repo_id is required when --push_to_hf is set")
     
     # Execute the training loop
     train_latent_bc(args)
