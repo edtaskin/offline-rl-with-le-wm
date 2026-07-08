@@ -17,14 +17,14 @@ repo_root = Path(__file__).resolve().parents[2]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-le_wm_path = os.getenv("LE_WM_PATH")
-if le_wm_path is None:
-    raise ValueError("LE_WM_PATH environment variable not set")
-if le_wm_path not in sys.path:
-    sys.path.insert(0, le_wm_path)
-swm = importlib.import_module("stable_worldmodel")
-
-from src.bc.dataset import PushTLeWMDataset
+from src.bc.dataset import (
+    LEWM_IMAGE_MEAN,
+    LEWM_IMAGE_NORMALIZATION,
+    LEWM_IMAGE_SIZE,
+    LEWM_IMAGE_STD,
+    PushTLeWMDataset,
+    PushTLeWMLatentDataset,
+)
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 from src.utils.hf_hub import push_files_to_hub
 
@@ -142,9 +142,138 @@ def seed_dataloader_worker(worker_id):
     random.seed(worker_seed)
 
 
+def _load_stable_worldmodel():
+    le_wm_path = os.getenv("LE_WM_PATH")
+    if le_wm_path is None:
+        raise ValueError("LE_WM_PATH environment variable not set")
+    if le_wm_path not in sys.path:
+        sys.path.insert(0, le_wm_path)
+    return importlib.import_module("stable_worldmodel")
+
+
+def _path_fingerprint(path):
+    path = Path(path)
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _default_latent_cache_path(data_path):
+    data_path = Path(data_path)
+    cache_name = f"{data_path.stem}_lewm_object_imagenet224_cls.pt"
+    return str(Path("data", "latent_cache", cache_name))
+
+
+def _num_samples_from_data(data_path):
+    data = np.load(data_path, allow_pickle=True)
+    try:
+        return int(data["actions"].shape[0])
+    finally:
+        data.close()
+
+
+def _latent_cache_metadata(data_path, ckpt_path, num_samples, latent_dim):
+    return {
+        "format_version": 1,
+        "cache_type": "lewm_cls_latents",
+        "data_file": _path_fingerprint(data_path),
+        "lewm_checkpoint_file": _path_fingerprint(ckpt_path),
+        "num_samples": int(num_samples),
+        "latent_dim": int(latent_dim),
+        "image_size": list(LEWM_IMAGE_SIZE),
+        "image_normalization": LEWM_IMAGE_NORMALIZATION,
+        "image_mean": list(LEWM_IMAGE_MEAN),
+        "image_std": list(LEWM_IMAGE_STD),
+    }
+
+
+def _metadata_matches(actual, expected):
+    if not isinstance(actual, dict):
+        return False, ["metadata is missing or not a dict"]
+
+    mismatches = []
+    for key, expected_value in expected.items():
+        actual_value = actual.get(key)
+        if actual_value != expected_value:
+            mismatches.append(f"{key}: expected {expected_value}, got {actual_value}")
+    return len(mismatches) == 0, mismatches
+
+
+def _check_latent_cache(cache_path, expected_metadata):
+    if not cache_path or not os.path.exists(cache_path):
+        return False, ["cache file does not exist"]
+    try:
+        payload = torch.load(cache_path, map_location="cpu")
+    except Exception as exc:
+        return False, [f"cache could not be loaded: {exc}"]
+
+    if not isinstance(payload, dict) or "latents" not in payload:
+        return False, ["cache payload must be a dict containing a 'latents' tensor"]
+    latents = payload["latents"]
+    if not torch.is_tensor(latents):
+        return False, ["cache 'latents' entry is not a tensor"]
+    expected_shape = (
+        int(expected_metadata["num_samples"]),
+        int(expected_metadata["latent_dim"]),
+    )
+    if tuple(latents.shape) != expected_shape:
+        return False, [f"latents shape mismatch: expected {expected_shape}, got {tuple(latents.shape)}"]
+
+    return _metadata_matches(payload.get("metadata"), expected_metadata)
+
+
+def _load_lewm_encoder(ckpt_path, device):
+    print("Loading official LeWM object checkpoint...")
+    print(ckpt_path)
+    lewm_model = torch.load(ckpt_path, map_location=device, weights_only=False)
+    lewm_encoder = lewm_model.encoder.to(device)
+    lewm_encoder.eval()
+    for param in lewm_encoder.parameters():
+        param.requires_grad = False
+    print("Successfully loaded and frozen the LeWM Encoder from the official checkpoint!")
+    return lewm_encoder
+
+
+def _build_latent_cache(source_dataset, lewm_encoder, device, cache_path, metadata, batch_size):
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if batch_size < 1:
+        raise ValueError("latent_cache_batch_size must be at least 1")
+
+    print(f"Building LeWM latent cache: {cache_path}")
+    all_latents = []
+    with torch.inference_mode():
+        for start in range(0, len(source_dataset), batch_size):
+            end = min(start + batch_size, len(source_dataset))
+            obs_batch = source_dataset.image_transform(source_dataset.images[start:end]).to(device)
+            encoder_outputs = lewm_encoder(obs_batch)
+            latents = encoder_outputs.last_hidden_state[:, 0, :].detach().cpu()
+            all_latents.append(latents)
+            if start == 0 or end == len(source_dataset):
+                print(f"  encoded {end}/{len(source_dataset)} frames")
+
+    cached_latents = torch.cat(all_latents, dim=0).contiguous()
+    torch.save(
+        {
+            "latents": cached_latents,
+            "metadata": {
+                **metadata,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        },
+        cache_path,
+    )
+    print(f"Saved LeWM latent cache with shape {tuple(cached_latents.shape)}")
+
+
 def train_latent_bc(args):
     if args.num_workers < 0:
         raise ValueError("num_workers must be non-negative")
+    if args.latent_cache_batch_size is not None and args.latent_cache_batch_size < 1:
+        raise ValueError("latent_cache_batch_size must be at least 1")
     seed_everything(args.seed, args.deterministic)
     print(f"Using seed: {args.seed} (deterministic={args.deterministic})")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -153,13 +282,72 @@ def train_latent_bc(args):
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # 1. Load Dataset with temporal frame history
-    dataset = PushTLeWMDataset(
-        args.data_path,
-        frame_stack=args.frame_stack,
-        frame_stride=args.frame_stride,
-        action_chunk_size=args.action_chunk_size,
-    )
+    # 1. Prepare dataset. By default, cache per-frame LeWM CLS latents once and
+    # rebuild stacked histories cheaply from that cache on later runs.
+    latent_dim = 192
+    swm = _load_stable_worldmodel()
+    ckpt_path = Path(swm.data.utils.get_cache_dir(), "checkpoints", "pusht", "lewm_object.ckpt")
+    use_latent_cache = not args.disable_latent_cache
+    latent_cache_path = args.latent_cache_path or _default_latent_cache_path(args.data_path)
+    latent_cache_rebuilt = False
+    expected_cache_metadata = None
+    lewm_encoder = None
+
+    if use_latent_cache:
+        num_samples = _num_samples_from_data(args.data_path)
+        expected_cache_metadata = _latent_cache_metadata(
+            args.data_path,
+            ckpt_path,
+            num_samples=num_samples,
+            latent_dim=latent_dim,
+        )
+        cache_ok, cache_messages = _check_latent_cache(latent_cache_path, expected_cache_metadata)
+        if args.rebuild_latent_cache:
+            cache_ok = False
+            cache_messages = ["cache rebuild was requested"]
+
+        if cache_ok:
+            print(f"Using existing LeWM latent cache: {latent_cache_path}")
+        else:
+            print(f"LeWM latent cache will be built at: {latent_cache_path}")
+            for message in cache_messages[:5]:
+                print(f"  cache miss: {message}")
+            source_dataset = PushTLeWMDataset(
+                args.data_path,
+                frame_stack=1,
+                frame_stride=1,
+                action_chunk_size=1,
+            )
+            lewm_encoder = _load_lewm_encoder(ckpt_path, device)
+            cache_batch_size = args.latent_cache_batch_size or args.batch_size
+            _build_latent_cache(
+                source_dataset,
+                lewm_encoder,
+                device,
+                latent_cache_path,
+                expected_cache_metadata,
+                batch_size=cache_batch_size,
+            )
+            latent_cache_rebuilt = True
+
+        dataset = PushTLeWMLatentDataset(
+            args.data_path,
+            latent_cache_path,
+            frame_stack=args.frame_stack,
+            frame_stride=args.frame_stride,
+            action_chunk_size=args.action_chunk_size,
+        )
+    else:
+        print("Latent cache disabled; images will be encoded through LeWM during every epoch.")
+        dataset = PushTLeWMDataset(
+            args.data_path,
+            frame_stack=args.frame_stack,
+            frame_stride=args.frame_stride,
+            action_chunk_size=args.action_chunk_size,
+        )
+        lewm_encoder = _load_lewm_encoder(ckpt_path, device)
+
+    latent_dim = int(dataset.stats.get('latent_dim', latent_dim))
     dataloader_generator = torch.Generator()
     dataloader_generator.manual_seed(args.seed)
     dataloader = DataLoader(
@@ -177,9 +365,13 @@ def train_latent_bc(args):
         'frame_stack': args.frame_stack,
         'frame_stride': args.frame_stride,
         'hidden_dim': args.hidden_dim,
-        'latent_dim': 192,
+        'latent_dim': latent_dim,
         'action_dim': 2,
         'action_chunk_size': args.action_chunk_size,
+        'latent_cache_enabled': use_latent_cache,
+        'latent_cache_path': latent_cache_path if use_latent_cache else None,
+        'latent_cache_rebuilt': latent_cache_rebuilt,
+        'latent_cache_expected_metadata': expected_cache_metadata,
         'seed': args.seed,
         'deterministic': args.deterministic,
         'num_workers': args.num_workers,
@@ -209,30 +401,7 @@ def train_latent_bc(args):
         run_url = getattr(wandb_run, "url", None)
         print(f"Logging run to wandb: {run_url or 'enabled'}")
 
-    # 2. Load the Pre-Trained LeWM Encoder (Frozen)
-    print("Loading official LeWM object checkpoint...")
-
-    # Get the path to where your conversion script just saved the checkpoint
-    ckpt_path = Path(swm.data.utils.get_cache_dir(), "checkpoints", "pusht", "lewm_object.ckpt")
-    print(ckpt_path)
-
-    # Because the conversion script used `torch.save(model, out)`, 
-    # the file contains the fully initialized and mapped PyTorch model object!
-    lewm_model = torch.load(ckpt_path, map_location=device, weights_only=False)
-
-    # Extract just the encoder for Behavior Cloning
-    lewm_encoder = lewm_model.encoder.to(device)
-    lewm_encoder.eval()
-
-    # Freeze the encoder so we only train the BC policy
-    for param in lewm_encoder.parameters():
-        param.requires_grad = False
-
-    print("Successfully loaded and frozen the LeWM Encoder from the official checkpoint!")
-
-    print("Successfully loaded and frozen the LeWM Encoder via the official API!")
     # 3. Initialize Latent BC Policy
-    latent_dim = 192
     policy = LatentBCPolicy(
         latent_dim=latent_dim, 
         frame_stack=args.frame_stack,
@@ -252,24 +421,20 @@ def train_latent_bc(args):
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         
-        for batch_obs_seq, batch_actions in dataloader:
-            batch_obs_seq = batch_obs_seq.to(device) # Shape: (Batch, FrameStack, C, H, W)
+        for batch_inputs, batch_actions in dataloader:
+            batch_inputs = batch_inputs.to(device)
             batch_actions = batch_actions.to(device)
 
-            with torch.no_grad():
-                # Reshape to treat frames as a larger batch: (Batch * FrameStack, C, H, W)
-                b, f, c, h, w = batch_obs_seq.shape
-                flat_obs = batch_obs_seq.reshape(b * f, c, h, w)
-                
-                # Extract the Hugging Face output object
-                encoder_outputs = lewm_encoder(flat_obs) 
-                
-                # Extract the CLS token (the 0th token) from the last hidden state
-                # last_hidden_state shape: (Batch * FrameStack, Sequence_Length, Hidden_Dim)
-                flat_latents = encoder_outputs.last_hidden_state[:, 0, :]
-                
-                # Reshape back to (Batch, FrameStack, LatentDim)
-                stacked_latents = flat_latents.reshape(b, f, latent_dim)
+            if use_latent_cache:
+                stacked_latents = batch_inputs
+            else:
+                with torch.no_grad():
+                    # Reshape to treat frames as a larger batch: (Batch * FrameStack, C, H, W)
+                    b, f, c, h, w = batch_inputs.shape
+                    flat_obs = batch_inputs.reshape(b * f, c, h, w)
+                    encoder_outputs = lewm_encoder(flat_obs)
+                    flat_latents = encoder_outputs.last_hidden_state[:, 0, :]
+                    stacked_latents = flat_latents.reshape(b, f, latent_dim)
 
             # Predict a future action chunk and calculate loss
             predicted_action_chunks = policy(stacked_latents)
@@ -312,6 +477,10 @@ def train_latent_bc(args):
             'latent_dim': latent_dim,
             'action_dim': 2,
             'action_chunk_size': args.action_chunk_size,
+            'latent_cache_enabled': use_latent_cache,
+            'latent_cache_path': latent_cache_path if use_latent_cache else None,
+            'latent_cache_rebuilt': latent_cache_rebuilt,
+            'latent_cache_expected_metadata': expected_cache_metadata,
             'seed': args.seed,
             'deterministic': args.deterministic,
             'num_workers': args.num_workers,
@@ -424,10 +593,32 @@ if __name__ == "__main__":
                         help="Path to the converted expert dataset .npz file")
     parser.add_argument("--checkpoint_path", type=str, default="checkpoints/trained_policies/pusht_latent_bc.pth", 
                         help="Path to save the final trained policy weights")
+    parser.add_argument(
+        "--latent_cache_path",
+        type=str,
+        default=None,
+        help="Path for cached per-frame LeWM CLS latents; defaults to data/latent_cache/<dataset>_lewm_object_imagenet224_cls.pt",
+    )
+    parser.add_argument(
+        "--rebuild_latent_cache",
+        action="store_true",
+        help="Recompute and overwrite the LeWM latent cache before training",
+    )
+    parser.add_argument(
+        "--disable_latent_cache",
+        action="store_true",
+        help="Disable latent caching and encode image batches through LeWM during every epoch",
+    )
     
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=64, help="Minibatch size for training")
+    parser.add_argument(
+        "--latent_cache_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for one-time cache construction; defaults to --batch_size",
+    )
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for the Adam optimizer")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible training")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader workers")
