@@ -1,10 +1,10 @@
-# Offline RL with LeWM
+# Offline RL with LeWM
 
-## LeWorldModel Probing + Decoder Training
+## LeWorldModel Probing + Decoder Training
 
 ## BC
 
-## PPO 
+## PPO 
 
 To train a latent PPO policy, you can use the following command:
 
