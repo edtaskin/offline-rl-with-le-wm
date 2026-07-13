@@ -1,5 +1,12 @@
 data/**/*
 !data/**/.gitkeep
-**/__pycache__/
-.env
-.vscode/
+
+# training artifacts
+runs/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+wandb/
