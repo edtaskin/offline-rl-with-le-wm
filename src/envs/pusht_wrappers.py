@@ -24,6 +24,81 @@ def _rotation_matrix(theta):
     return np.array([[c, -s], [s, c]], dtype=np.float64)
 
 
+def _polygon_area_centroid(vertices):
+    """Signed area and centroid of a polygon given ordered ``(x, y)`` vertices."""
+    verts = np.asarray(vertices, dtype=np.float64)
+    x, y = verts[:, 0], verts[:, 1]
+    x_next, y_next = np.roll(x, -1), np.roll(y, -1)
+    cross = x * y_next - x_next * y
+    area = 0.5 * float(cross.sum())
+    if abs(area) < 1e-9:
+        # Degenerate polygon: fall back to the vertex mean.
+        return 0.0, verts.mean(axis=0)
+    cx = float(((x + x_next) * cross).sum()) / (6.0 * area)
+    cy = float(((y + y_next) * cross).sum()) / (6.0 * area)
+    return abs(area), np.array([cx, cy], dtype=np.float64)
+
+
+def _block_local_centroid(unwrapped):
+    """Area-weighted centroid of the block's shapes in body-local coordinates.
+
+    The block's body origin is not its geometric center (for a T it sits at the
+    top edge of the bar, ~40px from the centroid), so both the green goal marker
+    and the block are best located by this centroid rather than ``position``.
+    """
+    total_area = 0.0
+    weighted = np.zeros(2, dtype=np.float64)
+    for shape in unwrapped.block.shapes:
+        get_vertices = getattr(shape, "get_vertices", None)
+        if get_vertices is not None:  # pymunk.Poly
+            area, centroid = _polygon_area_centroid(
+                [tuple(v) for v in get_vertices()]
+            )
+        else:  # pymunk.Circle
+            radius = float(getattr(shape, "radius", 0.0))
+            area = float(np.pi * radius * radius)
+            centroid = np.asarray(tuple(getattr(shape, "offset", (0.0, 0.0))), dtype=np.float64)
+        total_area += area
+        weighted += area * centroid
+    return weighted / total_area if total_area > 0 else np.zeros(2)
+
+
+def green_t_center(env):
+    """World-space centroid of the rendered green goal ("green T") marker.
+
+    The goal is drawn by transforming the block's own shapes by the goal pose
+    (``env.goal_pose = [x, y, angle]``), so the green marker occupies exactly the
+    block polygon rotated/translated to the goal pose. We return the
+    area-weighted centroid of that polygon in the same coordinate frame as the
+    agent/block positions (``512``-pixel pymunk world space) -- i.e. the visual
+    center of the green T.
+    """
+    unwrapped = env.unwrapped
+    goal_pose = np.asarray(unwrapped.goal_pose, dtype=np.float64)
+    return goal_pose[:2] + _rotation_matrix(float(goal_pose[2])) @ _block_local_centroid(unwrapped)
+
+
+def block_center(env):
+    """World-space centroid of the current block pose (matches :func:`green_t_center`)."""
+    unwrapped = env.unwrapped
+    state = np.asarray(unwrapped._get_obs(), dtype=np.float64)
+    block_pos, block_angle = state[2:4], float(state[4])
+    return block_pos + _rotation_matrix(block_angle) @ _block_local_centroid(unwrapped)
+
+
+def _success_from_info(info, terminated):
+    """Task-success flag: prefer explicit info keys, else the terminated flag.
+
+    Mirrors ``src.ppo.latent_env.success_from_info`` so the sparse reward agrees
+    with how success is tracked elsewhere (block-pose success under
+    ``fixed_target``; native ``terminated``-on-success otherwise).
+    """
+    for key in ("success", "is_success", "task_success"):
+        if key in info:
+            return float(info[key]) > 0.5
+    return bool(terminated)
+
+
 class PushTGoalPoseFromStateWrapper(gym.Wrapper):
     """Make the rendered PushT goal match the state used for reward/success."""
 
@@ -67,12 +142,17 @@ class PushTAlignSampledGoalToFixedTargetWrapper(gym.Wrapper):
         max_reset_attempts=100,
         workspace_low=PUSHT_WORKSPACE_LOW,
         workspace_high=PUSHT_WORKSPACE_HIGH,
+        agent_block_coef=0.0,
     ):
         super().__init__(env)
         self.target_pose = np.asarray(target_pose, dtype=np.float64)
         if self.target_pose.shape != (3,):
             raise ValueError("target_pose must contain [x, y, angle]")
         self.block_success = bool(block_success)
+        # Optional reward shaping: penalize agent->block distance so the policy
+        # stays engaged with the block instead of drifting off (helps far/rotation
+        # transports). 0.0 = disabled; success/termination are unaffected.
+        self.agent_block_coef = float(agent_block_coef)
         self.block_position_threshold = float(block_position_threshold)
         self.block_angle_threshold = float(block_angle_threshold)
         self.max_reset_attempts = int(max_reset_attempts)
@@ -142,6 +222,8 @@ class PushTAlignSampledGoalToFixedTargetWrapper(gym.Wrapper):
         info = dict(env._get_info())
         info["goal_pose"] = np.asarray(env.goal_pose).copy()
         info["goal_state"] = np.asarray(env.goal_state).copy()
+        state = env._get_obs()
+        info["agent_block_dist"] = float(np.linalg.norm(state[:2] - state[2:4]))
         if self.block_success:
             success, pos_dist, angle_dist, state_dist = self._block_metrics()
             info.update(
@@ -198,6 +280,8 @@ class PushTAlignSampledGoalToFixedTargetWrapper(gym.Wrapper):
         if self.block_success:
             terminated = bool(info["block_success"])
             reward = -float(info["block_state_dist"])
+            if self.agent_block_coef:
+                reward -= self.agent_block_coef * info["agent_block_dist"]
         return observation, reward, terminated, truncated, info
 
 
@@ -217,6 +301,129 @@ class PushTRenderObservationWrapper(gym.ObservationWrapper):
         return np.asarray(self.env.render(), dtype=np.uint8)
 
 
+class PushTBlockStartNearGoalWrapper(gym.Wrapper):
+    """Start each episode with the block near the green T (goal) center.
+
+    On every ``reset`` the block is repositioned so its centroid lands at a
+    uniform-random point inside a disk of radius ``radius`` pixels around the
+    green T center (see :func:`green_t_center` / :func:`block_center`); the block
+    *angle* and the agent are left untouched. This shortens the block-transport
+    distance -- the main driver of PushT difficulty -- into a controllable range.
+
+    The block origin is clipped to stay ``bounds_margin`` pixels inside the
+    workspace. Runs *after* any goal alignment/sync, so the disk is centered on
+    the final (possibly fixed) goal.
+    """
+
+    def __init__(
+        self,
+        env,
+        radius=50.0,
+        bounds_margin=20.0,
+        min_agent_clearance=0.0,
+        max_sample_attempts=100,
+        workspace_low=PUSHT_WORKSPACE_LOW,
+        workspace_high=PUSHT_WORKSPACE_HIGH,
+    ):
+        super().__init__(env)
+        self.radius = float(radius)
+        if self.radius < 0.0:
+            raise ValueError("radius must be non-negative")
+        self.bounds_margin = float(bounds_margin)
+        # Optional: reject samples whose block centroid lands within this distance
+        # of the agent (avoids spawning the block on top of the pusher). 0 = off.
+        self.min_agent_clearance = float(min_agent_clearance)
+        self.max_sample_attempts = max(1, int(max_sample_attempts))
+        self.workspace_low = np.asarray(workspace_low, dtype=np.float64)
+        self.workspace_high = np.asarray(workspace_high, dtype=np.float64)
+        self._low = self.workspace_low + self.bounds_margin
+        self._high = self.workspace_high - self.bounds_margin
+        self._rng = np.random.default_rng()
+
+    def _sample_block_pos(self, goal_center, agent_xy, block_angle, local_centroid):
+        # Choose where the block *centroid* should land, then back out the block
+        # origin for the (unchanged) block angle: pos = centroid - R(angle) @ lc.
+        rot = _rotation_matrix(block_angle)
+        best = None
+        for _ in range(self.max_sample_attempts):
+            radius = self.radius * np.sqrt(self._rng.random())
+            theta = self._rng.uniform(0.0, 2.0 * np.pi)
+            target_centroid = goal_center + radius * np.array([np.cos(theta), np.sin(theta)])
+            block_pos = np.clip(target_centroid - rot @ local_centroid, self._low, self._high)
+            best = block_pos
+            resulting_centroid = block_pos + rot @ local_centroid
+            if (
+                self.min_agent_clearance <= 0.0
+                or np.linalg.norm(resulting_centroid - agent_xy) >= self.min_agent_clearance
+            ):
+                return block_pos
+        return best  # clearance unsatisfiable in bounds; use the last sample
+
+    def _reposition_block(self, observation, info):
+        env = self.unwrapped
+        state = np.asarray(env._get_obs(), dtype=np.float64)
+        goal_center = green_t_center(env)
+        local_centroid = _block_local_centroid(env)
+        new_block_pos = self._sample_block_pos(
+            goal_center, state[:2], float(state[4]), local_centroid
+        )
+
+        new_state = state.copy()
+        new_state[2:4] = new_block_pos
+        env._set_state(new_state)
+
+        state = np.asarray(env._get_obs(), dtype=np.float64)
+        observation = {
+            "proprio": np.concatenate((state[:2], state[-2:])),
+            "state": state,
+        }
+        info = dict(info)
+        info["green_t_center"] = goal_center
+        info["block_pose"] = np.array(list(state[2:4]) + [state[4]])
+        info["block_goal_dist"] = float(np.linalg.norm(block_center(env) - goal_center))
+        if "agent_block_dist" in info:
+            info["agent_block_dist"] = float(np.linalg.norm(state[:2] - state[2:4]))
+        return observation, info
+
+    def reset(self, **kwargs):
+        seed = kwargs.get("seed")
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        observation, info = self.env.reset(**kwargs)
+        return self._reposition_block(observation, info)
+
+
+class PushTRewardModeWrapper(gym.Wrapper):
+    """Select between the environment's dense reward and a sparse success reward.
+
+    ``reward_mode="dense"`` passes the underlying reward through unchanged.
+    ``reward_mode="sparse"`` replaces it with ``success_reward`` (default ``1.0``)
+    on the success step and ``failure_reward`` (default ``0.0``) otherwise, using
+    the same success signal tracked elsewhere (see :func:`_success_from_info`).
+    """
+
+    def __init__(
+        self,
+        env,
+        reward_mode="dense",
+        success_reward=1.0,
+        failure_reward=0.0,
+    ):
+        super().__init__(env)
+        if reward_mode not in ("dense", "sparse"):
+            raise ValueError("reward_mode must be 'dense' or 'sparse'")
+        self.reward_mode = reward_mode
+        self.success_reward = float(success_reward)
+        self.failure_reward = float(failure_reward)
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        if self.reward_mode == "sparse":
+            success = _success_from_info(info, terminated)
+            reward = self.success_reward if success else self.failure_reward
+        return observation, float(reward), terminated, truncated, info
+
+
 def make_pusht_env(
     *,
     env_id=PUSHT_ENV_ID,
@@ -227,6 +434,11 @@ def make_pusht_env(
     fixed_target_pose=PUSHT_FIXED_TARGET_POSE,
     fixed_target_block_success=True,
     fixed_target_max_reset_attempts=100,
+    fixed_target_agent_block_coef=0.0,
+    block_start_near_goal=False,
+    block_start_radius=50.0,
+    block_start_min_agent_clearance=0.0,
+    reward_mode="dense",
     **kwargs,
 ):
     import stable_worldmodel  # noqa: F401
@@ -239,9 +451,21 @@ def make_pusht_env(
             target_pose=fixed_target_pose,
             block_success=fixed_target_block_success,
             max_reset_attempts=fixed_target_max_reset_attempts,
+            agent_block_coef=fixed_target_agent_block_coef,
         )
     if sync_goal_pose:
         env = PushTGoalPoseFromStateWrapper(env)
+    # Reposition the block near the green T. This must wrap both the alignment
+    # and goal-pose-sync wrappers so ``goal_pose`` already reflects the actually
+    # rendered goal when the green T center is computed.
+    if block_start_near_goal:
+        env = PushTBlockStartNearGoalWrapper(
+            env,
+            radius=block_start_radius,
+            min_agent_clearance=block_start_min_agent_clearance,
+        )
+    if reward_mode != "dense":
+        env = PushTRewardModeWrapper(env, reward_mode=reward_mode)
     if render_obs:
         env = PushTRenderObservationWrapper(env)
     return env
