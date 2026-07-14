@@ -14,3 +14,5 @@ runs/
 wandb/
 le-wm/
 .DS_Store
+.env
+.vscode/

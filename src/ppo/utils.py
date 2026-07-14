@@ -28,9 +28,9 @@ def get_device(device: str = "auto") -> torch.device:
 class RunningMeanStd:
     """Welford-style running mean/variance over a batch axis (Numpy).
 
-    Used for observation and return normalization, mirroring the behavior of
-    ``gymnasium.wrappers.NormalizeObservation`` / ``NormalizeReward`` but shared
-    across all parallel environments.
+    Used for return normalization, mirroring the behavior of
+    ``gymnasium.wrappers.NormalizeReward`` but shared across all parallel
+    environments.
     """
 
     def __init__(self, shape: tuple[int, ...] = (), epsilon: float = 1e-4):
@@ -55,30 +55,6 @@ class RunningMeanStd:
         m2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
         self.var = m2 / tot_count
         self.count = tot_count
-
-
-class ObsNormalizer:
-    """Normalizes observations to zero mean / unit variance, with clipping."""
-
-    def __init__(self, shape: tuple[int, ...], clip: float = 10.0, epsilon: float = 1e-8):
-        self.rms = RunningMeanStd(shape=shape)
-        self.clip = clip
-        self.epsilon = epsilon
-
-    def normalize(self, obs: np.ndarray, update: bool = True) -> np.ndarray:
-        obs = np.asarray(obs, dtype=np.float64)
-        if update:
-            self.rms.update(obs)
-        out = (obs - self.rms.mean) / np.sqrt(self.rms.var + self.epsilon)
-        return np.clip(out, -self.clip, self.clip).astype(np.float32)
-
-    def state_dict(self) -> dict:
-        return {"mean": self.rms.mean, "var": self.rms.var, "count": self.rms.count}
-
-    def load_state_dict(self, state: dict) -> None:
-        self.rms.mean = np.asarray(state["mean"], dtype=np.float64)
-        self.rms.var = np.asarray(state["var"], dtype=np.float64)
-        self.rms.count = state["count"]
 
 
 class RewardNormalizer:
@@ -108,7 +84,3 @@ class RewardNormalizer:
     def state_dict(self) -> dict:
         return {"var": self.rms.var, "mean": self.rms.mean, "count": self.rms.count}
 
-    def load_state_dict(self, state: dict) -> None:
-        self.rms.var = np.asarray(state["var"], dtype=np.float64)
-        self.rms.mean = np.asarray(state["mean"], dtype=np.float64)
-        self.rms.count = state["count"]

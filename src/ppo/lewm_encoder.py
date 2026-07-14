@@ -11,7 +11,7 @@ with the pixels preprocessed exactly as in training (``/255`` -> resize to
 
 :class:`LeWMLatentEncoder` wraps that raw encoder plus preprocessing behind a
 plain ``forward(images) -> [B, latent_dim]`` interface, so the PPO actor/critic
-in :mod:`src.ppo.latent_agent` can call ``self.encoder(images)`` and get a
+in :mod:`src.ppo.agent` can call ``self.encoder(images)`` and get a
 latent tensor back -- exactly like the ``DummyImageEncoder`` used for testing.
 The encoder is frozen (``eval`` + ``requires_grad_(False)``): PPO fine-tunes the
 BC policy and value head on top of fixed latents.

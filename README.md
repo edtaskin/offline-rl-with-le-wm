@@ -9,7 +9,7 @@
 To train a latent PPO policy, you can use the following command:
 
 ```bash
-python src/ppo/train_latent.py \
+python src/ppo/train.py \
   --bc_checkpoint checkpoints/trained_policies/pusht_latent_bc.pth \
   --bc_stats checkpoints/trained_policies/pusht_latent_bc_stats.pth \
   --hidden_dim 256 \
@@ -28,7 +28,7 @@ python src/ppo/train_latent.py \
 To evaluate the trained latent PPO policy, you can use the following command:
 
 ```bash
-python -m src.ppo.evaluate_latent \    
+python -m src.ppo.evaluate \
   --checkpoint <CHECKPOINT_PATH> \
   --episodes 50 --video
 ```

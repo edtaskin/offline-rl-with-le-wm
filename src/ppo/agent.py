@@ -10,17 +10,11 @@ Architecture (per observation)::
 
 The BC policy provides the action mean and is initialized from a trained BC
 checkpoint (``build_latent_agent``); PPO fine-tunes it together with the
-exploration ``log_std`` and a separate value head. The encoder is frozen.
-
-Because the encoder is frozen, a stacked latent is a fixed function of the
-images. Every method therefore comes in two flavours:
-
-* ``*_from_latents`` -- operate on precomputed ``[B, frame_stack, 192]`` latents
-  (used in the PPO update, where re-running the ViT would be wasted work);
-* the image-taking versions -- encode first, then call the latent path
-  (the interface used by the sanity snippet / one-off calls).
-
-Both paths compute identical math; the latent path just skips the frozen ViT.
+exploration ``log_std`` and a separate value head. The encoder is frozen, so a
+stacked latent is a fixed function of the images: the trainer/evaluator encode
+each frame once and every method here operates on precomputed
+``[B, frame_stack, 192]`` latents (``*_from_latents``) -- the ViT never appears
+in the optimization loop.
 """
 
 from __future__ import annotations
@@ -58,37 +52,12 @@ class LatentPPOActor(nn.Module):
             torch.full((action_chunk_size, action_dim), float(init_log_std))
         )
 
-    def encode_image_stack(self, image_stack: torch.Tensor) -> torch.Tensor:
-        """``[B, F, C, H, W]`` images -> ``[B, F, latent_dim]`` stacked latents."""
-        b, f, c, h, w = image_stack.shape
-        flat_images = image_stack.reshape(b * f, c, h, w)
-        with torch.no_grad():
-            flat_latents = self.encoder(flat_images)
-        latent_dim = flat_latents.shape[-1]
-        return flat_latents.reshape(b, f, latent_dim)
-
     def dist_from_latents(self, stacked_latents: torch.Tensor) -> Normal:
         # BC policy gives the deterministic action-chunk mean.
         action_mean = self.bc_policy(stacked_latents)
         # PPO turns that into a stochastic policy.
         action_std = torch.exp(self.log_std).expand_as(action_mean)
         return Normal(action_mean, action_std)
-
-    def forward(self, image_stack: torch.Tensor) -> Normal:
-        return self.dist_from_latents(self.encode_image_stack(image_stack))
-
-    def get_action_and_logprob(self, image_stack: torch.Tensor):
-        dist = self.forward(image_stack)
-        action = dist.sample()
-        logprob = dist.log_prob(action).sum(dim=(-1, -2))
-        return action, logprob
-
-    def evaluate_action(self, image_stack: torch.Tensor, action: torch.Tensor):
-        dist = self.forward(image_stack)
-        logprob = dist.log_prob(action).sum(dim=(-1, -2))
-        entropy = dist.entropy().sum(dim=(-1, -2))
-        return logprob, entropy
-
 
 class LatentCritic(nn.Module):
     def __init__(
@@ -114,20 +83,9 @@ class LatentCritic(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def encode_image_stack(self, image_stack: torch.Tensor) -> torch.Tensor:
-        b, f, c, h, w = image_stack.shape
-        flat_images = image_stack.reshape(b * f, c, h, w)
-        with torch.no_grad():
-            flat_latents = self.encoder(flat_images)
-        latent_dim = flat_latents.shape[-1]
-        return flat_latents.reshape(b, f, latent_dim)
-
     def value_from_latents(self, stacked_latents: torch.Tensor) -> torch.Tensor:
         flat_latents = stacked_latents.reshape(stacked_latents.shape[0], -1)
         return self.value_net(flat_latents).squeeze(-1)
-
-    def forward(self, image_stack: torch.Tensor) -> torch.Tensor:
-        return self.value_from_latents(self.encode_image_stack(image_stack))
 
 
 class LatentPPOAgent(nn.Module):
@@ -162,11 +120,6 @@ class LatentPPOAgent(nn.Module):
             frame_stack=frame_stack,
             hidden_dim=hidden_dim,
         )
-
-    # ---- image-taking interface (encodes internally) ----
-    def get_action_and_value(self, image_stack: torch.Tensor, action: torch.Tensor | None = None):
-        stacked_latents = self.actor.encode_image_stack(image_stack)
-        return self.get_action_and_value_from_latents(stacked_latents, action)
 
     # ---- latent fast-path (used by the PPO update / rollout) ----
     def get_action_and_value_from_latents(

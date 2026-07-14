@@ -1,88 +1,70 @@
-# PPO on `swm/PushT-v1` (from scratch)
+# Latent PPO on `swm/PushT-v1`
 
-A self-contained, CleanRL-style PPO implementation for the
+Chunk-level PPO fine-tuning of a Latent BC policy on the
 [`stable-worldmodel`](https://github.com/galilai-group/stable-worldmodel) Push-T
-environment, where a circular agent pushes a T-block to a goal pose.
-
-## Reward
-
-Uses the environment's **native dense reward** — the negative L2 distance
-between the current and goal full 7-D state:
-
-```
-reward = -‖goal_state − state‖₂
-```
-
-No reward shaping. This is a plain PPO baseline. Note that the full state
-includes the agent's own (randomly sampled) goal position, so the task is to
-drive the entire state — agent pose, block pose, and orientation — to the goal
-snapshot. This is hard for pure from-scratch PPO (PushT is a contact-rich
-manipulation task, which is why it is normally tackled with imitation learning);
-treat these numbers as a baseline.
-
-## Environment contract (what the code relies on)
-
-| Aspect        | Detail                                                                 |
-|---------------|-----------------------------------------------------------------------|
-| Obs (dict)    | `state` (7,) = `[agent_xy, block_xy, block_angle, agent_vxy]`; `proprio` (4,) |
-| **Goal**      | Re-randomized every episode, returned in `info["goal_state"]` (7,)     |
-| Action        | `Box(-1, 1, (2,))`, relative velocity (PD-controlled, scaled ×100)     |
-| Reward        | dense `-‖goal − state‖₂`                                               |
-| Termination   | `terminated=True` **only on success** (pos err <20px, angle err <π/9) |
-| Time limit    | **not built in** — added via `gym.make(..., max_episode_steps=200)`    |
-
-Because the goal changes per episode, the policy is **goal-conditioned**: the
-observation fed to the network is `concat(state, goal_state)` → 14-D
-(`envs.GoalConditionedFlatten`).
+environment. A frozen LeWM (JEPA ViT) encoder turns frames into latents; the
+BC-initialized policy emits open-loop action chunks that PPO fine-tunes together
+with an exploration `log_std` and a separate value head.
 
 ## Layout
 
-| File           | Purpose                                                            |
-|----------------|-------------------------------------------------------------------|
-| `config.py`    | `Config` dataclass — all hyperparameters                          |
-| `envs.py`      | env factory + goal-conditioning / flattening wrapper              |
-| `networks.py`  | `ActorCritic` MLP (diagonal Gaussian policy)                      |
-| `utils.py`     | seeding, device, running mean/std obs & reward normalizers        |
-| `ppo.py`       | `PPOTrainer` — rollout, GAE, clipped PPO update, checkpointing    |
-| `train.py`     | CLI entry point (`python -m src.ppo.train`)                       |
-| `evaluate.py`  | load a checkpoint, evaluate, optionally record MP4 videos         |
+| File              | Purpose                                                              |
+|-------------------|----------------------------------------------------------------------|
+| `config.py`       | `LatentConfig` dataclass — all hyperparameters                       |
+| `env.py`          | image-observation env factory + `LatentHistory` (dilated latent stack) |
+| `agent.py`        | `LatentPPOAgent` (BC-prior actor, value head) + `build_latent_agent` |
+| `lewm_encoder.py` | frozen LeWM ViT encoder wrapper (`LeWMLatentEncoder`)                |
+| `utils.py`        | seeding, device selection, reward normalizer                         |
+| `ppo.py`          | `LatentPPOTrainer` — chunk rollout, GAE, clipped PPO update, checkpointing |
+| `train.py`        | CLI entry point (`python -m src.ppo.train`)                          |
+| `evaluate.py`     | load a checkpoint, evaluate (open-loop / receding-horizon / temporal ensemble), record MP4s |
 
-### Implementation notes
+## How it works
 
-- Parallel envs are managed as a plain Python list (not a Gymnasium vector env)
-  so that **time-limit truncation bootstrapping is explicit**: on truncation we
-  add `gamma · V(terminal_obs)` to the reward; on success (termination) we do not.
-- Observations are normalized with a shared running mean/std; rewards are scaled
-  by the running std of the discounted return (gym-style).
+- One PPO transition = one open-loop *action chunk* of `action_chunk_size` env
+  steps. The transition reward is the within-chunk discounted sum
+  `sum_j gamma**j r_j`; GAE uses `chunk_gamma = gamma**action_chunk_size`.
+- Each frame is encoded once during rollout; the policy/value input is a
+  *dilated* stack of `frame_stack` latents spaced `frame_stride` steps apart
+  (`LatentHistory`). The PPO update runs on stored latents — the frozen ViT
+  never appears in the optimization loop.
+- Parallel envs are managed as a plain Python list so time-limit truncation
+  bootstrapping is explicit: on truncation the value of the genuine terminal
+  observation is bootstrapped into the reward; on success it is not.
+- The agent *contract* (`frame_stack`/`frame_stride`/`action_chunk_size`/
+  `latent_dim`/`hidden_dim`/`action_dim`) is read from the BC `_stats.pth` and
+  saved into every checkpoint; explicit CLI flags win.
 
 ## Usage
 
-Run from the **project root** with the env that has `stable-worldmodel` installed
-(here, the `dl_lab` conda env):
+Requires the LeWM object checkpoint in the swm cache
+(`python -m scripts.download_lewm_checkpoint`) and a trained BC checkpoint.
+Run from the project root:
 
 ```bash
-# quick smoke test
-python -m src.ppo.train --total-timesteps 8192 --num-envs 4 --num-steps 128 \
-    --num-minibatches 4 --update-epochs 4 --max-episode-steps 50
+# tiny end-to-end smoke run
+python -m src.ppo.train --smoke
 
-# full training run
-python -m src.ppo.train --total-timesteps 3000000 --num-envs 8 --exp-name pusht_run1
-
-# with Weights & Biases logging
-python -m src.ppo.train --track --wandb-project offline-rl-with-le-wm
+# training run (flags accept dash or underscore spellings)
+python src/ppo/train.py \
+  --bc_checkpoint checkpoints/trained_policies/pusht_latent_bc.pth \
+  --bc_stats checkpoints/trained_policies/pusht_latent_bc_stats.pth \
+  --fixed_target --eval_interval 10 \
+  --total_timesteps 1000000 --num_envs 8 --num_chunks 64
 
 # evaluate + record videos
-python -m src.ppo.evaluate --checkpoint runs/pusht_run1__seed1/final.pt \
-    --episodes 20 --video
+python -m src.ppo.evaluate \
+  --checkpoint runs/<exp_name>__seed<seed>/<timestamp>/best.pt \
+  --episodes 20 --video
 ```
 
-Checkpoints and videos are written under `runs/<exp_name>__seed<seed>/`.
-
-Every `Config` field is a CLI flag (`snake_case` → `--kebab-case`); booleans get
-a `--flag` / `--no-flag` pair.
+Checkpoints (`latest.pt`, `best.pt`, `second_best.pt`, `final.pt`) and videos
+are written under `runs/<exp_name>__seed<seed>/<timestamp>/`. With
+`--eval_interval N > 0`, `best.pt` is selected by deterministic held-out
+success (fixed seeds), matching `evaluate.py`.
 
 ## Logged metrics
 
-`success_rate`, `final_distance` (mean terminal `‖goal − state‖`),
-`episodic_return`, `episodic_length`, plus PPO diagnostics (`approx_kl`,
-`clipfrac`, `explained_variance`).
+`success_rate`, `final_distance`, `episodic_return`, `episodic_length`,
+`eval/heldout_success`, plus PPO diagnostics (`approx_kl`, `clipfrac`,
+`explained_variance`).

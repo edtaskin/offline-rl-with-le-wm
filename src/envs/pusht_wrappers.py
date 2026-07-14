@@ -89,7 +89,7 @@ def block_center(env):
 def _success_from_info(info, terminated):
     """Task-success flag: prefer explicit info keys, else the terminated flag.
 
-    Mirrors ``src.ppo.latent_env.success_from_info`` so the sparse reward agrees
+    Mirrors ``src.ppo.env.success_from_info`` so the sparse reward agrees
     with how success is tracked elsewhere (block-pose success under
     ``fixed_target``; native ``terminated``-on-success otherwise).
     """
