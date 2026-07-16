@@ -4,3 +4,18 @@ data/**/*
 
 le-wm/
 models/
+# training artifacts
+runs/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+wandb/
+runs/
+wandb/
+le-wm/
+.DS_Store
+.env
+.vscode/
