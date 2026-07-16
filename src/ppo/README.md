@@ -11,13 +11,13 @@ with an exploration `log_std` and a separate value head.
 | File              | Purpose                                                              |
 |-------------------|----------------------------------------------------------------------|
 | `config.py`       | `LatentConfig` dataclass — all hyperparameters                       |
-| `env.py`          | image-observation env factory + `LatentHistory` (dilated latent stack) |
+| `env.py`          | image-observation training env factory                                |
 | `agent.py`        | `LatentPPOAgent` (BC-prior actor, value head) + `build_latent_agent` |
-| `lewm_encoder.py` | frozen LeWM ViT encoder wrapper (`LeWMLatentEncoder`)                |
+| `../representations/lewm.py` | shared frozen LeWM encoder used by BC and PPO              |
 | `utils.py`        | seeding, device selection, reward normalizer                         |
 | `ppo.py`          | `LatentPPOTrainer` — chunk rollout, GAE, clipped PPO update, checkpointing |
 | `train.py`        | CLI entry point (`python -m src.ppo.train`)                          |
-| `evaluate.py`     | load a checkpoint, evaluate (open-loop / receding-horizon / temporal ensemble), record MP4s |
+| `../evaluation/`  | canonical BC/PPO PushT evaluation and agent adapters                  |
 
 ## How it works
 
@@ -39,6 +39,8 @@ with an exploration `log_std` and a separate value head.
 
 Requires the LeWM object checkpoint in the swm cache
 (`python -m scripts.download_lewm_checkpoint`) and a trained BC checkpoint.
+BC/PPO policy references use Hugging Face snapshots and reuse the local Hub
+cache when the remote commit has not changed.
 Run from the project root:
 
 ```bash
@@ -47,21 +49,22 @@ python -m src.ppo.train --smoke
 
 # training run (flags accept dash or underscore spellings)
 python src/ppo/train.py \
-  --bc_checkpoint checkpoints/trained_policies/pusht_latent_bc.pth \
-  --bc_stats checkpoints/trained_policies/pusht_latent_bc_stats.pth \
+  --bc_checkpoint hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc.pth \
+  --bc_stats hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc_stats.pth \
   --fixed_target --eval_interval 10 \
   --total_timesteps 1000000 --num_envs 8 --num_chunks 64
 
-# evaluate + record videos
-python -m src.ppo.evaluate \
-  --checkpoint runs/<exp_name>__seed<seed>/<timestamp>/best.pt \
-  --episodes 20 --video
+# evaluate + record videos through the shared environment runner
+python -m src.evaluation.evaluate_pusht \
+  --agent-type ppo \
+  --checkpoint hf://offline-rl-with-le-wm/ppo/best.pt \
+  --episodes 20 --seed 42 --video
 ```
 
 Checkpoints (`latest.pt`, `best.pt`, `second_best.pt`, `final.pt`) and videos
 are written under `runs/<exp_name>__seed<seed>/<timestamp>/`. With
 `--eval_interval N > 0`, `best.pt` is selected by deterministic held-out
-success (fixed seeds), matching `evaluate.py`.
+success using the same canonical runner as external BC/PPO evaluation.
 
 ## Logged metrics
 

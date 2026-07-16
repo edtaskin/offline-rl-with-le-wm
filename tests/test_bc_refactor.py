@@ -18,7 +18,7 @@ from src.bc.history import (
     temporal_ensemble_action,
 )
 from src.bc.latent_cache import check_latent_cache, metadata_matches
-from src.bc.lewm import LeWMFeatureExtractor
+from src.representations.lewm import LeWMEncoder
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 
 
@@ -158,7 +158,7 @@ class CacheAndPolicyTests(unittest.TestCase):
                 return SimpleNamespace(last_hidden_state=tokens)
 
         encoder = FakeEncoder()
-        extractor = LeWMFeatureExtractor(
+        extractor = LeWMEncoder(
             encoder=encoder,
             device="cpu",
             checkpoint_path="unused.ckpt",

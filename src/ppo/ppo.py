@@ -50,7 +50,7 @@ def _configure_logging() -> None:
 from src.ppo.agent import build_latent_agent
 from src.ppo.config import LatentConfig
 from src.ppo.env import LatentHistory, make_latent_env, success_from_info
-from src.ppo.lewm_encoder import LeWMLatentEncoder
+from src.representations.lewm import LeWMEncoder
 from src.ppo.utils import RewardNormalizer, get_device, set_seed
 
 
@@ -80,7 +80,7 @@ class LatentPPOTrainer:
 
         # Frozen encoder (allow injection for testing) + BC-initialized agent.
         if encoder is None:
-            encoder = LeWMLatentEncoder.from_checkpoint(
+            encoder = LeWMEncoder.from_checkpoint(
                 self.device,
                 cfg.encoder_checkpoint,
                 latent_dim=cfg.latent_dim,
@@ -381,59 +381,72 @@ class LatentPPOTrainer:
 
     @torch.no_grad()
     def _evaluate_heldout(self) -> dict:
-        """Deterministic held-out success on a fixed seed set.
+        """Evaluate the in-memory agent through the canonical PushT runner."""
+        from src.evaluation.agents import PPOComponents, make_ppo_evaluation_agent
+        from src.evaluation.pusht import PushTEvalConfig, run_evaluation
 
-        Mirrors src/ppo/evaluate.py: open-loop chunk execution with the
-        mean action, dilated latent history, on seeds ``[eval_seed, +N)``. Uses a
-        dedicated env and local state, so training rollout state is untouched.
-        """
         cfg = self.cfg
         if self._eval_env is None:
-            # No reward shaping here: success is shaping-independent, and this
-            # matches the coef=0 env that evaluate.py uses. The block
-            # start distribution *does* affect success, so it is matched.
             self._eval_env = make_latent_env(
                 env_id=cfg.env_id,
                 seed=cfg.eval_seed,
                 idx=0,
                 max_episode_steps=cfg.max_episode_steps,
                 record_stats=True,
-                fixed_target=cfg.fixed_target,
+                fixed_target=True,
                 fixed_target_block_success=cfg.fixed_target_block_success,
                 block_start_near_goal=cfg.block_start_near_goal,
                 block_start_radius=cfg.block_start_radius,
             )()
-        env = self._eval_env
-        k = cfg.action_chunk_size
-
-        successes, lengths = [], []
-        for ep in range(cfg.eval_episodes):
-            obs, info = env.reset(seed=cfg.eval_seed + ep)
-            hist = LatentHistory(cfg.frame_stack, cfg.frame_stride)
-            hist.append(self._encode_obs(obs)[0])
-            done = terminated = False
-            while not done:
-                stacked = hist.stacked().unsqueeze(0)
-                action = self.agent.actor.dist_from_latents(stacked).mean
-                action_np = torch.clamp(action, -1.0, 1.0).cpu().numpy()[0]
-                for j in range(k):
-                    obs, _, terminated, truncated, info = env.step(action_np[j])
-                    hist.append(self._encode_obs(obs)[0])
-                    if terminated or truncated:
-                        done = True
-                        break
-            successes.append(success_from_info(info, terminated))
-            lengths.append(float(info["episode"]["l"]) if "episode" in info else 0.0)
+        contract = {
+            "frame_stack": cfg.frame_stack,
+            "frame_stride": cfg.frame_stride,
+            "action_chunk_size": cfg.action_chunk_size,
+            "latent_dim": cfg.latent_dim,
+            "hidden_dim": cfg.hidden_dim,
+            "action_dim": cfg.action_dim,
+        }
+        adapter = make_ppo_evaluation_agent(
+            components=PPOComponents(
+                encoder=self.encoder,
+                agent=self.agent,
+                contract=contract,
+                config=cfg.__dict__,
+            ),
+            deterministic=True,
+            execution_mode="open-loop",
+        )
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            result = run_evaluation(
+                adapter,
+                PushTEvalConfig(
+                    env_id=cfg.env_id,
+                    episodes=cfg.eval_episodes,
+                    seed=cfg.eval_seed,
+                    max_episode_steps=cfg.max_episode_steps,
+                    fixed_target_block_success=cfg.fixed_target_block_success,
+                    block_start_radius=(
+                        cfg.block_start_radius if cfg.block_start_near_goal else None
+                    ),
+                ),
+                env=self._eval_env,
+            )
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
         logger.info(
             "Held-out eval | success %4.2f | len %5.1f | (%d eps, seed %d)",
-            float(np.mean(successes)),
-            float(np.mean(lengths)),
+            result.summary["success_rate"],
+            result.summary["mean_length"],
             cfg.eval_episodes,
             cfg.eval_seed,
         )
         return {
-            "success_rate": float(np.mean(successes)),
-            "mean_length": float(np.mean(lengths)),
+            "success_rate": result.summary["success_rate"],
+            "mean_length": result.summary["mean_length"],
             "episodes": cfg.eval_episodes,
         }
 

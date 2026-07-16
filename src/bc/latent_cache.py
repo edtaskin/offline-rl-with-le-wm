@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.bc.lewm import lewm_preprocessing_metadata
+from src.representations.lewm import lewm_preprocessing_metadata
 
 
 def path_fingerprint(path):

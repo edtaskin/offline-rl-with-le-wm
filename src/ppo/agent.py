@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
+from src.utils.hf_hub import resolve_artifact
 
 
 class LatentPPOActor(nn.Module):
@@ -152,7 +153,7 @@ def build_latent_agent(
     """Construct a :class:`LatentPPOAgent`, optionally loading BC policy weights.
 
     ``encoder`` should return ``[B, latent_dim]`` latents for ``[B, C, H, W]``
-    images (e.g. :class:`src.ppo.lewm_encoder.LeWMLatentEncoder`). When
+    images (e.g. :class:`src.representations.lewm.LeWMEncoder`). When
     ``bc_checkpoint_path`` is given, its weights are loaded into the actor's
     ``bc_policy`` so PPO starts from the BC prior.
     """
@@ -164,7 +165,8 @@ def build_latent_agent(
         action_chunk_size=action_chunk_size,
     )
     if bc_checkpoint_path is not None:
-        state_dict = torch.load(bc_checkpoint_path, map_location=device)
+        resolved_checkpoint = resolve_artifact(bc_checkpoint_path)
+        state_dict = torch.load(resolved_checkpoint, map_location=device)
         bc_policy.load_state_dict(state_dict)
 
     agent = LatentPPOAgent(

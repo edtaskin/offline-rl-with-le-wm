@@ -24,10 +24,10 @@ from src.bc.latent_cache import (
     expected_latent_cache_metadata,
     num_samples_from_data,
 )
-from src.bc.lewm import (
+from src.representations.lewm import (
     LEWM_DEFAULT_FEATURE_DIM,
     LEWM_IMAGE_NORMALIZATION,
-    LeWMFeatureExtractor,
+    LeWMEncoder,
     default_lewm_checkpoint_path,
     lewm_preprocessing_metadata,
 )
@@ -95,7 +95,7 @@ def _prepare_dataset(args, device):
                 frame_stride=1,
                 action_chunk_size=1,
             )
-            extractor = LeWMFeatureExtractor.load(
+            extractor = LeWMEncoder.load(
                 device=device,
                 checkpoint_path=checkpoint_path,
                 feature_dim=latent_dim,
@@ -123,7 +123,7 @@ def _prepare_dataset(args, device):
             frame_stride=args.frame_stride,
             action_chunk_size=args.action_chunk_size,
         )
-        extractor = LeWMFeatureExtractor.load(
+        extractor = LeWMEncoder.load(
             device=device,
             checkpoint_path=checkpoint_path,
             feature_dim=latent_dim,
@@ -367,7 +367,7 @@ def train_latent_bc(args):
 def build_parser():
     parser = argparse.ArgumentParser(description="Latent-Space Behavior Cloning (BC) Prior for LeWorldModel")
     parser.add_argument("--data_path", type=str, default="data/expert_trajectories/pusht_expert.npz", help="Path to the converted expert dataset .npz file")
-    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/trained_policies/pusht_latent_bc.pth", help="Path to save the final trained policy weights")
+    parser.add_argument("--checkpoint_path", type=str, default="runs/bc/pusht_latent_bc.pth", help="Temporary local output path used before optional Hugging Face upload")
     parser.add_argument("--latent_cache_path", type=str, default=None, help="Path for cached per-frame LeWM CLS latents; defaults to data/latent_cache/<dataset>_lewm_object_imagenet224_cls.pt")
     parser.add_argument("--rebuild_latent_cache", action="store_true", help="Recompute and overwrite the LeWM latent cache before training")
     parser.add_argument("--disable_latent_cache", action="store_true", help="Disable latent caching and encode image batches through LeWM during every epoch")
