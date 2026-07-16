@@ -10,3 +10,9 @@ __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
 wandb/
+runs/
+wandb/
+le-wm/
+.DS_Store
+.env
+.vscode/
