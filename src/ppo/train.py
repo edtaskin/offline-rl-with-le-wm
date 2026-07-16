@@ -2,8 +2,8 @@
 
 Requires the official LeWM object checkpoint in the swm cache
 (``<cache>/checkpoints/pusht/lewm_object.ckpt`` -- see
-``scripts/download_lewm_checkpoint.py``) and a trained BC checkpoint (default:
-``checkpoints/trained_policies/pusht_latent_bc.pth``). Runnable either way::
+``scripts/download_lewm_checkpoint.py``) and a trained BC checkpoint from the
+Hugging Face Hub. Runnable either way::
 
     python -m src.ppo.train --smoke
     python src/ppo/train.py --fixed_target --frame_stack 3 --action_chunk_size 5
@@ -18,7 +18,6 @@ Precedence: CLI > stats > defaults.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -39,6 +38,7 @@ except Exception:  # noqa: BLE001 - dotenv is optional
 import torch
 
 from src.ppo.config import LatentConfig
+from src.utils.hf_hub import resolve_artifact
 
 CONTRACT_FIELDS = (
     "frame_stack",
@@ -112,13 +112,11 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _stats_contract(stats_path: str) -> dict:
-    if not os.path.exists(stats_path):
-        print(f"BC stats file not found at {stats_path}; using contract defaults.")
-        return {}
-    stats = torch.load(stats_path, map_location="cpu")
+    resolved_stats_path = resolve_artifact(stats_path)
+    stats = torch.load(resolved_stats_path, map_location="cpu")
     overrides = {k: int(stats[k]) for k in CONTRACT_FIELDS if k in stats}
     if overrides:
-        print(f"Contract from {stats_path}: {overrides}")
+        print(f"Contract from {stats_path} ({resolved_stats_path}): {overrides}")
     return overrides
 
 

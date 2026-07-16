@@ -13,21 +13,13 @@ latents, exactly like the BC policy at train/eval time. This module provides:
 
 from __future__ import annotations
 
-from collections import deque
 from typing import Callable
 
 import gymnasium as gym
-import torch
 
 from src.envs import PUSHT_FIXED_TARGET_POSE, make_pusht_env
-
-
-def success_from_info(info: dict, terminated: bool) -> float:
-    """Episode success flag, mirroring ``run_eval._success_from_info``."""
-    for key in ("success", "is_success", "task_success"):
-        if key in info:
-            return float(info[key])
-    return float(terminated)
+from src.evaluation.pusht import success_from_info
+from src.representations.history import LatentHistory
 
 
 def make_latent_env(
@@ -78,45 +70,3 @@ def make_latent_env(
         return env
 
     return thunk
-
-
-class LatentHistory:
-    """Per-env dilated history of step latents -> stacked ``[frame_stack, D]``.
-
-    Stores one latent (shape ``[latent_dim]``) per environment step and selects
-    ``frame_stack`` of them spaced ``frame_stride`` steps apart, ending at the
-    most recent, padding with the oldest available latent early in an episode.
-    This is the exact selection used by ``run_eval.build_stacked_latents``.
-    """
-
-    def __init__(self, frame_stack: int, frame_stride: int):
-        if frame_stack < 1:
-            raise ValueError("frame_stack must be at least 1")
-        if frame_stride < 1:
-            raise ValueError("frame_stride must be at least 1")
-        self.frame_stack = frame_stack
-        self.frame_stride = frame_stride
-        self.max_len = (frame_stack - 1) * frame_stride + 1
-        self._buf: deque[torch.Tensor] = deque(maxlen=self.max_len)
-
-    def clear(self) -> None:
-        self._buf.clear()
-
-    def append(self, latent: torch.Tensor) -> None:
-        """Append one step latent (shape ``[latent_dim]``)."""
-        self._buf.append(latent)
-
-    def __len__(self) -> int:
-        return len(self._buf)
-
-    def stacked(self) -> torch.Tensor:
-        """Return the dilated stack ``[frame_stack, latent_dim]``."""
-        if not self._buf:
-            raise RuntimeError("LatentHistory is empty; append a latent first")
-        history = list(self._buf)
-        oldest = history[0]
-        selected = []
-        for offset in range(self.frame_stack - 1, -1, -1):
-            idx = len(history) - 1 - offset * self.frame_stride
-            selected.append(history[idx] if idx >= 0 else oldest)
-        return torch.stack(selected, dim=0)

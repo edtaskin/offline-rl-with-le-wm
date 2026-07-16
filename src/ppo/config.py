@@ -39,11 +39,15 @@ class LatentConfig:
     reward_mode: str = "sparse"
 
     # ----- BC prior / encoder -----
-    bc_checkpoint: str = "checkpoints/trained_policies/pusht_latent_bc.pth"
-    bc_stats: str = "checkpoints/trained_policies/pusht_latent_bc_stats.pth"
+    bc_checkpoint: str = (
+        "hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc.pth"
+    )
+    bc_stats: str = (
+        "hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc_stats.pth"
+    )
     encoder_checkpoint: str | None = None  # None -> default swm cache path
 
-    # ----- agent contract (defaults match the shipped BC checkpoint; the entry
+    # ----- agent contract (defaults match the published BC checkpoint; the entry
     # point overrides these from ``bc_stats`` when present) -----
     frame_stack: int = 3
     frame_stride: int = 5

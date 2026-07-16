@@ -6,6 +6,7 @@ le-wm/
 models/
 # training artifacts
 runs/
+checkpoints/
 
 # python
 __pycache__/

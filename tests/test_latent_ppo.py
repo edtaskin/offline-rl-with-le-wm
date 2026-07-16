@@ -11,7 +11,7 @@ here needs the real LeWM checkpoint or expert data. Covers:
 * determinism of the frozen-encoder latent path;
 * the gradient contract (BC policy / log_std / critic get grads; encoder does not);
 * ``LatentHistory`` dilated frame selection;
-* ``build_latent_agent`` loading the shipped BC checkpoint (skipped if absent);
+* ``build_latent_agent`` loading a local experimental BC checkpoint;
 * an end-to-end trainer run on a fake image env (rollout + GAE + update + save).
 """
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -182,25 +183,24 @@ def test_latent_history_dilated_selection():
 
 
 def test_build_latent_agent_loads_bc_checkpoint():
-    """The factory loads the shipped BC checkpoint into bc_policy (skips if absent)."""
-    ckpt = REPO_ROOT / "checkpoints/trained_policies/pusht_latent_bc.pth"
-    if not ckpt.exists():
-        print("  [skip] BC checkpoint not present")
-        return
-    encoder = DummyImageEncoder(latent_dim=192)
-    agent = build_latent_agent(
-        encoder=encoder,
-        latent_dim=192,
-        frame_stack=3,
-        action_dim=2,
-        action_chunk_size=5,
-        hidden_dim=256,
-        bc_checkpoint_path=str(ckpt),
-        device="cpu",
-    )
-    ref = torch.load(ckpt, map_location="cpu")
-    assert torch.equal(agent.actor.bc_policy.net[0].weight, ref["net.0.weight"])
-    assert torch.equal(agent.actor.bc_policy.net[4].bias, ref["net.4.bias"])
+    """The factory still accepts explicit experiment paths outside checkpoints/."""
+    reference_agent = _make_agent(action_chunk_size=5)
+    reference_state = reference_agent.actor.bc_policy.state_dict()
+    with TemporaryDirectory() as temporary_dir:
+        ckpt = Path(temporary_dir) / "bc_prior.pth"
+        torch.save(reference_state, ckpt)
+        agent = build_latent_agent(
+            encoder=DummyImageEncoder(latent_dim=192),
+            latent_dim=192,
+            frame_stack=3,
+            action_dim=2,
+            action_chunk_size=5,
+            hidden_dim=256,
+            bc_checkpoint_path=str(ckpt),
+            device="cpu",
+        )
+    assert torch.equal(agent.actor.bc_policy.net[0].weight, reference_state["net.0.weight"])
+    assert torch.equal(agent.actor.bc_policy.net[4].bias, reference_state["net.4.bias"])
 
 
 class _FakeImageEnv(gym.Env):
@@ -271,6 +271,8 @@ def test_trainer_end_to_end_fake_env(monkeypatch=None):
             max_episode_steps=6,
             save_dir=str(REPO_ROOT / "runs"),
             save_interval=1,
+            eval_interval=1,
+            eval_episodes=2,
         )
         encoder = DummyImageEncoder(latent_dim=192)
         trainer = latent_ppo.LatentPPOTrainer(cfg, encoder=encoder)
