@@ -30,7 +30,7 @@ import torchvision.transforms as T
 
 # Reuse the exact preprocessing constants the dataset/eval use, so PPO latents
 # match the ones the BC policy was trained on.
-from src.bc.dataset import LEWM_IMAGE_MEAN, LEWM_IMAGE_SIZE, LEWM_IMAGE_STD
+from src.bc.lewm import LEWM_IMAGE_MEAN, LEWM_IMAGE_SIZE, LEWM_IMAGE_STD
 
 LEWM_LATENT_DIM = 192
 
