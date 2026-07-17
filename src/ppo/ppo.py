@@ -30,6 +30,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
+
 logger = logging.getLogger(__name__)
 
 
@@ -97,6 +99,24 @@ class LatentPPOTrainer:
             bc_checkpoint_path=cfg.bc_checkpoint,
             device=self.device,
         )
+        # Load frozen BC policy if KL penalty required
+        self.bc_ref_policy = None
+        if cfg.BC_KL_penalty:
+            if cfg.bc_checkpoint is None:
+                raise ValueError("BC_KL_penalty requires cfg.bc_checkpoint")
+            self.bc_ref_policy = LatentBCPolicy(
+                latent_dim=cfg.latent_dim,
+                frame_stack=cfg.frame_stack,
+                action_dim=cfg.action_dim,
+                hidden_dim=cfg.hidden_dim,
+                action_chunk_size=cfg.action_chunk_size,
+            ).to(self.device)
+            self.bc_ref_policy.load_state_dict(
+                torch.load(cfg.bc_checkpoint, map_location=self.device)
+            )
+            self.bc_ref_policy.eval()
+            for param in self.bc_ref_policy.parameters():
+                param.requires_grad = False
         if cfg.anneal_log_std:
             # Schedule exploration instead of learning it: freeze the parameter
             # (so it is excluded from ``trainable`` below) and set it per
@@ -288,7 +308,8 @@ class LatentPPOTrainer:
         inds = np.arange(cfg.batch_size)
         clipfracs = []
         approx_kl = torch.tensor(0.0)
-        pg_loss = v_loss = entropy_loss = torch.tensor(0.0)
+        pg_loss = v_loss = entropy_loss = torch.tensor(0.0, device=self.device)
+        bc_kl_loss = torch.tensor(0.0, device=self.device)
         for _epoch in range(cfg.update_epochs):
             np.random.shuffle(inds)
             for start in range(0, cfg.batch_size, cfg.minibatch_size):
@@ -325,7 +346,22 @@ class LatentPPOTrainer:
                     v_loss = 0.5 * ((newvalue - returns_t[mb]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - cfg.ent_coef * entropy_loss + cfg.vf_coef * v_loss
+                if cfg.BC_KL_penalty:
+                    if self.bc_ref_policy is None:
+                        raise RuntimeError("BC_KL_penalty is enabled without a BC reference policy")
+                    current_action_mean = self.agent.actor.bc_policy(latents[mb])
+                    with torch.no_grad():
+                        bc_action_mean = self.bc_ref_policy(latents[mb])
+                    bc_kl_loss = ((current_action_mean - bc_action_mean) ** 2).mean()
+                else:
+                    bc_kl_loss = torch.tensor(0.0, device=self.device)
+
+                loss = (
+                    pg_loss
+                    - cfg.ent_coef * entropy_loss
+                    + cfg.vf_coef * v_loss
+                    + cfg.BC_KL_penalty_coef * bc_kl_loss
+                )
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -343,6 +379,7 @@ class LatentPPOTrainer:
             "loss/policy": pg_loss.item(),
             "loss/value": v_loss.item(),
             "loss/entropy": entropy_loss.item(),
+            "loss/bc_kl": bc_kl_loss.item(),
             "loss/approx_kl": approx_kl.item(),
             "loss/clipfrac": float(np.mean(clipfracs)) if clipfracs else 0.0,
             "loss/explained_variance": float(explained_var),
