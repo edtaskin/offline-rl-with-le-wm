@@ -4,13 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-
-import numpy as np
-import torch
 
 from src.envs import PUSHT_FIXED_TARGET_POSE
 from src.evaluation.agents import make_bc_evaluation_agent, make_ppo_evaluation_agent
@@ -93,14 +89,6 @@ def build_parser():
     return parser
 
 
-def _seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def _slug(value):
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip("-._")
     return slug or "eval"
@@ -164,7 +152,6 @@ def evaluate_from_args(args):
     if args.stochastic and args.execution_mode == "temporal-ensemble":
         raise ValueError("temporal ensembling requires deterministic chunk predictions")
     repeat_seeds = make_repeat_seeds(args.seed, args.repeats, args.episodes)
-    _seed_everything(repeat_seeds[0])
     agent_kwargs = {
         "checkpoint": args.checkpoint,
         "device": args.device,
@@ -188,7 +175,6 @@ def evaluate_from_args(args):
     print(f"Evaluation run directory: {run_dir}")
     results = []
     for repeat, repeat_seed in enumerate(repeat_seeds):
-        _seed_everything(repeat_seed)
         video_dir = run_dir / "videos" / f"repeat_{repeat:02d}_seed_{repeat_seed}"
         config = PushTEvalConfig(
             env_id=args.env_id,
@@ -212,7 +198,7 @@ def evaluate_from_args(args):
             f"seeds={config.seed}..{config.seed + config.episodes - 1}"
         )
         results.append(run_evaluation(agent, config))
-    result = aggregate_evaluation_results(results, repeat_seeds)
+    result = aggregate_evaluation_results(results)
     print("Aggregate evaluation summary:")
     for key, value in result.summary.items():
         print(f"  {key}: {value}")
@@ -233,7 +219,7 @@ def _save_and_track_result(args, result, run_dir):
         if args.wandb_mode is not None:
             init_kwargs["mode"] = args.wandb_mode
         run = wandb.init(**init_kwargs)
-        for step, episode in enumerate(getattr(result, "episodes", []), start=1):
+        for step, episode in enumerate(result.episodes, start=1):
             run.log(
                 {
                     "eval/episode_return": episode.episode_return,

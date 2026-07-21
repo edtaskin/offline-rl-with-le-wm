@@ -98,12 +98,24 @@ class EvaluationResult:
 class RepeatedEvaluationResult:
     """Aggregate result for multiple evaluations with distinct seed ranges."""
 
-    config: PushTEvalConfig
-    agent_type: str
-    agent_metadata: dict[str, Any]
-    repeat_seeds: list[int]
     results: list[EvaluationResult]
     summary: dict[str, float | int]
+
+    @property
+    def config(self):
+        return self.results[0].config
+
+    @property
+    def agent_type(self):
+        return self.results[0].agent_type
+
+    @property
+    def agent_metadata(self):
+        return self.results[0].agent_metadata
+
+    @property
+    def repeat_seeds(self):
+        return [result.config.seed for result in self.results]
 
     @property
     def episodes(self):
@@ -248,15 +260,12 @@ def summarize_results(episodes):
     return summary
 
 
-def aggregate_evaluation_results(results, repeat_seeds):
+def aggregate_evaluation_results(results):
     """Pool equally sized repeated evaluations into one reliable estimate."""
 
     results = list(results)
-    repeat_seeds = list(repeat_seeds)
     if not results:
         raise ValueError("at least one evaluation result is required")
-    if len(results) != len(repeat_seeds):
-        raise ValueError("repeat_seeds must contain one seed per evaluation result")
     episode_counts = {len(result.episodes) for result in results}
     if len(episode_counts) != 1:
         raise ValueError("all repeated evaluations must have the same episode count")
@@ -270,14 +279,9 @@ def aggregate_evaluation_results(results, repeat_seeds):
         {
             "repeats": len(results),
             "episodes_per_repeat": episode_counts.pop(),
-            "total_episodes": len(episodes),
         }
     )
     return RepeatedEvaluationResult(
-        config=first.config,
-        agent_type=first.agent_type,
-        agent_metadata=dict(first.agent_metadata),
-        repeat_seeds=repeat_seeds,
         results=results,
         summary=summary,
     )

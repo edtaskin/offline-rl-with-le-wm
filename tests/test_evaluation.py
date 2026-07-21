@@ -12,6 +12,7 @@ from src.evaluation.evaluate_pusht import (
     _write_metrics,
     build_parser,
     create_run_directory,
+    evaluate_from_args,
     make_repeat_seeds,
 )
 from src.evaluation.pusht import (
@@ -83,6 +84,43 @@ class EvaluationRunnerTests(unittest.TestCase):
         ]
         self.assertEqual(seeds, [7, 9, 11])
         self.assertEqual(len(episode_seeds), len(set(episode_seeds)))
+
+    def test_each_repeat_uses_its_seed_once(self):
+        with TemporaryDirectory() as temporary_dir:
+            args = build_parser().parse_args(
+                [
+                    "--agent-type",
+                    "bc",
+                    "--checkpoint",
+                    "test.pt",
+                    "--episodes",
+                    "1",
+                    "--repeats",
+                    "2",
+                    "--seed",
+                    "7",
+                    "--output-root",
+                    temporary_dir,
+                ]
+            )
+
+            def evaluate_fake_env(agent, config):
+                return run_evaluation(agent, config, env=FakePushTEnv())
+
+            agent = ConstantAgent([0.0, 0.0])
+            with (
+                patch(
+                    "src.evaluation.evaluate_pusht.make_bc_evaluation_agent",
+                    return_value=agent,
+                ),
+                patch(
+                    "src.evaluation.evaluate_pusht.run_evaluation",
+                    side_effect=evaluate_fake_env,
+                ),
+            ):
+                evaluate_from_args(args)
+
+        self.assertEqual(agent.reset_seeds, [7, 8])
 
     def test_reward_mode_is_not_an_evaluation_option(self):
         destinations = {action.dest for action in build_parser()._actions}
@@ -172,12 +210,12 @@ class EvaluationRunnerTests(unittest.TestCase):
             PushTEvalConfig(episodes=2, seed=12),
             env=FakePushTEnv(),
         )
-        aggregate = aggregate_evaluation_results([first, second], [10, 12])
+        aggregate = aggregate_evaluation_results([first, second])
         payload = aggregate.to_dict()
 
         self.assertEqual(aggregate.summary["repeats"], 2)
         self.assertEqual(aggregate.summary["episodes_per_repeat"], 2)
-        self.assertEqual(aggregate.summary["total_episodes"], 4)
+        self.assertEqual(aggregate.summary["episodes"], 4)
         self.assertAlmostEqual(
             aggregate.summary["mean_return"],
             (first.summary["mean_return"] + second.summary["mean_return"]) / 2,

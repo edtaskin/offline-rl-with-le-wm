@@ -82,8 +82,6 @@ class LatentChunkAgent:
 
     def reset(self, seed):
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
         self.history.clear()
         self._action_queue.clear()
         self._temporal_predictions.clear()
