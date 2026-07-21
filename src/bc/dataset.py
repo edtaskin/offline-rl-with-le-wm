@@ -82,9 +82,21 @@ class PushTImageDataset(_PushTTemporalDataset):
             raw_actions = torch.tensor(data["actions"], dtype=torch.float32)
             raw_states = torch.tensor(data["states"], dtype=torch.float32)
             episode_ends = np.asarray(data["episode_ends"])
+        if raw_images.ndim != 4:
+            raise ValueError(
+                f"expected NHWC or NCHW RGB images, got shape {tuple(raw_images.shape)}"
+            )
         if raw_images.shape[-1] == 3:
             raw_images = np.transpose(raw_images, (0, 3, 1, 2))
-        self.images = torch.tensor(raw_images, dtype=torch.float32) / 255.0
+        elif raw_images.shape[1] != 3:
+            raise ValueError(
+                f"expected NHWC or NCHW RGB images, got shape {tuple(raw_images.shape)}"
+            )
+        # Preserve the dataset's storage dtype and share the NumPy allocation.
+        # In particular, converting a 224x224 uint8 dataset to float32 here would
+        # require roughly 15 GB before the one-time LeWM latent-cache pass. The
+        # shared LeWM preprocessor accepts both uint8 [0, 255] and float images.
+        self.images = torch.from_numpy(raw_images)
         if len(self.images) != len(raw_actions):
             raise ValueError(f"images/actions length mismatch: {len(self.images)} vs {len(raw_actions)}")
         if len(self.images) != len(raw_states):
@@ -96,6 +108,12 @@ class PushTImageDataset(_PushTTemporalDataset):
             frame_stack,
             frame_stride,
             action_chunk_size,
+        )
+        self.stats.update(
+            {
+                "source_image_shape": list(self.images.shape[-2:]),
+                "source_image_dtype": str(self.images.dtype),
+            }
         )
 
     def __len__(self):

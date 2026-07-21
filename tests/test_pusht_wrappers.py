@@ -81,6 +81,17 @@ def test_green_t_center_matches_pixels():
     env.close()
 
 
+def test_render_observation_shape_tracks_resolution():
+    """The declared and returned image shapes match an explicit resolution."""
+    if not _HAVE_ENV:
+        return
+    env = make_pusht_env(resolution=128)
+    observation, _ = env.reset(seed=0)
+    assert observation.shape == (128, 128, 3)
+    assert env.observation_space.shape == observation.shape
+    env.close()
+
+
 def test_block_starts_within_radius():
     """Block centroid spawns within ``radius`` of the green T center, both modes.
 
