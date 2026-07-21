@@ -34,9 +34,12 @@ python -m src.bc.train_bc_latent \
 ```
 
 Each evaluation creates a timestamped directory under `runs/evaluations/`.
-The complete result is saved as `metrics.json`; with `--video`, episode videos
-are saved in the same run directory under `videos/`. Use `--output-root` to
-change the parent directory and `--run-name` to append a readable label.
+By default, it runs 3 repeats of 50 episodes. `--seed` sets the first repeat's
+seed; later repeats use deterministic, non-overlapping seed ranges. The pooled
+summary and each repeat's summary are saved in `metrics.json`; with `--video`,
+episode videos are saved in repeat-specific directories under `videos/`. Use
+`--output-root` to change the parent directory and `--run-name` to append a
+readable label. Set `--repeats 1` for a single evaluation.
 
 Evaluate BC on the fixed-target task. Passing `--block-start-radius 200`
 matches the PPO training start distribution; omit it for unrestricted block
@@ -51,7 +54,8 @@ python -m src.evaluation.evaluate_pusht \
   --episodes 50 \
   --max-episode-steps 300 \
   --video \
-  --seed 42
+  --seed 42 \
+  --repeats 3
 ```
 
 ## PPO 
@@ -86,5 +90,6 @@ python -m src.evaluation.evaluate_pusht \
   --episodes 50 \
   --max-episode-steps 300 \
   --seed 42 \
+  --repeats 3 \
   --video
 ```

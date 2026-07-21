@@ -8,8 +8,18 @@ import numpy as np
 import torch
 
 from src.evaluation.agents import LatentChunkAgent
-from src.evaluation.evaluate_pusht import _write_metrics, build_parser, create_run_directory
-from src.evaluation.pusht import PushTEvalConfig, make_evaluation_env, run_evaluation
+from src.evaluation.evaluate_pusht import (
+    _write_metrics,
+    build_parser,
+    create_run_directory,
+    make_repeat_seeds,
+)
+from src.evaluation.pusht import (
+    PushTEvalConfig,
+    aggregate_evaluation_results,
+    make_evaluation_env,
+    run_evaluation,
+)
 
 
 class FakePushTEnv(gym.Env):
@@ -58,6 +68,22 @@ class DummyEncoder(torch.nn.Module):
 
 
 class EvaluationRunnerTests(unittest.TestCase):
+    def test_cli_defaults_to_three_repeats_of_fifty_episodes(self):
+        parser = build_parser()
+        episodes = parser.get_default("episodes")
+        repeats = parser.get_default("repeats")
+        self.assertEqual(episodes, 50)
+        self.assertEqual(repeats, 3)
+        self.assertEqual(make_repeat_seeds(42, repeats, episodes), [42, 92, 142])
+
+    def test_repeat_seed_ranges_do_not_overlap(self):
+        seeds = make_repeat_seeds(7, repeats=3, episodes=2)
+        episode_seeds = [
+            seed + episode for seed in seeds for episode in range(2)
+        ]
+        self.assertEqual(seeds, [7, 9, 11])
+        self.assertEqual(len(episode_seeds), len(set(episode_seeds)))
+
     def test_reward_mode_is_not_an_evaluation_option(self):
         destinations = {action.dest for action in build_parser()._actions}
         self.assertNotIn("reward_mode", destinations)
@@ -134,6 +160,34 @@ class EvaluationRunnerTests(unittest.TestCase):
         config = PushTEvalConfig(episodes=3, seed=41)
         run_evaluation(agent, config, env=FakePushTEnv())
         self.assertEqual(agent.reset_seeds, [41, 42, 43])
+
+    def test_repeated_results_are_pooled_and_keep_per_repeat_summaries(self):
+        first = run_evaluation(
+            ConstantAgent([0.0, 0.0]),
+            PushTEvalConfig(episodes=2, seed=10),
+            env=FakePushTEnv(),
+        )
+        second = run_evaluation(
+            ConstantAgent([0.5, 0.0]),
+            PushTEvalConfig(episodes=2, seed=12),
+            env=FakePushTEnv(),
+        )
+        aggregate = aggregate_evaluation_results([first, second], [10, 12])
+        payload = aggregate.to_dict()
+
+        self.assertEqual(aggregate.summary["repeats"], 2)
+        self.assertEqual(aggregate.summary["episodes_per_repeat"], 2)
+        self.assertEqual(aggregate.summary["total_episodes"], 4)
+        self.assertAlmostEqual(
+            aggregate.summary["mean_return"],
+            (first.summary["mean_return"] + second.summary["mean_return"]) / 2,
+        )
+        self.assertEqual(payload["config"]["repeat_seeds"], [10, 12])
+        self.assertEqual(len(payload["repeat_summaries"]), 2)
+        self.assertEqual(
+            [episode["repeat"] for episode in payload["episodes"]],
+            [0, 0, 1, 1],
+        )
 
     def test_invalid_action_shape_is_rejected(self):
         config = PushTEvalConfig(episodes=1)

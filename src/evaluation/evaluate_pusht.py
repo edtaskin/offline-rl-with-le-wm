@@ -14,7 +14,11 @@ import torch
 
 from src.envs import PUSHT_FIXED_TARGET_POSE
 from src.evaluation.agents import make_bc_evaluation_agent, make_ppo_evaluation_agent
-from src.evaluation.pusht import PushTEvalConfig, run_evaluation
+from src.evaluation.pusht import (
+    PushTEvalConfig,
+    aggregate_evaluation_results,
+    run_evaluation,
+)
 
 
 def build_parser():
@@ -41,7 +45,18 @@ def build_parser():
     parser.add_argument("--temporal-ensemble-decay", type=float, default=0.01)
 
     parser.add_argument("--env-id", default="swm/PushT-v1")
-    parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=50,
+        help="number of episodes per evaluation repeat (default: 50)",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="number of evaluation repeats with non-overlapping seed ranges (default: 3)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-episode-steps", type=int, default=300)
     parser.add_argument(
@@ -91,6 +106,16 @@ def _slug(value):
     return slug or "eval"
 
 
+def make_repeat_seeds(seed, repeats, episodes):
+    """Derive deterministic, non-overlapping episode-seed ranges."""
+
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1")
+    if episodes < 1:
+        raise ValueError("episodes must be at least 1")
+    return [seed + repeat * episodes for repeat in range(repeats)]
+
+
 def create_run_directory(
     output_root,
     agent_type,
@@ -138,7 +163,8 @@ def evaluate_from_args(args):
         raise ValueError("BC evaluation is deterministic; --stochastic is only valid for PPO")
     if args.stochastic and args.execution_mode == "temporal-ensemble":
         raise ValueError("temporal ensembling requires deterministic chunk predictions")
-    _seed_everything(args.seed)
+    repeat_seeds = make_repeat_seeds(args.seed, args.repeats, args.episodes)
+    _seed_everything(repeat_seeds[0])
     agent_kwargs = {
         "checkpoint": args.checkpoint,
         "device": args.device,
@@ -160,27 +186,36 @@ def evaluate_from_args(args):
         run_name=args.run_name,
     )
     print(f"Evaluation run directory: {run_dir}")
-    config = PushTEvalConfig(
-        env_id=args.env_id,
-        episodes=args.episodes,
-        seed=args.seed,
-        max_episode_steps=args.max_episode_steps,
-        fixed_target_pose=tuple(args.fixed_target_pose),
-        fixed_target_block_success=args.fixed_target_block_success,
-        fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
-        agent_block_coef=args.agent_block_coef,
-        block_start_radius=args.block_start_radius,
-        record_video=args.video,
-        video_dir=str(run_dir / "videos"),
-        video_fps=args.video_fps,
-        video_resolution=args.video_resolution,
-        capture_traces=args.capture_traces,
-    )
-    print(
-        f"Agent: {args.agent_type} | fixed-target episodes={config.episodes} | "
-        f"seeds={config.seed}..{config.seed + config.episodes - 1}"
-    )
-    result = run_evaluation(agent, config)
+    results = []
+    for repeat, repeat_seed in enumerate(repeat_seeds):
+        _seed_everything(repeat_seed)
+        video_dir = run_dir / "videos" / f"repeat_{repeat:02d}_seed_{repeat_seed}"
+        config = PushTEvalConfig(
+            env_id=args.env_id,
+            episodes=args.episodes,
+            seed=repeat_seed,
+            max_episode_steps=args.max_episode_steps,
+            fixed_target_pose=tuple(args.fixed_target_pose),
+            fixed_target_block_success=args.fixed_target_block_success,
+            fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
+            agent_block_coef=args.agent_block_coef,
+            block_start_radius=args.block_start_radius,
+            record_video=args.video,
+            video_dir=str(video_dir),
+            video_fps=args.video_fps,
+            video_resolution=args.video_resolution,
+            capture_traces=args.capture_traces,
+        )
+        print(
+            f"Repeat {repeat + 1}/{args.repeats} | agent={args.agent_type} | "
+            f"fixed-target episodes={config.episodes} | "
+            f"seeds={config.seed}..{config.seed + config.episodes - 1}"
+        )
+        results.append(run_evaluation(agent, config))
+    result = aggregate_evaluation_results(results, repeat_seeds)
+    print("Aggregate evaluation summary:")
+    for key, value in result.summary.items():
+        print(f"  {key}: {value}")
     return _save_and_track_result(args, result, run_dir)
 
 
@@ -198,14 +233,14 @@ def _save_and_track_result(args, result, run_dir):
         if args.wandb_mode is not None:
             init_kwargs["mode"] = args.wandb_mode
         run = wandb.init(**init_kwargs)
-        for episode in getattr(result, "episodes", []):
+        for step, episode in enumerate(getattr(result, "episodes", []), start=1):
             run.log(
                 {
                     "eval/episode_return": episode.episode_return,
                     "eval/episode_length": episode.length,
                     "eval/episode_success": episode.success,
                 },
-                step=episode.episode + 1,
+                step=step,
             )
         for key, value in result.summary.items():
             run.summary[f"eval/{key}"] = value
