@@ -4,7 +4,9 @@ from gymnasium import spaces
 
 
 PUSHT_ENV_ID = "swm/PushT-v1"
-PUSHT_RENDER_SHAPE = (96, 96, 3)
+# LeWM was trained with 224x224 inputs. Render at that resolution in the
+# simulator instead of rendering at 96x96 and asking the encoder to upsample.
+PUSHT_RENDER_SHAPE = (224, 224, 3)
 PUSHT_FIXED_TARGET_POSE = np.array([256.0, 256.0, np.pi / 4], dtype=np.float64)
 PUSHT_WORKSPACE_LOW = np.array([0.0, 0.0], dtype=np.float64)
 PUSHT_WORKSPACE_HIGH = np.array([512.0, 512.0], dtype=np.float64)
@@ -444,6 +446,9 @@ def make_pusht_env(
     import stable_worldmodel  # noqa: F401
 
     kwargs.setdefault("resolution", PUSHT_RENDER_SHAPE[0])
+    resolution = int(kwargs["resolution"])
+    if resolution < 1:
+        raise ValueError("resolution must be positive")
     env = gym.make(env_id, render_mode=render_mode, **kwargs)
     if align_sampled_goal_to_fixed_target:
         env = PushTAlignSampledGoalToFixedTargetWrapper(
@@ -467,5 +472,8 @@ def make_pusht_env(
     if reward_mode != "dense":
         env = PushTRewardModeWrapper(env, reward_mode=reward_mode)
     if render_obs:
-        env = PushTRenderObservationWrapper(env)
+        env = PushTRenderObservationWrapper(
+            env,
+            image_shape=(resolution, resolution, PUSHT_RENDER_SHAPE[2]),
+        )
     return env
