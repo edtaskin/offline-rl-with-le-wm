@@ -94,6 +94,64 @@ class EvaluationResult:
         }
 
 
+@dataclass
+class RepeatedEvaluationResult:
+    """Aggregate result for multiple evaluations with distinct seed ranges."""
+
+    results: list[EvaluationResult]
+    summary: dict[str, float | int]
+
+    @property
+    def config(self):
+        return self.results[0].config
+
+    @property
+    def agent_type(self):
+        return self.results[0].agent_type
+
+    @property
+    def agent_metadata(self):
+        return self.results[0].agent_metadata
+
+    @property
+    def repeat_seeds(self):
+        return [result.config.seed for result in self.results]
+
+    @property
+    def episodes(self):
+        return [episode for result in self.results for episode in result.episodes]
+
+    def to_dict(self):
+        config = asdict(self.config)
+        config.update(
+            {
+                "repeats": len(self.results),
+                "repeat_seeds": list(self.repeat_seeds),
+            }
+        )
+        episodes = []
+        repeat_summaries = []
+        for repeat, (seed, result) in enumerate(zip(self.repeat_seeds, self.results)):
+            repeat_summaries.append(
+                {
+                    "repeat": repeat,
+                    "seed": seed,
+                    **result.summary,
+                }
+            )
+            episodes.extend(
+                {"repeat": repeat, **episode.to_dict()} for episode in result.episodes
+            )
+        return {
+            "config": config,
+            "agent_type": self.agent_type,
+            "agent_metadata": self.agent_metadata,
+            "repeat_summaries": repeat_summaries,
+            "episodes": episodes,
+            "summary": self.summary,
+        }
+
+
 def success_from_info(info, terminated):
     for key in ("success", "is_success", "task_success", "block_success"):
         if key in info:
@@ -200,6 +258,33 @@ def summarize_results(episodes):
         if values:
             summary[f"mean_final_{key}"] = float(np.mean(values))
     return summary
+
+
+def aggregate_evaluation_results(results):
+    """Pool equally sized repeated evaluations into one reliable estimate."""
+
+    results = list(results)
+    if not results:
+        raise ValueError("at least one evaluation result is required")
+    episode_counts = {len(result.episodes) for result in results}
+    if len(episode_counts) != 1:
+        raise ValueError("all repeated evaluations must have the same episode count")
+    first = results[0]
+    if any(result.agent_type != first.agent_type for result in results[1:]):
+        raise ValueError("all repeated evaluations must use the same agent type")
+
+    episodes = [episode for result in results for episode in result.episodes]
+    summary = summarize_results(episodes)
+    summary.update(
+        {
+            "repeats": len(results),
+            "episodes_per_repeat": episode_counts.pop(),
+        }
+    )
+    return RepeatedEvaluationResult(
+        results=results,
+        summary=summary,
+    )
 
 
 def run_evaluation(agent: EvaluationAgent, config: PushTEvalConfig, env=None):
