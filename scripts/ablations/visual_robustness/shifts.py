@@ -7,6 +7,7 @@ from typing import Any
 
 import gymnasium as gym
 import numpy as np
+from PIL import Image, ImageFilter
 
 
 BASE_BACKGROUND = (255, 255, 255)
@@ -42,6 +43,8 @@ class VisualShiftSpec:
     checkerboard: bool = False
     checker_colors: tuple[tuple[int, int, int], tuple[int, int, int]] = CHECKER_COLORS
     checker_size: int = CHECKER_SIZE
+    blur_sigma: float = 0.0
+    observation_resolution: int | None = None
 
     def __post_init__(self):
         for label, color in (
@@ -55,9 +58,26 @@ class VisualShiftSpec:
             raise ValueError("strength must be in [0, 1]")
         if self.checker_size < 1:
             raise ValueError("checker_size must be positive")
+        if self.blur_sigma < 0:
+            raise ValueError("blur_sigma must be non-negative")
+        if self.observation_resolution is not None and self.observation_resolution < 1:
+            raise ValueError("observation_resolution must be positive")
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        # Preserve metadata compatibility for the original color/texture caches.
+        if self.blur_sigma == 0.0:
+            payload.pop("blur_sigma")
+        if self.observation_resolution is None:
+            payload.pop("observation_resolution")
+        return payload
+
+    @property
+    def has_post_render_shift(self):
+        return self.checkerboard or self.blur_sigma > 0.0
+
+    def effective_resolution(self, default):
+        return int(self.observation_resolution or default)
 
     def renderer_init_value(self):
         value = {}
@@ -83,17 +103,23 @@ class VisualShiftSpec:
         return value or None
 
     def apply_post_render(self, frame):
-        if not self.checkerboard:
-            return np.asarray(frame, dtype=np.uint8)
         frame = np.asarray(frame, dtype=np.uint8).copy()
-        height, width = frame.shape[:2]
-        rows, cols = np.indices((height, width))
-        cells = ((rows // self.checker_size) + (cols // self.checker_size)) % 2
-        texture = np.empty_like(frame)
-        texture[cells == 0] = np.asarray(self.checker_colors[0], dtype=np.uint8)
-        texture[cells == 1] = np.asarray(self.checker_colors[1], dtype=np.uint8)
-        mask = np.all(frame == np.asarray(BASE_BACKGROUND, dtype=np.uint8), axis=-1)
-        frame[mask] = texture[mask]
+        if self.checkerboard:
+            height, width = frame.shape[:2]
+            rows, cols = np.indices((height, width))
+            cells = ((rows // self.checker_size) + (cols // self.checker_size)) % 2
+            texture = np.empty_like(frame)
+            texture[cells == 0] = np.asarray(self.checker_colors[0], dtype=np.uint8)
+            texture[cells == 1] = np.asarray(self.checker_colors[1], dtype=np.uint8)
+            mask = np.all(frame == np.asarray(BASE_BACKGROUND, dtype=np.uint8), axis=-1)
+            frame[mask] = texture[mask]
+        if self.blur_sigma > 0.0:
+            frame = np.asarray(
+                Image.fromarray(frame).filter(
+                    ImageFilter.GaussianBlur(radius=float(self.blur_sigma))
+                ),
+                dtype=np.uint8,
+            ).copy()
         return frame
 
 
@@ -128,12 +154,27 @@ def _build_conditions():
         strength=1.0,
         checkerboard=True,
     )
+    conditions["resolution_224"] = VisualShiftSpec(
+        name="resolution_224",
+        component="resolution",
+        strength=1.0,
+        observation_resolution=224,
+    )
+    for sigma in (1.0, 2.0, 4.0):
+        name = f"blur_{int(sigma)}"
+        conditions[name] = VisualShiftSpec(
+            name=name,
+            component="gaussian_blur",
+            strength=sigma / 4.0,
+            blur_sigma=sigma,
+        )
     return conditions
 
 
 CONDITIONS = _build_conditions()
 CONDITION_NAMES = tuple(CONDITIONS)
 ENDPOINT_CONDITIONS = ("background_1", "block_1", "goal_1", "combined")
+ADAPTATION_CONDITIONS = ENDPOINT_CONDITIONS + ("blur_4",)
 
 
 def get_condition(name):
@@ -155,4 +196,3 @@ class PostRenderShiftWrapper(gym.ObservationWrapper):
 
     def observation(self, observation):
         return self.visual_shift.apply_post_render(observation)
-

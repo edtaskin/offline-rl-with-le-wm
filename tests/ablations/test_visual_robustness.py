@@ -12,12 +12,15 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import numpy as np
 import torch
+from PIL import Image
 
 from scripts.ablations.visual_robustness.analysis import (
     adaptation_rows,
     analyze,
     difference_in_differences_rows,
+    latent_metric_rows,
     paired_robustness_rows,
+    validate_evaluation_protocols,
 )
 from scripts.ablations.visual_robustness.cache import (
     CounterfactualRenderer,
@@ -25,13 +28,16 @@ from scripts.ablations.visual_robustness.cache import (
     check_cache,
     expected_cache_metadata,
     load_source_arrays,
+    save_thumbnail_grid,
 )
+from scripts.ablations.visual_robustness.cli import build_parser
 from scripts.ablations.visual_robustness.evaluation import (
     evaluate_checkpoint,
     make_shifted_evaluation_env,
     save_environment_screenshots,
 )
 from scripts.ablations.visual_robustness.shifts import (
+    ADAPTATION_CONDITIONS,
     BASE_BACKGROUND,
     BASE_BLOCK,
     BASE_GOAL,
@@ -100,8 +106,20 @@ def record(encoder, train_condition, training_seed, eval_condition, successes):
 
 
 class VisualRobustnessTests(unittest.TestCase):
+    def test_evaluation_defaults_match_canonical_repeated_protocol(self):
+        args = build_parser().parse_args(["evaluate"])
+        all_args = build_parser().parse_args(["all"])
+        analyze_args = build_parser().parse_args(["analyze"])
+        self.assertEqual(args.episodes, 50)
+        self.assertEqual(args.repeats, 3)
+        self.assertEqual(args.eval_seed, 42)
+        self.assertEqual(args.observation_resolution, 96)
+        self.assertEqual(args.encoders, ["lewm"])
+        self.assertEqual(all_args.encoders, ["lewm"])
+        self.assertEqual(analyze_args.encoders, ["lewm"])
+
     def test_condition_registry_and_isolated_components(self):
-        self.assertEqual(len(CONDITION_NAMES), 12)
+        self.assertEqual(len(CONDITION_NAMES), 16)
         background = get_condition("background_1")
         block = get_condition("block_1")
         goal = get_condition("goal_1")
@@ -110,8 +128,27 @@ class VisualRobustnessTests(unittest.TestCase):
         self.assertNotEqual(block.block, BASE_BLOCK)
         self.assertEqual((block.background, block.goal), (BASE_BACKGROUND, BASE_GOAL))
         self.assertNotEqual(goal.goal, BASE_GOAL)
+        self.assertEqual(get_condition("resolution_224").observation_resolution, 224)
+        self.assertEqual(get_condition("blur_4").blur_sigma, 4.0)
+        self.assertIn("blur_4", ADAPTATION_CONDITIONS)
         with self.assertRaises(ValueError):
             get_condition("not-a-condition")
+
+    def test_original_condition_metadata_remains_cache_compatible(self):
+        clean = get_condition("clean").to_dict()
+        self.assertNotIn("blur_sigma", clean)
+        self.assertNotIn("observation_resolution", clean)
+
+    def test_gaussian_blur_is_deterministic_and_preserves_shape_and_dtype(self):
+        frame = np.full((32, 32, 3), 255, dtype=np.uint8)
+        frame[10:22, 10:22] = BASE_BLOCK
+        condition = get_condition("blur_2")
+        first = condition.apply_post_render(frame)
+        second = condition.apply_post_render(frame)
+        self.assertEqual(first.shape, frame.shape)
+        self.assertEqual(first.dtype, frame.dtype)
+        self.assertTrue(np.array_equal(first, second))
+        self.assertFalse(np.array_equal(first, frame))
 
     def test_checkerboard_changes_only_exact_background_pixels(self):
         frame = np.full((24, 24, 3), BASE_BACKGROUND, dtype=np.uint8)
@@ -132,6 +169,13 @@ class VisualRobustnessTests(unittest.TestCase):
         self.assertEqual(a.dtype, np.uint8)
         self.assertTrue(np.array_equal(a, b))
         self.assertTrue(np.array_equal(a, c))
+
+    def test_resolution_condition_renders_natively_at_224(self):
+        state = np.array([150, 350, 320, 180, 0.3], dtype=np.float32)
+        with CounterfactualRenderer(get_condition("resolution_224"), 96) as renderer:
+            frame = renderer.render(state)
+            self.assertEqual(renderer.resolution, 224)
+        self.assertEqual(frame.shape, (224, 224, 3))
 
     def test_clean_renderer_reproduces_first_expert_frame(self):
         data_path = Path("data/expert_trajectories/pusht_expert.npz")
@@ -158,7 +202,11 @@ class VisualRobustnessTests(unittest.TestCase):
 
     def test_shifted_evaluation_preserves_seeded_physical_state(self):
         config = PushTEvalConfig(
-            episodes=1, seed=77, max_episode_steps=2, block_start_radius=200.0
+            episodes=1,
+            seed=77,
+            max_episode_steps=2,
+            observation_resolution=96,
+            block_start_radius=200.0,
         )
         clean = make_shifted_evaluation_env(config, "clean")
         shifted = make_shifted_evaluation_env(config, "combined")
@@ -173,7 +221,11 @@ class VisualRobustnessTests(unittest.TestCase):
 
     def test_texture_evaluation_wrapper_resets_and_steps(self):
         config = PushTEvalConfig(
-            episodes=1, seed=81, max_episode_steps=2, block_start_radius=200.0
+            episodes=1,
+            seed=81,
+            max_episode_steps=2,
+            observation_resolution=96,
+            block_start_radius=200.0,
         )
         env = make_shifted_evaluation_env(config, "texture")
         try:
@@ -184,17 +236,78 @@ class VisualRobustnessTests(unittest.TestCase):
         finally:
             env.close()
 
+    def test_blur_and_resolution_evaluation_observations(self):
+        config = PushTEvalConfig(
+            episodes=1,
+            seed=82,
+            max_episode_steps=2,
+            observation_resolution=96,
+            block_start_radius=200.0,
+        )
+        clean = make_shifted_evaluation_env(config, "clean")
+        blur = make_shifted_evaluation_env(config, "blur_2")
+        high_resolution = make_shifted_evaluation_env(config, "resolution_224")
+        try:
+            clean_frame, _ = clean.reset(seed=82)
+            blur_frame, _ = blur.reset(seed=82)
+            high_resolution_frame, _ = high_resolution.reset(seed=82)
+            self.assertEqual(clean_frame.shape, (96, 96, 3))
+            self.assertEqual(blur_frame.shape, clean_frame.shape)
+            self.assertFalse(np.array_equal(blur_frame, clean_frame))
+            self.assertEqual(high_resolution_frame.shape, (224, 224, 3))
+            self.assertTrue(
+                np.allclose(clean.unwrapped._get_obs(), blur.unwrapped._get_obs())
+            )
+            self.assertTrue(
+                np.allclose(
+                    clean.unwrapped._get_obs(), high_resolution.unwrapped._get_obs()
+                )
+            )
+        finally:
+            clean.close()
+            blur.close()
+            high_resolution.close()
+
     def test_environment_screenshots_save_individual_frames_and_grid(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = save_environment_screenshots(
                 output_root=directory,
-                condition_names=["clean", "combined", "texture"],
+                condition_names=["clean", "combined", "texture", "resolution_224"],
                 seeds=[1000, 1001],
                 max_episode_steps=2,
             )
             self.assertTrue(artifacts["contact_sheet"].exists())
             self.assertTrue(artifacts["manifest"].exists())
-            self.assertEqual(len(artifacts["images"]), 6)
+            self.assertEqual(len(artifacts["images"]), 8)
+            manifest = json.loads(artifacts["manifest"].read_text())
+            self.assertEqual(manifest["observation_resolution"], 96)
+            self.assertEqual(manifest["condition_resolutions"]["clean"], 96)
+            self.assertEqual(
+                manifest["condition_resolutions"]["resolution_224"], 224
+            )
+            high_resolution = (
+                Path(directory)
+                / "environment_screenshots"
+                / "resolution_224"
+                / "seed_1000.png"
+            )
+            with Image.open(high_resolution) as screenshot:
+                self.assertEqual(screenshot.size, (224, 224))
+
+    def test_thumbnail_grid_normalizes_native_resolutions_for_display(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "expert.npz"
+            small_source(data_path)
+            path = save_thumbnail_grid(
+                data_path=data_path,
+                output_root=root,
+                condition_names=["clean", "resolution_224", "blur_2"],
+                resolution=96,
+                count=2,
+            )
+            with Image.open(path) as grid:
+                self.assertEqual(grid.size, (150 + 2 * 96, 3 * 96))
 
     def test_cache_metadata_detects_condition_and_source_integrity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -220,6 +333,40 @@ class VisualRobustnessTests(unittest.TestCase):
             for key in ("states_sha256", "actions_sha256", "episode_ends_sha256"):
                 self.assertEqual(clean["source"][key], shifted["source"][key])
 
+    def test_resolution_condition_overrides_cache_renderer_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "expert.npz"
+            checkpoint = root / "dummy.pth"
+            checkpoint.touch()
+            small_source(data_path)
+            arrays = load_source_arrays(data_path)
+            metadata = expected_cache_metadata(
+                data_path,
+                arrays,
+                "lewm",
+                DummyEncoder(checkpoint),
+                get_condition("resolution_224"),
+                resolution=96,
+            )
+            self.assertEqual(metadata["renderer"]["resolution"], 224)
+
+    def test_latent_metrics_are_reported_from_paired_caches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache_root = root / "cache" / "lewm"
+            cache_root.mkdir(parents=True)
+            clean = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+            blurred = torch.tensor([[0.8, 0.2], [0.2, 0.8]])
+            torch.save({"latents": clean}, cache_root / "clean.pt")
+            torch.save({"latents": blurred}, cache_root / "blur_1.pt")
+            rows = latent_metric_rows(root, encoder_names=("lewm",))
+            row = next(item for item in rows if item["eval_condition"] == "blur_1")
+            self.assertEqual(row["samples"], 2)
+            self.assertIn("cosine_mean", row)
+            self.assertIn("normalized_l2_mean", row)
+            self.assertIn("variance_ratio", row)
+
     def test_paired_statistics_and_difference_in_differences(self):
         records = []
         for training_seed in (42, 43):
@@ -240,6 +387,40 @@ class VisualRobustnessTests(unittest.TestCase):
         ]
         adaptation = adaptation_rows(records, bootstrap_samples=200)
         self.assertAlmostEqual(adaptation[0]["matched_delta_vs_clean_baseline"], 0.0)
+
+    def test_analysis_rejects_mixed_evaluation_protocols(self):
+        records = [
+            {
+                **record("lewm", "clean", 42, "clean", [1, 0]),
+                "payload": {
+                    "config": {
+                        "episodes": 50,
+                        "repeats": 3,
+                        "repeat_seeds": [42, 92, 142],
+                        "seed": 42,
+                        "max_episode_steps": 300,
+                        "block_start_radius": 200.0,
+                        "observation_resolution": 96,
+                    }
+                },
+            },
+            {
+                **record("lewm", "clean", 43, "clean", [1, 0]),
+                "payload": {
+                    "config": {
+                        "episodes": 200,
+                        "repeats": None,
+                        "repeat_seeds": None,
+                        "seed": 1000,
+                        "max_episode_steps": 300,
+                        "block_start_radius": 200.0,
+                        "observation_resolution": None,
+                    }
+                },
+            },
+        ]
+        with self.assertRaises(RuntimeError):
+            validate_evaluation_protocols(records)
 
     def test_small_cpu_smoke_cache_train_evaluate_analyze(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,14 +465,41 @@ class VisualRobustnessTests(unittest.TestCase):
             outputs = evaluate_checkpoint(
                 checkpoint_path=policy_path,
                 output_root=output_root,
-                condition_names=["clean"],
+                condition_names=["clean", "resolution_224", "blur_1"],
                 device="cpu",
                 episodes=1,
+                repeats=2,
                 eval_seed=1000,
                 max_episode_steps=2,
                 encoder=encoder,
             )
+            self.assertEqual(len(outputs), 3)
             self.assertTrue(outputs[0].exists())
+            payload = json.loads(outputs[0].read_text())
+            self.assertEqual(payload["config"]["repeats"], 2)
+            self.assertEqual(payload["config"]["repeat_seeds"], [1000, 1001])
+            self.assertEqual(payload["config"]["observation_resolution"], 96)
+            self.assertEqual(len(payload["repeat_summaries"]), 2)
+            self.assertEqual(len(payload["episodes"]), 2)
+            resolution_payload = json.loads(outputs[1].read_text())
+            self.assertEqual(
+                resolution_payload["config"]["observation_resolution"], 224
+            )
+            blur_payload = json.loads(outputs[2].read_text())
+            self.assertEqual(blur_payload["ablation"]["eval_condition"], "blur_1")
+            with self.assertRaises(RuntimeError):
+                evaluate_checkpoint(
+                    checkpoint_path=policy_path,
+                    output_root=output_root,
+                    condition_names=["clean"],
+                    device="cpu",
+                    episodes=1,
+                    repeats=2,
+                    eval_seed=1000,
+                    max_episode_steps=2,
+                    observation_resolution=224,
+                    encoder=encoder,
+                )
             report = analyze(
                 output_root=output_root,
                 data_path=data_path,
@@ -304,4 +512,3 @@ class VisualRobustnessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

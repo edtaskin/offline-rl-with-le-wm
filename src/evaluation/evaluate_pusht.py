@@ -8,12 +8,12 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.envs import PUSHT_FIXED_TARGET_POSE
+from src.envs import PUSHT_FIXED_TARGET_POSE, PUSHT_RENDER_SHAPE
 from src.evaluation.agents import make_bc_evaluation_agent, make_ppo_evaluation_agent
 from src.evaluation.pusht import (
     PushTEvalConfig,
-    aggregate_evaluation_results,
-    run_evaluation,
+    make_repeat_seeds,
+    run_repeated_evaluation,
 )
 
 
@@ -56,6 +56,12 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-episode-steps", type=int, default=300)
     parser.add_argument(
+        "--observation-resolution",
+        type=int,
+        default=PUSHT_RENDER_SHAPE[0],
+        help="square policy-observation resolution (default: 224)",
+    )
+    parser.add_argument(
         "--fixed-target-pose",
         type=float,
         nargs=3,
@@ -92,16 +98,6 @@ def build_parser():
 def _slug(value):
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip("-._")
     return slug or "eval"
-
-
-def make_repeat_seeds(seed, repeats, episodes):
-    """Derive deterministic, non-overlapping episode-seed ranges."""
-
-    if repeats < 1:
-        raise ValueError("repeats must be at least 1")
-    if episodes < 1:
-        raise ValueError("episodes must be at least 1")
-    return [seed + repeat * episodes for repeat in range(repeats)]
 
 
 def create_run_directory(
@@ -151,7 +147,6 @@ def evaluate_from_args(args):
         raise ValueError("BC evaluation is deterministic; --stochastic is only valid for PPO")
     if args.stochastic and args.execution_mode == "temporal-ensemble":
         raise ValueError("temporal ensembling requires deterministic chunk predictions")
-    repeat_seeds = make_repeat_seeds(args.seed, args.repeats, args.episodes)
     agent_kwargs = {
         "checkpoint": args.checkpoint,
         "device": args.device,
@@ -173,32 +168,24 @@ def evaluate_from_args(args):
         run_name=args.run_name,
     )
     print(f"Evaluation run directory: {run_dir}")
-    results = []
-    for repeat, repeat_seed in enumerate(repeat_seeds):
-        video_dir = run_dir / "videos" / f"repeat_{repeat:02d}_seed_{repeat_seed}"
-        config = PushTEvalConfig(
-            env_id=args.env_id,
-            episodes=args.episodes,
-            seed=repeat_seed,
-            max_episode_steps=args.max_episode_steps,
-            fixed_target_pose=tuple(args.fixed_target_pose),
-            fixed_target_block_success=args.fixed_target_block_success,
-            fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
-            agent_block_coef=args.agent_block_coef,
-            block_start_radius=args.block_start_radius,
-            record_video=args.video,
-            video_dir=str(video_dir),
-            video_fps=args.video_fps,
-            video_resolution=args.video_resolution,
-            capture_traces=args.capture_traces,
-        )
-        print(
-            f"Repeat {repeat + 1}/{args.repeats} | agent={args.agent_type} | "
-            f"fixed-target episodes={config.episodes} | "
-            f"seeds={config.seed}..{config.seed + config.episodes - 1}"
-        )
-        results.append(run_evaluation(agent, config))
-    result = aggregate_evaluation_results(results)
+    config = PushTEvalConfig(
+        env_id=args.env_id,
+        episodes=args.episodes,
+        seed=args.seed,
+        max_episode_steps=args.max_episode_steps,
+        observation_resolution=args.observation_resolution,
+        fixed_target_pose=tuple(args.fixed_target_pose),
+        fixed_target_block_success=args.fixed_target_block_success,
+        fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
+        agent_block_coef=args.agent_block_coef,
+        block_start_radius=args.block_start_radius,
+        record_video=args.video,
+        video_dir=str(run_dir / "videos"),
+        video_fps=args.video_fps,
+        video_resolution=args.video_resolution,
+        capture_traces=args.capture_traces,
+    )
+    result = run_repeated_evaluation(agent, config, repeats=args.repeats)
     print("Aggregate evaluation summary:")
     for key, value in result.summary.items():
         print(f"  {key}: {value}")

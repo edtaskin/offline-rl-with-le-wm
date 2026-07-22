@@ -83,6 +83,7 @@ def expected_cache_metadata(
     condition,
     resolution=96,
 ):
+    resolution = condition.effective_resolution(resolution)
     metadata = encoder_metadata(encoder_name, encoder)
     metadata["checkpoint"] = path_fingerprint(metadata.pop("checkpoint_path"))
     return {
@@ -138,9 +139,10 @@ class CounterfactualRenderer:
     """Render saved physical states with one fixed visual intervention."""
 
     def __init__(self, condition: VisualShiftSpec, resolution=96):
+        self.resolution = condition.effective_resolution(resolution)
         kwargs = {
             "render_obs": False,
-            "resolution": int(resolution),
+            "resolution": self.resolution,
             # Downloaded demonstrations use PushT's fixed visual goal.
             "sync_goal_pose": False,
         }
@@ -255,12 +257,16 @@ def save_thumbnail_grid(
     rows = []
     label_width = 150
     for name in condition_names:
-        with CounterfactualRenderer(get_condition(name), resolution) as renderer:
+        condition = get_condition(name)
+        with CounterfactualRenderer(condition, resolution) as renderer:
             frames = renderer.render_many(arrays["states"][indices])
         row = Image.new("RGB", (label_width + count * resolution, resolution), "white")
         ImageDraw.Draw(row).text((5, resolution // 2 - 6), name, fill="black")
         for column, frame in enumerate(frames):
-            row.paste(Image.fromarray(frame), (label_width + column * resolution, 0))
+            thumbnail = Image.fromarray(frame)
+            if thumbnail.size != (resolution, resolution):
+                thumbnail = thumbnail.resize((resolution, resolution), Image.Resampling.LANCZOS)
+            row.paste(thumbnail, (label_width + column * resolution, 0))
         rows.append(row)
     grid = Image.new("RGB", (rows[0].width, len(rows) * resolution), "white")
     for index, row in enumerate(rows):
@@ -269,4 +275,3 @@ def save_thumbnail_grid(
     path.parent.mkdir(parents=True, exist_ok=True)
     grid.save(path)
     return path
-

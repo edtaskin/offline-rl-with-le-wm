@@ -57,6 +57,12 @@ episode videos are saved in repeat-specific directories under `videos/`. Use
 `--output-root` to change the parent directory and `--run-name` to append a
 readable label. Set `--repeats 1` for a single evaluation.
 
+Policy observations render at 224x224 by default. This resolution is stored in
+`metrics.json` as `config.observation_resolution`; pass
+`--observation-resolution 96` to reproduce the earlier low-resolution
+evaluation protocol. `--video-resolution` controls only saved-video scaling
+and does not affect policy inputs.
+
 Evaluate BC on the fixed-target task. Passing `--block-start-radius 200`
 matches the PPO training start distribution; omit it for unrestricted block
 starts around the same fixed target.

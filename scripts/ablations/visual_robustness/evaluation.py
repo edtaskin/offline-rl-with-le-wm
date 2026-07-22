@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import gymnasium as gym
@@ -11,7 +12,11 @@ from PIL import Image, ImageDraw
 
 from src.envs import make_pusht_env
 from src.evaluation.agents import LatentChunkAgent, resolve_device
-from src.evaluation.pusht import PushTEvalConfig, run_evaluation
+from src.evaluation.pusht import (
+    PushTEvalConfig,
+    make_repeat_seeds,
+    run_repeated_evaluation,
+)
 
 from .cache import path_fingerprint
 from .encoders import load_encoder
@@ -19,26 +24,14 @@ from .shifts import PostRenderShiftWrapper, get_condition
 from .training import load_policy
 
 
-ABLATION_RENDER_RESOLUTION = 96
-_MISSING = object()
-
-
-def _run_evaluation_quiet(agent, config, env):
-    """Call the shared evaluator across branches with and without ``verbose``."""
-
-    namespace = run_evaluation.__globals__
-    previous = namespace.get("verbose", _MISSING)
-    namespace["verbose"] = False
-    try:
-        return run_evaluation(agent, config, env=env)
-    finally:
-        if previous is _MISSING:
-            namespace.pop("verbose", None)
-        else:
-            namespace["verbose"] = previous
+def config_for_condition(config, condition_name):
+    condition = get_condition(condition_name)
+    resolution = condition.effective_resolution(config.observation_resolution)
+    return replace(config, observation_resolution=resolution)
 
 
 def make_shifted_evaluation_env(config, condition_name):
+    config = config_for_condition(config, condition_name)
     config.validate()
     condition = get_condition(condition_name)
     kwargs = {}
@@ -55,10 +48,10 @@ def make_shifted_evaluation_env(config, condition_name):
         fixed_target_agent_block_coef=config.agent_block_coef,
         block_start_near_goal=config.block_start_radius is not None,
         block_start_radius=config.block_start_radius or 0.0,
-        resolution=ABLATION_RENDER_RESOLUTION,
+        resolution=config.observation_resolution,
         **kwargs,
     )
-    if condition.checkerboard:
+    if condition.has_post_render_shift:
         env = PostRenderShiftWrapper(env, condition)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env.action_space.seed(config.seed)
@@ -73,6 +66,7 @@ def save_environment_screenshots(
     seeds=(1000, 1001),
     block_start_radius=200.0,
     max_episode_steps=300,
+    observation_resolution=96,
 ):
     condition_names = list(condition_names)
     seeds = [int(seed) for seed in seeds]
@@ -81,14 +75,18 @@ def save_environment_screenshots(
     screenshot_root = Path(output_root) / "environment_screenshots"
     screenshot_root.mkdir(parents=True, exist_ok=True)
     frames = {}
+    condition_resolutions = {}
     config = PushTEvalConfig(
         episodes=1,
         seed=seeds[0],
         max_episode_steps=int(max_episode_steps),
+        observation_resolution=int(observation_resolution),
         block_start_radius=float(block_start_radius),
     )
     for condition_name in condition_names:
-        env = make_shifted_evaluation_env(config, condition_name)
+        condition_config = config_for_condition(config, condition_name)
+        condition_resolutions[condition_name] = condition_config.observation_resolution
+        env = make_shifted_evaluation_env(condition_config, condition_name)
         condition_dir = screenshot_root / condition_name
         condition_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -99,7 +97,7 @@ def save_environment_screenshots(
                 Image.fromarray(frame).save(condition_dir / f"seed_{seed}.png")
         finally:
             env.close()
-    frame_height, frame_width = next(iter(frames.values())).shape[:2]
+    frame_height = frame_width = int(observation_resolution)
     label_width = 150
     header_height = 24
     grid = Image.new(
@@ -121,8 +119,13 @@ def save_environment_screenshots(
         y = header_height + row * frame_height
         draw.text((5, y + frame_height // 2 - 6), condition_name, fill="black")
         for column, seed in enumerate(seeds):
+            frame = Image.fromarray(frames[(condition_name, seed)])
+            if frame.size != (frame_width, frame_height):
+                frame = frame.resize(
+                    (frame_width, frame_height), Image.Resampling.LANCZOS
+                )
             grid.paste(
-                Image.fromarray(frames[(condition_name, seed)]),
+                frame,
                 (label_width + column * frame_width, y),
             )
     grid_path = screenshot_root / "evaluation_conditions.png"
@@ -132,6 +135,8 @@ def save_environment_screenshots(
         "seeds": seeds,
         "block_start_radius": float(block_start_radius),
         "max_episode_steps": int(max_episode_steps),
+        "observation_resolution": int(observation_resolution),
+        "condition_resolutions": condition_resolutions,
         "paired_physical_initial_states": True,
         "contact_sheet": str(grid_path),
     }
@@ -194,7 +199,9 @@ def evaluation_path(output_root, metadata, condition_name):
     )
 
 
-def _existing_evaluation_matches(path, *, metadata, condition_name, config):
+def _existing_evaluation_matches(
+    path, *, metadata, condition_name, config, repeats
+):
     try:
         payload = json.loads(Path(path).read_text())
     except (OSError, json.JSONDecodeError):
@@ -210,11 +217,23 @@ def _existing_evaluation_matches(path, *, metadata, condition_name, config):
     expected_config = {
         "episodes": config.episodes,
         "seed": config.seed,
+        "repeats": int(repeats),
+        "repeat_seeds": make_repeat_seeds(
+            config.seed, repeats, config.episodes
+        ),
         "max_episode_steps": config.max_episode_steps,
+        "observation_resolution": config.observation_resolution,
         "block_start_radius": config.block_start_radius,
     }
-    return all(ablation.get(key) == value for key, value in expected.items()) and all(
-        actual_config.get(key) == value for key, value in expected_config.items()
+    expected_episode_count = int(config.episodes) * int(repeats)
+    return (
+        all(ablation.get(key) == value for key, value in expected.items())
+        and all(
+            actual_config.get(key) == value
+            for key, value in expected_config.items()
+        )
+        and len(payload.get("repeat_summaries", [])) == int(repeats)
+        and len(payload.get("episodes", [])) == expected_episode_count
     )
 
 
@@ -224,9 +243,11 @@ def evaluate_checkpoint(
     output_root,
     condition_names,
     device="auto",
-    episodes=200,
-    eval_seed=1000,
+    episodes=50,
+    repeats=3,
+    eval_seed=42,
     max_episode_steps=300,
+    observation_resolution=96,
     block_start_radius=200.0,
     video=False,
     force=False,
@@ -240,13 +261,17 @@ def evaluate_checkpoint(
     for condition_name in condition_names:
         output_path = evaluation_path(output_root, metadata, condition_name)
         video_dir = output_path.parent / f"videos_{condition_name}"
-        config = PushTEvalConfig(
-            episodes=int(episodes),
-            seed=int(eval_seed),
-            max_episode_steps=int(max_episode_steps),
-            block_start_radius=float(block_start_radius),
-            record_video=bool(video),
-            video_dir=str(video_dir),
+        config = config_for_condition(
+            PushTEvalConfig(
+                episodes=int(episodes),
+                seed=int(eval_seed),
+                max_episode_steps=int(max_episode_steps),
+                observation_resolution=int(observation_resolution),
+                block_start_radius=float(block_start_radius),
+                record_video=bool(video),
+                video_dir=str(video_dir),
+            ),
+            condition_name,
         )
         if output_path.exists() and not force:
             if not _existing_evaluation_matches(
@@ -254,6 +279,7 @@ def evaluate_checkpoint(
                 metadata=metadata,
                 condition_name=condition_name,
                 config=config,
+                repeats=repeats,
             ):
                 raise RuntimeError(
                     f"existing evaluation is incompatible with the requested settings: "
@@ -262,11 +288,14 @@ def evaluate_checkpoint(
             print(f"Using existing evaluation: {output_path}")
             paths.append(output_path)
             continue
-        env = make_shifted_evaluation_env(config, condition_name)
-        try:
-            result = _run_evaluation_quiet(agent, config, env)
-        finally:
-            env.close()
+        result = run_repeated_evaluation(
+            agent,
+            config,
+            repeats=int(repeats),
+            env_factory=lambda repeat_config: make_shifted_evaluation_env(
+                repeat_config, condition_name
+            ),
+        )
         payload = result.to_dict()
         payload["ablation"] = {
             "name": "lewm_visual_robustness",

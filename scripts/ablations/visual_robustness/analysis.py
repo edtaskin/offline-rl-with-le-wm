@@ -29,14 +29,57 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
-def load_evaluations(output_root):
+def load_evaluations(output_root, encoder_names=None):
+    selected_encoders = set(encoder_names) if encoder_names is not None else None
     records = []
     for path in sorted(Path(output_root).glob("evaluations/**/eval_*.json")):
         payload = json.loads(path.read_text())
         ablation = payload.get("ablation")
-        if ablation:
+        if ablation and (
+            selected_encoders is None or ablation.get("encoder") in selected_encoders
+        ):
             records.append({"path": str(path), "payload": payload, **ablation})
     return records
+
+
+def validate_evaluation_protocols(records):
+    """Reject analyses that would silently pool incompatible evaluation runs."""
+
+    if not records:
+        return
+    protocol_keys = (
+        "episodes",
+        "repeats",
+        "repeat_seeds",
+        "seed",
+        "max_episode_steps",
+        "block_start_radius",
+    )
+    signatures = {
+        tuple(
+            json.dumps(record["payload"].get("config", {}).get(key), sort_keys=True)
+            for key in protocol_keys
+        )
+        for record in records
+    }
+    if len(signatures) != 1:
+        raise RuntimeError(
+            "evaluation artifacts use incompatible episode/repeat/seed protocols; "
+            "replace stale results before analyzing"
+        )
+    resolutions = defaultdict(set)
+    for record in records:
+        resolutions[record["eval_condition"]].add(
+            record["payload"].get("config", {}).get("observation_resolution")
+        )
+    mismatched = sorted(
+        condition for condition, values in resolutions.items() if len(values) != 1
+    )
+    if mismatched:
+        raise RuntimeError(
+            "evaluation artifacts mix observation resolutions for conditions: "
+            + ", ".join(mismatched)
+        )
 
 
 def _episode_map(record, field="success"):
@@ -270,13 +313,21 @@ def latent_metric_rows(output_root, encoder_names=("lewm", "dinov2")):
     return rows
 
 
-def action_metric_rows(output_root, data_path, batch_size=512):
+def action_metric_rows(
+    output_root,
+    data_path,
+    batch_size=512,
+    encoder_names=("lewm", "dinov2"),
+):
+    selected_encoders = set(encoder_names)
     rows = []
     for metadata_path in sorted(Path(output_root).glob("models/*/clean/seed_*/metadata.json")):
         metadata = json.loads(metadata_path.read_text())
         policy, _ = load_policy(metadata_path.with_name("policy.pth"), "cpu")
         contract = metadata["contract"]
         encoder_name = metadata["encoder"]
+        if encoder_name not in selected_encoders:
+            continue
         clean_cache = cache_path(output_root, encoder_name, "clean")
         for condition_name in CONDITION_NAMES:
             if condition_name == "clean":
@@ -367,16 +418,27 @@ def analyze(
     bootstrap_samples=10000,
     margin=0.10,
     include_action_metrics=True,
+    encoder_names=("lewm", "dinov2"),
 ):
     if bootstrap_samples < 1 or margin < 0:
         raise ValueError("bootstrap_samples must be positive and margin non-negative")
-    records = load_evaluations(output_root)
+    encoder_names = tuple(encoder_names)
+    records = load_evaluations(output_root, encoder_names)
+    validate_evaluation_protocols(records)
     evaluation = evaluation_rows(records)
     robustness = paired_robustness_rows(records, bootstrap_samples, margin)
     adaptation = adaptation_rows(records, bootstrap_samples, margin)
     comparative = difference_in_differences_rows(records, bootstrap_samples)
-    latent = latent_metric_rows(output_root)
-    actions = action_metric_rows(output_root, data_path) if include_action_metrics else []
+    latent = latent_metric_rows(output_root, encoder_names)
+    actions = (
+        action_metric_rows(
+            output_root,
+            data_path,
+            encoder_names=encoder_names,
+        )
+        if include_action_metrics
+        else []
+    )
     analysis_dir = Path(output_root) / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     tables = {
@@ -391,6 +453,7 @@ def analyze(
         _write_csv(analysis_dir / f"{name}.csv", rows)
     plots = _save_plots(analysis_dir, evaluation, latent)
     report = {
+        "encoders": list(encoder_names),
         "bootstrap_samples": int(bootstrap_samples),
         "noninferiority_margin": -float(margin),
         "tables": tables,
@@ -399,4 +462,3 @@ def analyze(
     report_path = analysis_dir / "report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     return report_path
-

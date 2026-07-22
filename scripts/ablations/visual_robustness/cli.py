@@ -18,7 +18,7 @@ from .cache import (
 )
 from .encoders import load_encoder
 from .evaluation import evaluate_checkpoint, save_environment_screenshots
-from .shifts import CONDITION_NAMES, ENDPOINT_CONDITIONS
+from .shifts import ADAPTATION_CONDITIONS, CONDITION_NAMES
 from .training import model_paths, train_policy
 
 
@@ -78,6 +78,7 @@ def build_parser():
     screenshots.add_argument("--seeds", nargs="+", type=int, default=[1000, 1001])
     screenshots.add_argument("--block-start-radius", type=float, default=200.0)
     screenshots.add_argument("--max-episode-steps", type=int, default=300)
+    screenshots.add_argument("--observation-resolution", type=int, default=96)
 
     train = subparsers.add_parser("train", help="train BC heads from ablation caches")
     _add_paths(train)
@@ -95,7 +96,7 @@ def build_parser():
     _add_paths(evaluate)
     _add_encoder_paths(evaluate)
     evaluate.add_argument("--checkpoints", nargs="*", default=None)
-    evaluate.add_argument("--encoders", nargs="+", choices=ENCODERS, default=list(ENCODERS))
+    evaluate.add_argument("--encoders", nargs="+", choices=ENCODERS, default=["lewm"])
     evaluate.add_argument(
         "--train-conditions", nargs="+", choices=CONDITION_NAMES, default=["clean"]
     )
@@ -104,9 +105,11 @@ def build_parser():
     )
     evaluate.add_argument("--seeds", nargs="+", type=int, default=list(TRAINING_SEEDS))
     evaluate.add_argument("--device", default="auto")
-    evaluate.add_argument("--episodes", type=int, default=200)
-    evaluate.add_argument("--eval-seed", type=int, default=1000)
+    evaluate.add_argument("--episodes", type=int, default=50)
+    evaluate.add_argument("--repeats", type=int, default=3)
+    evaluate.add_argument("--eval-seed", type=int, default=42)
     evaluate.add_argument("--max-episode-steps", type=int, default=300)
+    evaluate.add_argument("--observation-resolution", type=int, default=96)
     evaluate.add_argument("--block-start-radius", type=float, default=200.0)
     evaluate.add_argument("--video", action="store_true")
     evaluate.add_argument("--force", action="store_true")
@@ -115,6 +118,9 @@ def build_parser():
         "analyze", help="aggregate metrics and confidence intervals"
     )
     _add_paths(analyze_parser)
+    analyze_parser.add_argument(
+        "--encoders", nargs="+", choices=ENCODERS, default=["lewm"]
+    )
     analyze_parser.add_argument("--bootstrap-samples", type=int, default=10000)
     analyze_parser.add_argument("--margin", type=float, default=0.10)
     analyze_parser.add_argument("--skip-action-metrics", action="store_true")
@@ -124,15 +130,20 @@ def build_parser():
     )
     _add_paths(all_parser)
     _add_encoder_paths(all_parser)
+    all_parser.add_argument(
+        "--encoders", nargs="+", choices=ENCODERS, default=["lewm"]
+    )
     all_parser.add_argument("--device", default="auto")
     all_parser.add_argument("--cache-batch-size", type=int, default=128)
     all_parser.add_argument("--train-batch-size", type=int, default=64)
     all_parser.add_argument("--epochs", type=int, default=100)
     all_parser.add_argument("--learning-rate", type=float, default=1e-3)
     all_parser.add_argument("--seeds", nargs="+", type=int, default=list(TRAINING_SEEDS))
-    all_parser.add_argument("--episodes", type=int, default=200)
-    all_parser.add_argument("--eval-seed", type=int, default=1000)
+    all_parser.add_argument("--episodes", type=int, default=50)
+    all_parser.add_argument("--repeats", type=int, default=3)
+    all_parser.add_argument("--eval-seed", type=int, default=42)
     all_parser.add_argument("--max-episode-steps", type=int, default=300)
+    all_parser.add_argument("--observation-resolution", type=int, default=224)
     all_parser.add_argument("--block-start-radius", type=float, default=200.0)
     all_parser.add_argument("--screenshot-seeds", nargs="+", type=int, default=[1000, 1001])
     all_parser.add_argument("--bootstrap-samples", type=int, default=10000)
@@ -161,6 +172,9 @@ def _run_cache(args, encoder_names=None, condition_names=None):
         seeds=getattr(args, "screenshot_seeds", (1000, 1001)),
         block_start_radius=getattr(args, "block_start_radius", 200.0),
         max_episode_steps=getattr(args, "max_episode_steps", 300),
+        observation_resolution=getattr(
+            args, "observation_resolution", getattr(args, "resolution", 96)
+        ),
     )
     encoders = {}
     for name in encoder_names:
@@ -214,6 +228,7 @@ def _run_screenshots(args):
         seeds=args.seeds,
         block_start_radius=args.block_start_radius,
         max_episode_steps=args.max_episode_steps,
+        observation_resolution=args.observation_resolution,
     )
 
 
@@ -249,8 +264,10 @@ def _run_evaluate(args, checkpoints=None, condition_selector=None, encoders=None
                 condition_names=conditions,
                 device=device,
                 episodes=args.episodes,
+                repeats=args.repeats,
                 eval_seed=args.eval_seed,
                 max_episode_steps=args.max_episode_steps,
+                observation_resolution=args.observation_resolution,
                 block_start_radius=args.block_start_radius,
                 video=args.video,
                 force=getattr(args, "force", getattr(args, "force_evaluate", False)),
@@ -261,15 +278,20 @@ def _run_evaluate(args, checkpoints=None, condition_selector=None, encoders=None
 
 
 def _run_all(args):
-    args.encoders = list(ENCODERS)
+    selected_encoders = list(args.encoders)
     args.conditions = list(CONDITION_NAMES)
     encoders = _run_cache(args)
-    jobs = [(encoder, "clean", seed) for encoder in ENCODERS for seed in args.seeds]
-    jobs += [
-        ("lewm", condition, seed)
-        for condition in ENDPOINT_CONDITIONS
+    jobs = [
+        (encoder, "clean", seed)
+        for encoder in selected_encoders
         for seed in args.seeds
     ]
+    if "lewm" in selected_encoders:
+        jobs += [
+            ("lewm", condition, seed)
+            for condition in ADAPTATION_CONDITIONS
+            for seed in args.seeds
+        ]
     checkpoints = _run_train(args, jobs)
 
     def conditions_for(metadata):
@@ -284,6 +306,7 @@ def _run_all(args):
         bootstrap_samples=args.bootstrap_samples,
         margin=0.10,
         include_action_metrics=True,
+        encoder_names=selected_encoders,
     )
 
 
@@ -304,6 +327,7 @@ def main(argv=None):
             bootstrap_samples=args.bootstrap_samples,
             margin=args.margin,
             include_action_metrics=not args.skip_action_metrics,
+            encoder_names=args.encoders,
         )
     elif args.command == "all":
         _run_all(args)
@@ -313,4 +337,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
