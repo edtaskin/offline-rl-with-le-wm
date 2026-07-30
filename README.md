@@ -10,12 +10,27 @@ artifacts and are never read from the local filesystem.
 
 ## BC
 
+Generate the LeWM-resolution expert dataset once after downloading the original
+PushT demonstrations. This restores each recorded simulator state and renders
+it directly at 224x224; it does not interpolate the stored 96x96 pixels.
+
+```bash
+python scripts/regenerate_pusht_expert.py \
+  --dataset data/expert_trajectories/pusht_expert.npz \
+  --output-dataset data/expert_trajectories/pusht_expert_224.npz \
+  --verify-n 100
+```
+
+The generator uses a disk-backed image buffer. During the final save, allow
+space for both that temporary buffer and the output dataset. Add `--compressed`
+if disk space matters more than generation and load time.
+
 Train the latent BC policy with the configuration used for the current
 checkpoint:
 
 ```bash
 python -m src.bc.train_bc_latent \
-  --data_path data/expert_trajectories/pusht_expert.npz \
+  --data_path data/expert_trajectories/pusht_expert_224.npz \
   --checkpoint_path runs/bc/pusht_latent_bc.pth \
   --epochs 100 \
   --batch_size 64 \
@@ -24,6 +39,7 @@ python -m src.bc.train_bc_latent \
   --frame_stack 3 \
   --frame_stride 5 \
   --action_chunk_size 5 \
+  --data_path data/expert_trajectories/pusht_expert_224.npz \
   --seed 42 \
   --num_workers 0 \
   --deterministic \
@@ -34,9 +50,12 @@ python -m src.bc.train_bc_latent \
 ```
 
 Each evaluation creates a timestamped directory under `runs/evaluations/`.
-The complete result is saved as `metrics.json`; with `--video`, episode videos
-are saved in the same run directory under `videos/`. Use `--output-root` to
-change the parent directory and `--run-name` to append a readable label.
+By default, it runs 3 repeats of 50 episodes. `--seed` sets the first repeat's
+seed; later repeats use deterministic, non-overlapping seed ranges. The pooled
+summary and each repeat's summary are saved in `metrics.json`; with `--video`,
+episode videos are saved in repeat-specific directories under `videos/`. Use
+`--output-root` to change the parent directory and `--run-name` to append a
+readable label. Set `--repeats 1` for a single evaluation.
 
 Evaluate BC on the fixed-target task. Passing `--block-start-radius 200`
 matches the PPO training start distribution; omit it for unrestricted block
@@ -51,7 +70,8 @@ python -m src.evaluation.evaluate_pusht \
   --episodes 50 \
   --max-episode-steps 300 \
   --video \
-  --seed 42
+  --seed 42 \
+  --repeats 3
 ```
 
 ## PPO 
@@ -86,5 +106,6 @@ python -m src.evaluation.evaluate_pusht \
   --episodes 50 \
   --max-episode-steps 300 \
   --seed 42 \
+  --repeats 3 \
   --video
 ```
