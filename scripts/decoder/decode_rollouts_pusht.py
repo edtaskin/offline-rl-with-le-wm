@@ -6,6 +6,7 @@ decodes each imagined latent to an RGB frame, and saves:
 
   * side-by-side videos of real future frames vs decoded imagined frames,
   * a grid at model steps 1..10, i.e. environment steps 5..50 by default.
+  * image-space rollout metrics and plots comparing decoded images.
 
 Relative paths are resolved from the top-level wrapper repo, regardless of the
 current working directory used to launch the script.
@@ -14,6 +15,7 @@ current working directory used to launch the script.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -23,9 +25,11 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import h5py
 import imageio.v2 as imageio
+import matplotlib.pyplot as plt
 import numpy as np
 import stable_worldmodel as swm
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torch import nn
 
@@ -64,9 +68,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=4.0)
     parser.add_argument("--video-format", choices=["mp4", "gif"], default="mp4")
     parser.add_argument("--grid-steps", default="5,10,15,20,25,30,35,40,45,50")
+    parser.add_argument("--no-videos", action="store_true", help="Skip per-trajectory side-by-side videos.")
+    parser.add_argument("--no-grids", action="store_true", help="Skip per-trajectory timestep grids.")
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--encode-batch-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--foreground-threshold", type=float, default=0.05)
+    parser.add_argument("--mask-dilate", type=int, default=7)
+    parser.add_argument("--color-min", type=float, default=0.25)
+    parser.add_argument("--color-margin", type=float, default=0.05)
+    parser.add_argument("--gray-min", type=float, default=0.20)
+    parser.add_argument("--gray-max", type=float, default=0.85)
+    parser.add_argument("--gray-chroma", type=float, default=0.18)
+    parser.add_argument("--min-mask-pixels", type=int, default=8)
     parser.add_argument(
         "--no-normalize-actions",
         action="store_true",
@@ -175,6 +190,24 @@ def rollout_embeddings(
     return torch.stack(emb_list[context_steps:], dim=1)
 
 
+@torch.inference_mode()
+def encode_future_embeddings(
+    model: torch.nn.Module,
+    future_pixels: np.ndarray,
+    encode_batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    bsz, horizon = future_pixels.shape[:2]
+    flat_pixels = future_pixels.reshape(bsz * horizon, *future_pixels.shape[2:])
+    chunks = []
+    for start in range(0, len(flat_pixels), encode_batch_size):
+        pixel_chunk = flat_pixels[start : start + encode_batch_size]
+        pixels = preprocess_pixels(pixel_chunk[:, None], device)
+        emb = model.encode({"pixels": pixels})["emb"][:, 0]
+        chunks.append(emb.detach().cpu().float())
+    return torch.cat(chunks, dim=0).reshape(bsz, horizon, -1)
+
+
 def load_decoder(path: Path, device: torch.device) -> nn.Module:
     if not path.exists():
         raise FileNotFoundError(
@@ -206,6 +239,250 @@ def decode_embeddings(
 
 def pixels_to_tensor(pixels: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(pixels).permute(0, 1, 4, 2, 3).float().div(255.0)
+
+
+def foreground_mask(images: torch.Tensor, threshold: float) -> torch.Tensor:
+    return images.sub(1.0).abs().amax(dim=2) > threshold
+
+
+def color_masks(images: torch.Tensor, args: argparse.Namespace) -> dict[str, torch.Tensor]:
+    r, g, b = images.unbind(dim=2)
+    fg = foreground_mask(images, args.foreground_threshold)
+    maxc = images.max(dim=2).values
+    minc = images.min(dim=2).values
+    mean = images.mean(dim=2)
+    return {
+        "foreground": fg,
+        "blue_agent": (b > args.color_min) & (b > r + args.color_margin) & (b > g + args.color_margin),
+        "green_target": (g > args.color_min) & (g > r + args.color_margin) & (g > b + args.color_margin),
+        "gray_block": fg & ((maxc - minc) < args.gray_chroma) & (mean > args.gray_min) & (mean < args.gray_max),
+    }
+
+
+def _sum_over_images(values: torch.Tensor) -> np.ndarray:
+    return values.sum(dim=(0, 2, 3)).detach().cpu().double().numpy()
+
+
+def _sum_over_image_channels(values: torch.Tensor) -> np.ndarray:
+    return values.sum(dim=(0, 2, 3, 4)).detach().cpu().double().numpy()
+
+
+def _mask_den(mask: torch.Tensor, channels: int = 1) -> np.ndarray:
+    return (mask.sum(dim=(0, 2, 3)) * channels).detach().cpu().double().numpy()
+
+
+def ssim_maps(pred: torch.Tensor, ref: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    pred_flat = pred.flatten(0, 1)
+    ref_flat = ref.flatten(0, 1)
+    pad = window_size // 2
+    c1 = 0.01**2
+    c2 = 0.03**2
+    mu_x = F.avg_pool2d(pred_flat, window_size, stride=1, padding=pad)
+    mu_y = F.avg_pool2d(ref_flat, window_size, stride=1, padding=pad)
+    sigma_x = F.avg_pool2d(pred_flat * pred_flat, window_size, stride=1, padding=pad) - mu_x * mu_x
+    sigma_y = F.avg_pool2d(ref_flat * ref_flat, window_size, stride=1, padding=pad) - mu_y * mu_y
+    sigma_xy = F.avg_pool2d(pred_flat * ref_flat, window_size, stride=1, padding=pad) - mu_x * mu_y
+    ssim = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
+        (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2)
+    )
+    return ssim.reshape(*pred.shape)
+
+
+def dilate_mask(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if kernel_size <= 1:
+        return mask
+    flat = mask.flatten(0, 1).float().unsqueeze(1)
+    pad = kernel_size // 2
+    dilated = F.max_pool2d(flat, kernel_size=kernel_size, stride=1, padding=pad)
+    return dilated.squeeze(1).reshape(mask.shape).bool()
+
+
+def mask_iou_parts(pred_mask: torch.Tensor, ref_mask: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    intersection = torch.logical_and(pred_mask, ref_mask).sum(dim=(0, 2, 3))
+    union = torch.logical_or(pred_mask, ref_mask).sum(dim=(0, 2, 3))
+    return intersection.detach().cpu().double().numpy(), union.detach().cpu().double().numpy()
+
+
+def centroid_error_parts(
+    pred_mask: torch.Tensor,
+    ref_mask: torch.Tensor,
+    min_pixels: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    bsz, horizon, height, width = pred_mask.shape
+    ys, xs = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32, device=pred_mask.device),
+        torch.arange(width, dtype=torch.float32, device=pred_mask.device),
+        indexing="ij",
+    )
+    numerator = torch.zeros(horizon, dtype=torch.float64)
+    denominator = torch.zeros(horizon, dtype=torch.float64)
+    pred_f = pred_mask.float()
+    ref_f = ref_mask.float()
+
+    for t in range(horizon):
+        for b in range(bsz):
+            pred_count = pred_f[b, t].sum()
+            ref_count = ref_f[b, t].sum()
+            if pred_count < min_pixels or ref_count < min_pixels:
+                continue
+            pred_x = (pred_f[b, t] * xs).sum() / pred_count
+            pred_y = (pred_f[b, t] * ys).sum() / pred_count
+            ref_x = (ref_f[b, t] * xs).sum() / ref_count
+            ref_y = (ref_f[b, t] * ys).sum() / ref_count
+            dist = torch.sqrt((pred_x - ref_x).pow(2) + (pred_y - ref_y).pow(2))
+            numerator[t] += float(dist.detach().cpu())
+            denominator[t] += 1.0
+    return numerator.numpy(), denominator.numpy()
+
+
+def image_metric_parts(
+    pred: torch.Tensor,
+    ref: torch.Tensor,
+    prefix: str,
+    args: argparse.Namespace,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    pred = pred.detach().cpu().float().clamp(0, 1)
+    ref = ref.detach().cpu().float().clamp(0, 1)
+    bsz, horizon, channels, height, width = pred.shape
+    parts: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    abs_err = (pred - ref).abs()
+    sq_err = (pred - ref).pow(2)
+    full_den = np.full(horizon, bsz * channels * height * width, dtype=np.float64)
+    parts[f"{prefix}_full_mae"] = (_sum_over_image_channels(abs_err), full_den)
+    parts[f"{prefix}_full_rmse"] = (_sum_over_image_channels(sq_err), full_den)
+
+    ref_fg = foreground_mask(ref, args.foreground_threshold)
+    fg_den = _mask_den(ref_fg, channels)
+    parts[f"{prefix}_foreground_mae"] = (_sum_over_image_channels(abs_err * ref_fg.unsqueeze(2)), fg_den)
+    parts[f"{prefix}_foreground_rmse"] = (_sum_over_image_channels(sq_err * ref_fg.unsqueeze(2)), fg_den)
+
+    ssim = ssim_maps(pred, ref)
+    ssim_per_image = ssim.mean(dim=(2, 3, 4))
+    parts[f"{prefix}_ssim"] = (
+        ssim_per_image.sum(dim=0).detach().cpu().double().numpy(),
+        np.full(horizon, bsz, dtype=np.float64),
+    )
+    fg_for_ssim = dilate_mask(ref_fg, args.mask_dilate)
+    parts[f"{prefix}_foreground_ssim"] = (
+        _sum_over_image_channels(ssim * fg_for_ssim.unsqueeze(2)),
+        _mask_den(fg_for_ssim, channels),
+    )
+
+    pred_masks = color_masks(pred, args)
+    ref_masks = color_masks(ref, args)
+    for name in ("foreground", "blue_agent", "green_target", "gray_block"):
+        inter, union = mask_iou_parts(pred_masks[name], ref_masks[name])
+        parts[f"{prefix}_{name}_iou"] = (inter, union)
+        num, den = centroid_error_parts(pred_masks[name], ref_masks[name], args.min_mask_pixels)
+        parts[f"{prefix}_{name}_centroid_error_px"] = (num, den)
+
+    return parts
+
+
+class MetricAccumulator:
+    def __init__(self):
+        self.numerators: dict[str, np.ndarray] = {}
+        self.denominators: dict[str, np.ndarray] = {}
+
+    def add(self, parts: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
+        for key, (num, den) in parts.items():
+            if key not in self.numerators:
+                self.numerators[key] = num.astype(np.float64).copy()
+                self.denominators[key] = den.astype(np.float64).copy()
+            else:
+                self.numerators[key] += num
+                self.denominators[key] += den
+
+    def curves(self) -> dict[str, np.ndarray]:
+        output = {}
+        for key, num in self.numerators.items():
+            den = self.denominators[key]
+            value = np.divide(num, den, out=np.full_like(num, np.nan, dtype=np.float64), where=den > 0)
+            if key.endswith("_rmse"):
+                value = np.sqrt(value)
+            output[key] = value
+        return output
+
+
+def save_metrics_csv(path: Path, env_steps: np.ndarray, curves: dict[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["model_step", "env_step"] + sorted(curves)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for i, env_step in enumerate(env_steps):
+            row = {"model_step": i + 1, "env_step": int(env_step)}
+            row.update({key: float(value[i]) for key, value in curves.items()})
+            writer.writerow(row)
+
+
+def plot_metric_group(
+    path: Path,
+    env_steps: np.ndarray,
+    curves: dict[str, np.ndarray],
+    metric_names: list[tuple[str, str]],
+    comparison_prefixes: list[tuple[str, str]],
+) -> None:
+    fig, axes = plt.subplots(1, len(metric_names), figsize=(5 * len(metric_names), 4), constrained_layout=True)
+    if len(metric_names) == 1:
+        axes = [axes]
+    for ax, (metric, title) in zip(axes, metric_names):
+        for prefix, label in comparison_prefixes:
+            key = f"{prefix}_{metric}"
+            if key in curves:
+                ax.plot(env_steps, curves[key], label=label, linewidth=2)
+        ax.set_title(title)
+        ax.set_xlabel("Environment steps after context")
+        ax.grid(True, alpha=0.25)
+    axes[-1].legend()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def save_metric_plots(output_dir: Path, env_steps: np.ndarray, curves: dict[str, np.ndarray]) -> None:
+    comparisons = [
+        ("imagined_vs_real", "imagined decoded vs real"),
+        ("encoded_gt_vs_real", "encoded-GT decoded vs real"),
+        ("imagined_vs_encoded_gt", "imagined decoded vs encoded-GT decoded"),
+    ]
+    plot_metric_group(
+        output_dir / "rollout_decode_image_errors.png",
+        env_steps,
+        curves,
+        [
+            ("foreground_mae", "Foreground MAE"),
+            ("foreground_rmse", "Foreground RMSE"),
+            ("ssim", "SSIM"),
+            ("foreground_ssim", "Foreground SSIM"),
+        ],
+        comparisons,
+    )
+    plot_metric_group(
+        output_dir / "rollout_decode_mask_iou.png",
+        env_steps,
+        curves,
+        [
+            ("foreground_iou", "Foreground IoU"),
+            ("blue_agent_iou", "Blue Agent IoU"),
+            ("gray_block_iou", "Gray Block IoU"),
+            ("green_target_iou", "Green Target IoU"),
+        ],
+        comparisons,
+    )
+    plot_metric_group(
+        output_dir / "rollout_decode_centroid_errors.png",
+        env_steps,
+        curves,
+        [
+            ("foreground_centroid_error_px", "Foreground Centroid Error"),
+            ("blue_agent_centroid_error_px", "Blue Agent Centroid Error"),
+            ("gray_block_centroid_error_px", "Gray Block Centroid Error"),
+            ("green_target_centroid_error_px", "Green Target Centroid Error"),
+        ],
+        comparisons,
+    )
 
 
 def tensor_image_to_uint8(image: torch.Tensor) -> np.ndarray:
@@ -304,6 +581,8 @@ def main() -> None:
     history_size = int(getattr(model.predictor, "num_frames", 3))
     decoder = load_decoder(decoder_checkpoint, device)
     grid_env_steps = parse_grid_steps(args.grid_steps, args.frameskip, args.horizon)
+    env_steps = args.frameskip * np.arange(1, args.horizon + 1)
+    metric_accumulator = MetricAccumulator()
 
     sampled: list[tuple[int, int]] = []
     with h5py.File(dataset_path, "r") as h5:
@@ -337,28 +616,49 @@ def main() -> None:
                 device=device,
             )
             decoded = decode_embeddings(decoder, pred_emb, args.batch_size, device)
+            gt_emb = encode_future_embeddings(model, future_pixels, args.encode_batch_size, device)
+            decoded_gt = decode_embeddings(decoder, gt_emb, args.batch_size, device)
             real = pixels_to_tensor(future_pixels)
-            env_steps = args.frameskip * np.arange(1, args.horizon + 1)
+
+            metric_accumulator.add(image_metric_parts(decoded, real, "imagined_vs_real", args))
+            metric_accumulator.add(image_metric_parts(decoded_gt, real, "encoded_gt_vs_real", args))
+            metric_accumulator.add(
+                image_metric_parts(decoded, decoded_gt, "imagined_vs_encoded_gt", args)
+            )
 
             for i, (ep, start) in enumerate(batch_starts):
                 traj_name = f"trajectory_{len(sampled):03d}_ep{ep}_start{start}"
                 suffix = ".gif" if args.video_format == "gif" else ".mp4"
-                save_video(
-                    output_dir / f"{traj_name}_side_by_side{suffix}",
-                    real[i],
-                    decoded[i],
-                    env_steps,
-                    args.fps,
-                )
-                save_timestep_grid(
-                    output_dir / f"{traj_name}_grid.png",
-                    real[i],
-                    decoded[i],
-                    grid_env_steps,
-                    args.frameskip,
-                )
+                if not args.no_videos:
+                    save_video(
+                        output_dir / f"{traj_name}_side_by_side{suffix}",
+                        real[i],
+                        decoded[i],
+                        env_steps,
+                        args.fps,
+                    )
+                if not args.no_grids:
+                    save_timestep_grid(
+                        output_dir / f"{traj_name}_grid.png",
+                        real[i],
+                        decoded[i],
+                        grid_env_steps,
+                        args.frameskip,
+                    )
                 sampled.append((ep, start))
-                print(f"saved visuals for {traj_name}")
+                if args.no_videos and args.no_grids:
+                    print(f"processed metrics for {traj_name}")
+                else:
+                    print(f"saved visuals for {traj_name}")
+
+    metric_curves = metric_accumulator.curves()
+    save_metrics_csv(output_dir / "rollout_decode_metrics.csv", env_steps, metric_curves)
+    save_metric_plots(output_dir, env_steps, metric_curves)
+    np.savez_compressed(
+        output_dir / "rollout_decode_metric_arrays.npz",
+        env_steps=env_steps,
+        **metric_curves,
+    )
 
     summary = {
         "config": vars(args),
@@ -367,6 +667,8 @@ def main() -> None:
         "history_size": history_size,
         "env_steps": (args.frameskip * np.arange(1, args.horizon + 1)).tolist(),
         "grid_env_steps": grid_env_steps.tolist(),
+        "final_step": {key: float(value[-1]) for key, value in metric_curves.items()},
+        "mean_over_horizon": {key: float(np.nanmean(value)) for key, value in metric_curves.items()},
         "action_normalization": {
             "enabled": not args.no_normalize_actions,
             "mean": action_mean.tolist(),
