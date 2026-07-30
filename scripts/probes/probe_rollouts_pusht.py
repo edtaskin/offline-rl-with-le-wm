@@ -433,18 +433,40 @@ def binary_curve_metrics(
     tn = np.logical_and(~pred, ~y).sum(axis=0).astype(np.float32)
     fp = np.logical_and(pred, ~y).sum(axis=0).astype(np.float32)
     fn = np.logical_and(~pred, y).sum(axis=0).astype(np.float32)
+    positive_count = y.sum(axis=0).astype(np.float32)
+    negative_count = (~y).sum(axis=0).astype(np.float32)
     recall = tp / np.maximum(tp + fn, 1.0)
     specificity = tn / np.maximum(tn + fp, 1.0)
     precision = tp / np.maximum(tp + fp, 1.0)
     f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-8)
     false_positive_rate = fp / np.maximum(fp + tn, 1.0)
+    false_negative_rate = fn / np.maximum(fn + tp, 1.0)
+    p_on_positive = np.divide(
+        (p * y).sum(axis=0),
+        positive_count,
+        out=np.full_like(positive_count, np.nan, dtype=np.float32),
+        where=positive_count > 0,
+    )
+    p_on_negative = np.divide(
+        (p * ~y).sum(axis=0),
+        negative_count,
+        out=np.full_like(negative_count, np.nan, dtype=np.float32),
+        where=negative_count > 0,
+    )
     return {
+        "objective_met_positive_count": positive_count,
+        "objective_met_negative_count": negative_count,
         "objective_met_positive_rate": y.mean(axis=0),
         "objective_met_mean_probability": p.mean(axis=0),
+        "objective_met_mean_probability_on_positives": p_on_positive,
+        "objective_met_mean_probability_on_negatives": p_on_negative,
         "objective_met_predicted_rate": pred.mean(axis=0),
         "objective_met_true_positives": tp,
+        "objective_met_true_negatives": tn,
         "objective_met_false_positives": fp,
+        "objective_met_false_negatives": fn,
         "objective_met_false_positive_rate": false_positive_rate,
+        "objective_met_false_negative_rate": false_negative_rate,
         "objective_met_accuracy": (tp + tn) / np.maximum(tp + tn + fp + fn, 1.0),
         "objective_met_balanced_accuracy": 0.5 * (recall + specificity),
         "objective_met_precision": precision,
@@ -577,6 +599,34 @@ def plot_objective_recall_false_positive_curves(
         if key != "objective_met_false_positives":
             ax.set_ylim(0.0, 1.05)
     axes[-1].legend()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def plot_objective_reliability_curves(
+    path: Path,
+    env_steps: np.ndarray,
+    imagined: dict[str, np.ndarray],
+    encoded_gt: dict[str, np.ndarray],
+) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    specs = [
+        ("objective_met_positive_count", "GT Objective-Met Support", "Count"),
+        ("objective_met_recall", "Recall on GT Objective-Met States", "Rate"),
+        ("objective_met_false_negative_rate", "False Negative Rate on GT Objective-Met States", "Rate"),
+        ("objective_met_precision", "Precision of Objective-Met Predictions", "Rate"),
+    ]
+    for ax, (key, title, ylabel) in zip(axes.flat, specs):
+        ax.plot(env_steps, imagined[key], label="imagined latent", linewidth=2)
+        ax.plot(env_steps, encoded_gt[key], label="encoded GT latent", linestyle="--", linewidth=2)
+        ax.set_title(title)
+        ax.set_xlabel("Environment steps after context")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        if key != "objective_met_positive_count":
+            ax.set_ylim(0.0, 1.05)
+    axes[0, 1].legend()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -735,6 +785,12 @@ def main() -> None:
         imagined_curves,
         encoded_gt_curves,
     )
+    plot_objective_reliability_curves(
+        output_dir / "rollout_probe_objective_reliability.png",
+        env_steps,
+        imagined_curves,
+        encoded_gt_curves,
+    )
     plot_latent_curve(output_dir / "latent_rmse.png", env_steps, latent_rmse)
     plot_latent_similarity(output_dir / "latent_similarity.png", env_steps, latent_rmse, latent_cosine)
     np.savez_compressed(
@@ -769,9 +825,16 @@ def main() -> None:
             or key.endswith("_f1")
             or key.endswith("_balanced_accuracy")
             or key.endswith("_recall")
+            or key.endswith("_precision")
             or key.endswith("_false_positive_rate")
+            or key.endswith("_false_negative_rate")
             or key.endswith("_false_positives")
+            or key.endswith("_false_negatives")
+            or key.endswith("_positive_count")
+            or key.endswith("_negative_count")
             or key.endswith("_mean_probability")
+            or key.endswith("_mean_probability_on_positives")
+            or key.endswith("_mean_probability_on_negatives")
             or key.endswith("_positive_rate")
             or key in ("latent_rmse", "latent_cosine")
         },
@@ -785,9 +848,16 @@ def main() -> None:
             or key.endswith("_f1")
             or key.endswith("_balanced_accuracy")
             or key.endswith("_recall")
+            or key.endswith("_precision")
             or key.endswith("_false_positive_rate")
+            or key.endswith("_false_negative_rate")
             or key.endswith("_false_positives")
+            or key.endswith("_false_negatives")
+            or key.endswith("_positive_count")
+            or key.endswith("_negative_count")
             or key.endswith("_mean_probability")
+            or key.endswith("_mean_probability_on_positives")
+            or key.endswith("_mean_probability_on_negatives")
             or key.endswith("_positive_rate")
             or key in ("latent_rmse", "latent_cosine")
         },
