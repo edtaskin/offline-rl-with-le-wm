@@ -17,6 +17,7 @@ here needs the real LeWM checkpoint or expert data. Covers:
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -33,6 +34,7 @@ import gymnasium as gym  # noqa: E402
 from gymnasium import spaces  # noqa: E402
 
 from src.ppo.agent import LatentPPOAgent, build_latent_agent  # noqa: E402
+from src.ppo.config import LatentConfig  # noqa: E402
 from src.ppo.env import LatentHistory  # noqa: E402
 
 
@@ -201,6 +203,116 @@ def test_build_latent_agent_loads_bc_checkpoint():
         )
     assert torch.equal(agent.actor.bc_policy.net[0].weight, reference_state["net.0.weight"])
     assert torch.equal(agent.actor.bc_policy.net[4].bias, reference_state["net.4.bias"])
+
+
+def test_build_bc_ref_policy_loads_frozen_checkpoint():
+    """The BC reference policy is loaded from the same artifact path as the actor."""
+    import src.ppo.ppo as latent_ppo
+
+    reference_agent = _make_agent(action_chunk_size=5)
+    reference_state = reference_agent.actor.bc_policy.state_dict()
+    with TemporaryDirectory() as temporary_dir:
+        ckpt = Path(temporary_dir) / "bc_prior.pth"
+        torch.save(reference_state, ckpt)
+        cfg = LatentConfig(
+            bc_checkpoint=str(ckpt),
+            bc_penalty=True,
+            latent_dim=192,
+            frame_stack=3,
+            action_dim=2,
+            action_chunk_size=5,
+            hidden_dim=256,
+            num_envs=1,
+            num_chunks=1,
+        )
+        ref_policy = latent_ppo.build_bc_ref_policy(cfg, torch.device("cpu"))
+
+    assert ref_policy is not None
+    assert ref_policy.training is False
+    assert all(not p.requires_grad for p in ref_policy.parameters())
+    assert torch.equal(ref_policy.net[0].weight, reference_state["net.0.weight"])
+    assert torch.equal(ref_policy.net[4].bias, reference_state["net.4.bias"])
+
+
+def test_build_bc_ref_policy_requires_checkpoint():
+    """Turning on the BC penalty without a BC checkpoint should fail early."""
+    import src.ppo.ppo as latent_ppo
+
+    cfg = LatentConfig(
+        bc_checkpoint=None,
+        bc_penalty=True,
+        num_envs=1,
+        num_chunks=1,
+    )
+    try:
+        latent_ppo.build_bc_ref_policy(cfg, torch.device("cpu"))
+    except ValueError as exc:
+        assert "bc_checkpoint" in str(exc)
+    else:
+        raise AssertionError("bc_penalty without bc_checkpoint did not fail")
+
+
+def test_lewm_dream_trainer_loads_bc_ref_policy():
+    """Dream PPO wires the frozen BC reference needed by inherited update()."""
+    import shutil
+    import src.ppo.train_lewm as train_lewm
+
+    class FakeDreamWorld:
+        def __init__(self, cfg, device):
+            self.cls_encoder = DummyImageEncoder(latent_dim=cfg.latent_dim)
+
+    reference_agent = _make_agent(action_chunk_size=5)
+    reference_state = reference_agent.actor.bc_policy.state_dict()
+    with TemporaryDirectory() as temporary_dir:
+        ckpt = Path(temporary_dir) / "bc_prior.pth"
+        torch.save(reference_state, ckpt)
+
+        orig_world = train_lewm.LeWMDreamWorld
+        train_lewm.LeWMDreamWorld = FakeDreamWorld
+        try:
+            cfg = train_lewm.DreamConfig(
+                exp_name="test_lewm_dream_kl",
+                device="cpu",
+                bc_checkpoint=str(ckpt),
+                bc_penalty=True,
+                latent_dim=192,
+                frame_stack=3,
+                frame_stride=5,
+                action_chunk_size=5,
+                hidden_dim=256,
+                action_dim=2,
+                num_envs=1,
+                num_chunks=1,
+                total_timesteps=5,
+                eval_interval=0,
+                dream_eval_interval=0,
+                selection="rolling",
+                save_dir=str(REPO_ROOT / "runs"),
+            )
+            trainer = train_lewm.LeWMDreamPPOTrainer(cfg)
+        finally:
+            train_lewm.LeWMDreamWorld = orig_world
+            shutil.rmtree(REPO_ROOT / "runs" / "test_lewm_dream_kl__seed1", ignore_errors=True)
+
+    assert trainer.bc_ref_policy is not None
+    assert trainer.bc_ref_policy.training is False
+    assert all(not p.requires_grad for p in trainer.bc_ref_policy.parameters())
+
+
+def test_bc_penalty_cli_flags():
+    """BC penalty CLI flags populate the config fields."""
+    import src.ppo.train as train
+    import src.ppo.train_lewm as train_lewm
+
+    for add_args in (train._add_args, train_lewm._add_args):
+        parser = argparse.ArgumentParser()
+        add_args(parser)
+        parsed = parser.parse_args(["--bc-penalty", "--bc-penalty-coef", "0.05"])
+        assert parsed.bc_penalty is True
+        assert parsed.bc_penalty_coef == 0.05
+
+        parsed = parser.parse_args(["--no-bc_penalty"])
+        assert parsed.bc_penalty is False
 
 
 class _FakeImageEnv(gym.Env):

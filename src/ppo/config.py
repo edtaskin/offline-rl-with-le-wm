@@ -79,8 +79,8 @@ class LatentConfig:
     clip_vloss: bool = True
     ent_coef: float = 0.0
     vf_coef: float = 0.5
-    BC_KL_penalty: bool = False
-    BC_KL_penalty_coef: float = 0.0
+    bc_penalty: bool = False
+    bc_penalty_coef: float = 0.0
     max_grad_norm: float = 0.5
     target_kl: float | None = 0.03
 

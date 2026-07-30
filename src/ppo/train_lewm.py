@@ -70,7 +70,7 @@ from src.ppo.agent import build_latent_agent
 from src.ppo.config import LatentConfig
 from src.ppo.env import LatentHistory
 from src.ppo.lewm_encoder import LeWMLatentEncoder
-from src.ppo.ppo import LatentPPOTrainer, _configure_logging, logger
+from src.ppo.ppo import LatentPPOTrainer, _configure_logging, build_bc_ref_policy, logger
 from src.ppo.train import (
     _NULLABLE_STR_FIELDS,
     SMOKE_OVERRIDES,
@@ -687,6 +687,7 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
             bc_checkpoint_path=cfg.bc_checkpoint,
             device=self.device,
         )
+        self.bc_ref_policy = build_bc_ref_policy(cfg, self.device)
         if cfg.anneal_log_std:
             self.agent.actor.log_std.requires_grad_(False)
             self._set_log_std(cfg.init_log_std)
@@ -987,7 +988,6 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
             parser.add_argument(
                 *names, dest=f.name, type=type(default), default=argparse.SUPPRESS
             )
-
 
 def parse_config() -> DreamConfig:
     parser = argparse.ArgumentParser(

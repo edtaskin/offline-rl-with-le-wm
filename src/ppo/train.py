@@ -110,7 +110,6 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
                 *names, dest=f.name, type=type(default), default=argparse.SUPPRESS
             )
 
-
 def _stats_contract(stats_path: str) -> dict:
     resolved_stats_path = resolve_artifact(stats_path)
     stats = torch.load(resolved_stats_path, map_location="cpu")
