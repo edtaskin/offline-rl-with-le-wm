@@ -91,6 +91,12 @@ class LatentConfig:
     # ----- logging / checkpointing (in iterations) -----
     log_interval: int = 1
     save_interval: int = 25
+    # Keep a permanent, step-tagged copy of the agent every ``snapshot_interval``
+    # iterations (``snapshot_step<env_steps>_it<iteration>.pt``). Unlike
+    # ``latest.pt`` these are never overwritten, which is what makes an
+    # interaction-budget curve (success vs env steps consumed) possible after the
+    # fact. 0 = off.
+    snapshot_interval: int = 0
 
     # ----- held-out evaluation (deterministic, fixed seeds) -----
     # Honest best-checkpoint selection: every ``eval_interval`` iterations, run

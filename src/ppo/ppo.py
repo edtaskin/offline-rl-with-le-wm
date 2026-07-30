@@ -138,6 +138,10 @@ class LatentPPOTrainer:
         ]
 
         self.global_step = 0  # counts real env steps
+        # Env steps spent on held-out evaluation (checkpoint selection). Tracked
+        # separately from training steps so the total interaction budget a
+        # checkpoint cost -- see :meth:`real_env_steps` -- is auditable.
+        self._eval_env_steps = 0
         self.start_time = time.time()
         self._ep_returns: deque[float] = deque(maxlen=100)
         self._ep_lengths: deque[float] = deque(maxlen=100)
@@ -386,6 +390,24 @@ class LatentPPOTrainer:
         }
 
     # ------------------------------------------------------------ checkpoint
+    def train_env_steps(self) -> int:
+        """Real ``env.step`` calls spent collecting rollouts.
+
+        Equals ``global_step`` here; trainers that roll out somewhere other than
+        the environment (see :mod:`src.ppo.train_lewm`) override this to 0, since
+        for them ``global_step`` counts imagined steps.
+        """
+        return self.global_step
+
+    def real_env_steps(self) -> int:
+        """Real ``env.step`` calls this checkpoint cost, training *and* selection.
+
+        The interaction budget a checkpoint was bought with is what RQ1 compares
+        agents on, so held-out evaluation counts: selecting ``best.pt`` by
+        real-env success is environment interaction even though it trains nothing.
+        """
+        return self.train_env_steps() + self._eval_env_steps
+
     def save_checkpoint(self, name: str = "latest", success_rate: float | None = None) -> Path:
         path = self.run_dir / f"{name}.pt"
         # Drop the (frozen, large) encoder weights; it is reloaded separately.
@@ -398,6 +420,9 @@ class LatentPPOTrainer:
             "agent": agent_state,
             "config": self.cfg.__dict__,
             "global_step": self.global_step,
+            "env_steps_consumed": self.real_env_steps(),
+            "train_env_steps": self.train_env_steps(),
+            "eval_env_steps": self._eval_env_steps,
             "success_rate": success_rate,
             "contract": {
                 "frame_stack": self.cfg.frame_stack,
@@ -411,6 +436,19 @@ class LatentPPOTrainer:
         if self.reward_norm is not None:
             ckpt["reward_norm"] = self.reward_norm.state_dict()
         torch.save(ckpt, path)
+        return path
+
+    def save_snapshot(self, iteration: int) -> Path:
+        """Save a permanent checkpoint tagged with the interaction budget so far.
+
+        The env-step count leads the name so that dream and real runs land on a
+        common x-axis: every dream snapshot is ``snapshot_step000000000_*`` no
+        matter how much imagined experience produced it. The iteration suffix
+        keeps those snapshots distinct.
+        """
+        name = f"snapshot_step{self.real_env_steps():09d}_it{iteration:05d}"
+        path = self.save_checkpoint(name, success_rate=self._current_success_rate())
+        logger.info("Saved budget snapshot %s", path.name)
         return path
 
     def _current_success_rate(self) -> float:
@@ -474,6 +512,8 @@ class LatentPPOTrainer:
             torch.set_rng_state(cpu_rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
+        # Selection is paid for in env steps too; see real_env_steps().
+        self._eval_env_steps += int(sum(episode.length for episode in result.episodes))
         logger.info(
             "Held-out eval | success %4.2f | len %5.1f | (%d eps, seed %d)",
             result.summary["success_rate"],
@@ -541,11 +581,45 @@ class LatentPPOTrainer:
             self.save_checkpoint("second_best", success_rate=success_rate)
             self._second_best_success = success_rate
 
+    # ------------------------------------------------------------- selection
+    def _run_selection(self, iteration: int) -> None:
+        """Refresh ``best.pt`` / ``second_best.pt`` for this iteration.
+
+        Isolated from :meth:`train` because *what a checkpoint is selected by* is
+        the variable RQ1 manipulates: :mod:`src.ppo.train_lewm` overrides this to
+        rank checkpoints by imagined success and never touch the environment.
+        """
+        cfg = self.cfg
+        if cfg.eval_interval > 0:
+            # Honest selection: rank checkpoints by held-out success, refreshed
+            # every eval_interval iterations.
+            if iteration % cfg.eval_interval == 0:
+                eval_stats = self._evaluate_heldout()
+                self._log_heldout(iteration, eval_stats)
+                self._update_best_checkpoints(eval_stats["success_rate"])
+        else:
+            # Track best / second-best every iteration so peaks are never missed.
+            self._update_best_checkpoints()
+
+    def _finalize_selection(self) -> float | None:
+        """Last selection pass after the final update; returns final success."""
+        cfg = self.cfg
+        if cfg.eval_interval <= 0:
+            return None
+        eval_stats = self._evaluate_heldout()
+        self._log_heldout(cfg.num_iterations, eval_stats)
+        self._update_best_checkpoints(eval_stats["success_rate"])
+        return eval_stats["success_rate"]
+
     # ----------------------------------------------------------------- train
     def train(self) -> None:
         cfg = self.cfg
         self._reset_all()
         done = np.zeros(cfg.num_envs, dtype=np.float32)
+
+        if cfg.snapshot_interval > 0:
+            # Budget-curve origin: the untouched BC prior at zero env steps.
+            self.save_snapshot(0)
 
         for iteration in range(1, cfg.num_iterations + 1):
             if cfg.anneal_lr:
@@ -578,26 +652,15 @@ class LatentPPOTrainer:
             if iteration % cfg.log_interval == 0:
                 self._log(iteration, stats)
 
-            if cfg.eval_interval > 0:
-                # Honest selection: rank checkpoints by held-out success, refreshed
-                # every eval_interval iterations.
-                if iteration % cfg.eval_interval == 0:
-                    eval_stats = self._evaluate_heldout()
-                    self._log_heldout(iteration, eval_stats)
-                    self._update_best_checkpoints(eval_stats["success_rate"])
-            else:
-                # Track best / second-best every iteration so peaks are never missed.
-                self._update_best_checkpoints()
+            self._run_selection(iteration)
 
             if iteration % cfg.save_interval == 0:
                 self.save_checkpoint("latest", success_rate=self._current_success_rate())
 
-        final_success = None
-        if cfg.eval_interval > 0:
-            eval_stats = self._evaluate_heldout()
-            self._log_heldout(cfg.num_iterations, eval_stats)
-            self._update_best_checkpoints(eval_stats["success_rate"])
-            final_success = eval_stats["success_rate"]
+            if cfg.snapshot_interval > 0 and iteration % cfg.snapshot_interval == 0:
+                self.save_snapshot(iteration)
+
+        final_success = self._finalize_selection()
         self.save_checkpoint(
             "final",
             success_rate=final_success if final_success is not None else self._current_success_rate(),
