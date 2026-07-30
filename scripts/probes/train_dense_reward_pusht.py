@@ -1,8 +1,8 @@
 """Train a dense reward classifier on frozen PushT LeWM latents.
 
 The classifier predicts whether the objective will be met within several future
-world-model horizons. With the default horizons 2, 5, 10, 20 and frameskip 5,
-the four sigmoid heads mean success within 10, 25, 50, and 100 environment
+world-model horizons. With the default horizons 2, 5, 10, 16 and frameskip 5,
+the four sigmoid heads mean success within 10, 25, 50, and 80 environment
 steps. Already-successful states are positive for every head.
 
 Labels are derived from full expert trajectories using cached latent row IDs.
@@ -48,8 +48,16 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
 
 
 class DenseRewardClassifier(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int, depth: int):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int,
+        depth: int,
+        monotonic_outputs: bool = False,
+    ):
         super().__init__()
+        self.monotonic_outputs = monotonic_outputs
         layers: list[nn.Module] = []
         dim = input_dim
         for _ in range(depth):
@@ -59,7 +67,13 @@ class DenseRewardClassifier(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        logits = self.net(x)
+        if not self.monotonic_outputs or logits.shape[-1] <= 1:
+            return logits
+        probs = torch.sigmoid(logits)
+        probs = torch.cummax(probs, dim=-1).values
+        eps = torch.finfo(probs.dtype).eps
+        return torch.logit(probs.clamp(eps, 1.0 - eps))
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +85,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-cache", default=None)
     parser.add_argument("--label-cache", default=None)
     parser.add_argument("--imagined-cache", default=None)
+    parser.add_argument("--imagined-val-cache", default=None)
+    parser.add_argument("--imagined-test-cache", default=None)
     parser.add_argument("--max-samples", type=int, default=1_000_000)
     parser.add_argument("--sample-block-size", type=int, default=16)
     parser.add_argument("--encode-batch-size", type=int, default=256)
@@ -82,12 +98,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=2)
-    parser.add_argument("--horizons", type=int, nargs="+", default=[2, 5, 10, 20])
+    parser.add_argument("--horizons", type=int, nargs="+", default=[2, 5, 10, 16])
     parser.add_argument("--frameskip", type=int, default=5)
     parser.add_argument("--context-steps", type=int, default=3)
     parser.add_argument("--imagined-rollout-horizon", type=int, default=None)
     parser.add_argument("--include-imagined-rollouts", action="store_true")
     parser.add_argument("--imagined-fraction", type=float, default=0.5)
+    parser.add_argument("--eval-imagined-rollouts", action="store_true")
+    parser.add_argument("--imagined-eval-samples", type=int, default=100_000)
+    parser.add_argument(
+        "--threshold-policy",
+        choices=["f1", "target_fpr"],
+        default="f1",
+        help="Use validation F1 or highest-recall threshold with validation FPR <= target.",
+    )
+    parser.add_argument("--target-fpr", type=float, default=0.02)
+    parser.add_argument("--monotonic-outputs", action="store_true")
+    parser.add_argument("--monotonic-loss-weight", type=float, default=0.0)
+    parser.add_argument("--hard-negative-mining", action="store_true")
+    parser.add_argument("--hard-negative-fraction", type=float, default=0.25)
+    parser.add_argument("--hard-negative-epochs", type=int, default=10)
+    parser.add_argument("--hard-negative-threshold-source", choices=["thresholds", "target_fpr"], default="thresholds")
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--force-recache", action="store_true")
@@ -348,6 +379,7 @@ def imagined_metadata_matches(found: dict, expected: dict) -> bool:
         "context_steps",
         "rollout_horizon",
         "num_samples",
+        "split",
         "objective_x",
         "objective_y",
         "objective_angle",
@@ -362,10 +394,12 @@ def imagined_metadata_matches(found: dict, expected: dict) -> bool:
 def build_imagined_train_cache(
     h5_path: Path,
     model: nn.Module,
-    train_rows: np.ndarray,
+    source_rows: np.ndarray,
     num_samples: int,
     rollout_horizon: int,
     args: argparse.Namespace,
+    split: str,
+    seed_offset: int,
 ) -> dict[str, np.ndarray]:
     device = torch.device(args.device)
     model = model.to(device).eval()
@@ -380,12 +414,12 @@ def build_imagined_train_cache(
         starts = sample_rollout_starts(
             offsets,
             lengths,
-            train_rows,
+            source_rows,
             num_windows=int(np.ceil(num_samples / rollout_horizon)),
             context_steps=args.context_steps,
             horizon=rollout_horizon,
             frameskip=args.frameskip,
-            seed=args.seed + 17,
+            seed=args.seed + seed_offset,
         )
         met_prefix = np.concatenate([[0], np.cumsum(objective_met_from_state(state, args).astype(np.int64))])
 
@@ -445,6 +479,67 @@ def build_imagined_train_cache(
     }
 
 
+def imagined_metadata_expected(
+    args: argparse.Namespace,
+    rollout_horizon: int,
+    num_samples: int,
+    split: str,
+) -> dict:
+    return {
+        "dataset": args.dataset,
+        "checkpoint": args.checkpoint,
+        "horizons": args.horizons,
+        "frameskip": args.frameskip,
+        "context_steps": args.context_steps,
+        "rollout_horizon": rollout_horizon,
+        "num_samples": int(num_samples),
+        "split": split,
+        "objective_x": args.objective_x,
+        "objective_y": args.objective_y,
+        "objective_angle": args.objective_angle,
+        "objective_pos_tol": args.objective_pos_tol,
+        "objective_angle_tol": args.objective_angle_tol,
+        "keep_censored_negatives": args.keep_censored_negatives,
+        "normalize_actions": not args.no_normalize_actions,
+    }
+
+
+def get_or_build_imagined_cache(
+    cache_path: Path,
+    h5_path: Path,
+    model: nn.Module,
+    source_rows: np.ndarray,
+    num_samples: int,
+    rollout_horizon: int,
+    args: argparse.Namespace,
+    split: str,
+    seed_offset: int,
+    force: bool,
+) -> tuple[dict[str, np.ndarray], dict]:
+    expected = imagined_metadata_expected(args, rollout_horizon, num_samples, split)
+    if cache_path.exists() and not force:
+        arrays, metadata = load_imagined_cache(cache_path)
+        if imagined_metadata_matches(metadata, expected):
+            print(f"loaded imagined {split} cache: {cache_path}")
+            return arrays, metadata
+        print(f"imagined {split} cache metadata mismatch, recaching: {cache_path}")
+
+    arrays = build_imagined_train_cache(
+        h5_path=h5_path,
+        model=model,
+        source_rows=source_rows,
+        num_samples=num_samples,
+        rollout_horizon=rollout_horizon,
+        args=args,
+        split=split,
+        seed_offset=seed_offset,
+    )
+    metadata = expected
+    save_imagined_cache(cache_path, arrays, metadata)
+    print(f"saved imagined {split} cache: {cache_path}")
+    return arrays, metadata
+
+
 def standardize(train: np.ndarray, *others: np.ndarray) -> tuple[np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
     mean = train.mean(axis=0, keepdims=True)
     std = train.std(axis=0, keepdims=True)
@@ -452,9 +547,21 @@ def standardize(train: np.ndarray, *others: np.ndarray) -> tuple[np.ndarray, lis
     return (train - mean) / std, [(x - mean) / std for x in others], mean, std
 
 
+def apply_standardizer(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return ((x.astype(np.float32) - mean) / std).astype(np.float32)
+
+
 def masked_bce_loss(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor, pos_weight: torch.Tensor) -> torch.Tensor:
     loss = nn.functional.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight, reduction="none")
     return (loss * valid).sum() / valid.sum().clamp_min(1.0)
+
+
+def monotonic_consistency_loss(logits: torch.Tensor) -> torch.Tensor:
+    if logits.shape[-1] <= 1:
+        return logits.new_tensor(0.0)
+    probs = torch.sigmoid(logits)
+    violations = torch.relu(probs[..., :-1] - probs[..., 1:])
+    return violations.mean()
 
 
 def pos_weight_for(y: np.ndarray, valid: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -472,9 +579,20 @@ def train_model(
     y_val: np.ndarray,
     valid_val: np.ndarray,
     args: argparse.Namespace,
+    model: DenseRewardClassifier | None = None,
+    epochs: int | None = None,
+    stage: str = "train",
 ) -> DenseRewardClassifier:
     device = torch.device(args.device)
-    model = DenseRewardClassifier(x_train.shape[1], y_train.shape[1], args.hidden_dim, args.depth).to(device)
+    if model is None:
+        model = DenseRewardClassifier(
+            x_train.shape[1],
+            y_train.shape[1],
+            args.hidden_dim,
+            args.depth,
+            monotonic_outputs=args.monotonic_outputs,
+        )
+    model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     pos_weight = pos_weight_for(y_train, valid_train, device)
 
@@ -491,21 +609,29 @@ def train_model(
     best_loss = float("inf")
     best_state = None
     stale = 0
-    for epoch in range(1, args.epochs + 1):
+    max_epochs = int(epochs or args.epochs)
+    for epoch in range(1, max_epochs + 1):
         model.train()
         for xb, yb, vb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
             vb = vb.to(device)
-            loss = masked_bce_loss(model(xb), yb, vb, pos_weight)
+            logits = model(xb)
+            loss = masked_bce_loss(logits, yb, vb, pos_weight)
+            if args.monotonic_loss_weight > 0:
+                loss = loss + args.monotonic_loss_weight * monotonic_consistency_loss(logits)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
         model.eval()
         with torch.inference_mode():
-            val_loss = masked_bce_loss(model(x_val_t), y_val_t, valid_val_t, pos_weight).item()
-        print(f"epoch {epoch:03d} val_loss={val_loss:.6f}")
+            val_logits = model(x_val_t)
+            val_loss_t = masked_bce_loss(val_logits, y_val_t, valid_val_t, pos_weight)
+            if args.monotonic_loss_weight > 0:
+                val_loss_t = val_loss_t + args.monotonic_loss_weight * monotonic_consistency_loss(val_logits)
+            val_loss = val_loss_t.item()
+        print(f"{stage} epoch {epoch:03d} val_loss={val_loss:.6f}")
         if val_loss < best_loss:
             best_loss = val_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -584,7 +710,13 @@ def average_precision(y_true: np.ndarray, y_prob: np.ndarray, valid: np.ndarray)
     return float((precision * y_sorted).sum() / pos)
 
 
-def select_thresholds(y_val: np.ndarray, prob_val: np.ndarray, valid_val: np.ndarray) -> np.ndarray:
+def select_thresholds(
+    y_val: np.ndarray,
+    prob_val: np.ndarray,
+    valid_val: np.ndarray,
+    policy: str,
+    target_fpr: float,
+) -> np.ndarray:
     thresholds = []
     for head in range(y_val.shape[1]):
         mask = valid_val[:, head].astype(bool)
@@ -592,12 +724,23 @@ def select_thresholds(y_val: np.ndarray, prob_val: np.ndarray, valid_val: np.nda
         y = y_val[mask, head]
         candidates = np.unique(np.quantile(p, np.linspace(0.01, 0.99, 99)))
         candidates = np.concatenate([[0.5], candidates])
-        best_threshold = 0.5
-        best_f1 = -1.0
+        best_threshold = 1.0
+        best_score = -1.0
         for threshold in candidates:
-            f1 = binary_confusion(y, p, np.ones_like(y), float(threshold))["f1"]
-            if f1 > best_f1:
-                best_f1 = f1
+            metrics = binary_confusion(y, p, np.ones_like(y), float(threshold))
+            if policy == "f1":
+                score = metrics["f1"]
+            elif policy == "target_fpr":
+                fp = metrics["fp"]
+                tn = metrics["tn"]
+                fpr = fp / max(fp + tn, 1.0)
+                if fpr > target_fpr:
+                    continue
+                score = metrics["recall"]
+            else:
+                raise ValueError(f"Unknown threshold policy: {policy}")
+            if score > best_score:
+                best_score = score
                 best_threshold = float(threshold)
         thresholds.append(best_threshold)
     return np.asarray(thresholds, dtype=np.float32)
@@ -630,6 +773,25 @@ def evaluate_split(
             **binary_confusion(y, p, valid[:, i], float(thresholds[i])),
         }
     return {"heads": heads}
+
+
+def hard_negative_indices(
+    y: np.ndarray,
+    prob: np.ndarray,
+    valid: np.ndarray,
+    thresholds: np.ndarray,
+    max_count: int,
+) -> np.ndarray:
+    if max_count <= 0:
+        return np.array([], dtype=np.int64)
+    negative_valid = (valid > 0) & (y <= 0)
+    excess = np.where(negative_valid, prob - thresholds[None, :], -np.inf)
+    hard_score = excess.max(axis=1)
+    candidates = np.nonzero(hard_score > 0)[0]
+    if len(candidates) == 0:
+        return candidates.astype(np.int64)
+    order = np.argsort(-hard_score[candidates])
+    return candidates[order[:max_count]].astype(np.int64)
 
 
 def merge_latents_and_labels(
@@ -667,6 +829,12 @@ def main() -> None:
     label_cache = repo_path(args.label_cache) if args.label_cache else output_dir / "dense_reward_labels.npz"
     imagined_cache = (
         repo_path(args.imagined_cache) if args.imagined_cache else output_dir / "imagined_train_rollouts.npz"
+    )
+    imagined_val_cache = (
+        repo_path(args.imagined_val_cache) if args.imagined_val_cache else output_dir / "imagined_val_rollouts.npz"
+    )
+    imagined_test_cache = (
+        repo_path(args.imagined_test_cache) if args.imagined_test_cache else output_dir / "imagined_test_rollouts.npz"
     )
 
     if latent_cache.exists() and not args.force_recache:
@@ -736,6 +904,11 @@ def main() -> None:
     merged = merge_latents_and_labels(data, labels)
     train_source_counts = {"gt": int(len(merged["train"]["z"])), "imagined": 0}
     imagined_metadata = None
+    imagined_val = None
+    imagined_test = None
+    imagined_val_metadata = None
+    imagined_test_metadata = None
+    rollout_model = None
 
     train_z_raw = merged["train"]["z"]
     y_train = merged["train"]["y"]
@@ -746,39 +919,19 @@ def main() -> None:
         n_train_total = len(train_z_raw)
         n_imagined = int(round(n_train_total * args.imagined_fraction))
         n_gt_keep = n_train_total - n_imagined
-        imagined_metadata_expected = {
-            "dataset": args.dataset,
-            "checkpoint": args.checkpoint,
-            "horizons": args.horizons,
-            "frameskip": args.frameskip,
-            "context_steps": args.context_steps,
-            "rollout_horizon": rollout_horizon,
-            "num_samples": n_imagined,
-            "objective_x": args.objective_x,
-            "objective_y": args.objective_y,
-            "objective_angle": args.objective_angle,
-            "objective_pos_tol": args.objective_pos_tol,
-            "objective_angle_tol": args.objective_angle_tol,
-            "keep_censored_negatives": args.keep_censored_negatives,
-            "normalize_actions": not args.no_normalize_actions,
-        }
-        if imagined_cache.exists() and not args.force_imagined_recache:
-            imagined, imagined_metadata = load_imagined_cache(imagined_cache)
-            if imagined_metadata_matches(imagined_metadata, imagined_metadata_expected):
-                print(f"loaded imagined rollout cache: {imagined_cache}")
-            else:
-                print(f"imagined cache metadata mismatch, recaching: {imagined_cache}")
-                model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=cache_dir)
-                imagined = build_imagined_train_cache(h5_path, model, train_rows, n_imagined, rollout_horizon, args)
-                imagined_metadata = imagined_metadata_expected
-                save_imagined_cache(imagined_cache, imagined, imagined_metadata)
-                print(f"saved imagined rollout cache: {imagined_cache}")
-        else:
-            model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=cache_dir)
-            imagined = build_imagined_train_cache(h5_path, model, train_rows, n_imagined, rollout_horizon, args)
-            imagined_metadata = imagined_metadata_expected
-            save_imagined_cache(imagined_cache, imagined, imagined_metadata)
-            print(f"saved imagined rollout cache: {imagined_cache}")
+        rollout_model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=cache_dir)
+        imagined, imagined_metadata = get_or_build_imagined_cache(
+            cache_path=imagined_cache,
+            h5_path=h5_path,
+            model=rollout_model,
+            source_rows=train_rows,
+            num_samples=n_imagined,
+            rollout_horizon=rollout_horizon,
+            args=args,
+            split="train",
+            seed_offset=17,
+            force=args.force_imagined_recache,
+        )
 
         rng = np.random.default_rng(args.seed + 23)
         gt_keep_idx = rng.choice(n_train_total, size=n_gt_keep, replace=False) if n_gt_keep > 0 else np.array([], dtype=np.int64)
@@ -787,6 +940,34 @@ def main() -> None:
         valid_train = np.concatenate([valid_train[gt_keep_idx], imagined["valid"].astype(np.float32)], axis=0)
         train_source_counts = {"gt": int(n_gt_keep), "imagined": int(n_imagined)}
         print(f"training mix: {n_gt_keep} GT latents + {n_imagined} imagined rollout latents")
+
+    if args.eval_imagined_rollouts:
+        if rollout_model is None:
+            rollout_model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=cache_dir)
+        imagined_val, imagined_val_metadata = get_or_build_imagined_cache(
+            cache_path=imagined_val_cache,
+            h5_path=h5_path,
+            model=rollout_model,
+            source_rows=merged["val"]["rows"],
+            num_samples=args.imagined_eval_samples,
+            rollout_horizon=rollout_horizon,
+            args=args,
+            split="val",
+            seed_offset=31,
+            force=args.force_imagined_recache,
+        )
+        imagined_test, imagined_test_metadata = get_or_build_imagined_cache(
+            cache_path=imagined_test_cache,
+            h5_path=h5_path,
+            model=rollout_model,
+            source_rows=merged["test"]["rows"],
+            num_samples=args.imagined_eval_samples,
+            rollout_horizon=rollout_horizon,
+            args=args,
+            split="test",
+            seed_offset=47,
+            force=args.force_imagined_recache,
+        )
 
     x_train, (x_val, x_test), x_mean, x_std = standardize(
         train_z_raw, merged["val"]["z"], merged["test"]["z"]
@@ -805,12 +986,69 @@ def main() -> None:
             f"test valid={int(valid_test[:, i].sum())} pos={int((y_test[:, i] * valid_test[:, i]).sum())}"
         )
 
-    classifier = train_model(x_train, y_train, valid_train, x_val, y_val, valid_val, args)
+    classifier = train_model(x_train, y_train, valid_train, x_val, y_val, valid_val, args, stage="train")
     val_prob = predict(classifier, x_val, args.batch_size)
+    thresholds = select_thresholds(y_val, val_prob, valid_val, args.threshold_policy, args.target_fpr)
+    hard_negative_count = 0
+    if args.hard_negative_mining:
+        train_prob = predict(classifier, x_train, args.batch_size)
+        mining_policy = "target_fpr" if args.hard_negative_threshold_source == "target_fpr" else args.threshold_policy
+        mining_thresholds = (
+            select_thresholds(y_val, val_prob, valid_val, "target_fpr", args.target_fpr)
+            if mining_policy == "target_fpr"
+            else thresholds
+        )
+        max_hard = int(round(len(x_train) * args.hard_negative_fraction))
+        hard_idx = hard_negative_indices(y_train, train_prob, valid_train, mining_thresholds, max_hard)
+        hard_negative_count = int(len(hard_idx))
+        if len(hard_idx) > 0:
+            print(f"hard-negative mining: oversampling {len(hard_idx)} high-scoring valid negatives")
+            x_train_hn = np.concatenate([x_train, x_train[hard_idx]], axis=0)
+            y_train_hn = np.concatenate([y_train, y_train[hard_idx]], axis=0)
+            valid_train_hn = np.concatenate([valid_train, valid_train[hard_idx]], axis=0)
+            classifier = train_model(
+                x_train_hn,
+                y_train_hn,
+                valid_train_hn,
+                x_val,
+                y_val,
+                valid_val,
+                args,
+                model=classifier,
+                epochs=args.hard_negative_epochs,
+                stage="hard-negative",
+            )
+            val_prob = predict(classifier, x_val, args.batch_size)
+            thresholds = select_thresholds(y_val, val_prob, valid_val, args.threshold_policy, args.target_fpr)
+        else:
+            print("hard-negative mining: no high-scoring valid negatives found")
+
     test_prob = predict(classifier, x_test, args.batch_size)
-    thresholds = select_thresholds(y_val, val_prob, valid_val)
     val_metrics = evaluate_split(y_val, val_prob, valid_val, thresholds, args.horizons, args.frameskip)
     test_metrics = evaluate_split(y_test, test_prob, valid_test, thresholds, args.horizons, args.frameskip)
+    imagined_val_metrics = None
+    imagined_test_metrics = None
+    if imagined_val is not None and imagined_test is not None:
+        imagined_val_x = apply_standardizer(imagined_val["z"], x_mean, x_std)
+        imagined_test_x = apply_standardizer(imagined_test["z"], x_mean, x_std)
+        imagined_val_prob = predict(classifier, imagined_val_x, args.batch_size)
+        imagined_test_prob = predict(classifier, imagined_test_x, args.batch_size)
+        imagined_val_metrics = evaluate_split(
+            imagined_val["y"],
+            imagined_val_prob,
+            imagined_val["valid"],
+            thresholds,
+            args.horizons,
+            args.frameskip,
+        )
+        imagined_test_metrics = evaluate_split(
+            imagined_test["y"],
+            imagined_test_prob,
+            imagined_test["valid"],
+            thresholds,
+            args.horizons,
+            args.frameskip,
+        )
 
     torch.save(
         {
@@ -819,6 +1057,12 @@ def main() -> None:
             "output_dim": len(args.horizons),
             "hidden_dim": args.hidden_dim,
             "depth": args.depth,
+            "monotonic_outputs": args.monotonic_outputs,
+            "monotonic_loss_weight": args.monotonic_loss_weight,
+            "hard_negative_mining": args.hard_negative_mining,
+            "hard_negative_fraction": args.hard_negative_fraction,
+            "hard_negative_epochs": args.hard_negative_epochs,
+            "hard_negative_count": hard_negative_count,
             "horizons": args.horizons,
             "frameskip": args.frameskip,
             "context_steps": args.context_steps,
@@ -826,6 +1070,8 @@ def main() -> None:
             "imagined_fraction": args.imagined_fraction,
             "imagined_rollout_horizon": rollout_horizon,
             "thresholds": thresholds,
+            "threshold_policy": args.threshold_policy,
+            "target_fpr": args.target_fpr,
             "x_mean": x_mean,
             "x_std": x_std,
             "objective": {
@@ -845,14 +1091,23 @@ def main() -> None:
         "latent_cache": str(latent_cache),
         "label_cache": str(label_cache),
         "imagined_cache": str(imagined_cache) if args.include_imagined_rollouts else None,
+        "imagined_val_cache": str(imagined_val_cache) if args.eval_imagined_rollouts else None,
+        "imagined_test_cache": str(imagined_test_cache) if args.eval_imagined_rollouts else None,
         "latent_cache_metadata": latent_metadata,
         "label_cache_metadata": label_metadata,
         "imagined_cache_metadata": imagined_metadata,
+        "imagined_val_cache_metadata": imagined_val_metadata,
+        "imagined_test_cache_metadata": imagined_test_metadata,
         "train_source_counts": train_source_counts,
         "normalizer": {"mean": x_mean.tolist(), "std": x_std.tolist()},
         "thresholds": thresholds.tolist(),
+        "threshold_policy": args.threshold_policy,
+        "target_fpr": args.target_fpr,
+        "hard_negative_count": hard_negative_count,
         "val": val_metrics,
         "test": test_metrics,
+        "imagined_val": imagined_val_metrics,
+        "imagined_test": imagined_test_metrics,
     }
     with (output_dir / "metrics.json").open("w") as f:
         json.dump(summary, f, indent=2)
