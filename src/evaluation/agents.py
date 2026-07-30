@@ -165,6 +165,26 @@ def infer_bc_stats_path(checkpoint_path):
     return f"{checkpoint_path}_stats.pth"
 
 
+def _square_resolution(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2 or int(value[0]) != int(value[1]):
+            return None
+        value = value[0]
+    value = int(value)
+    return value if value > 0 else None
+
+
+def bc_training_observation_resolution(stats):
+    """Extract the native BC image resolution, including older stats formats."""
+
+    explicit = _square_resolution(stats.get("observation_resolution"))
+    if explicit is not None:
+        return explicit
+    return _square_resolution(stats.get("source_image_shape"))
+
+
 def load_bc_components(checkpoint, stats_path=None, device="auto"):
     device = resolve_device(device)
     stats_reference = stats_path or infer_bc_stats_path(checkpoint)
@@ -269,6 +289,9 @@ def make_bc_evaluation_agent(
             "stats": str(stats_path or infer_bc_stats_path(checkpoint))
             if checkpoint is not None
             else "in-memory",
+            "training_observation_resolution": bc_training_observation_resolution(
+                components.stats
+            ),
         },
     )
 
@@ -302,5 +325,10 @@ def make_ppo_evaluation_agent(
         execution_mode=execution_mode,
         replan_interval=replan_interval,
         temporal_ensemble_decay=temporal_ensemble_decay,
-        metadata={"checkpoint": str(checkpoint) if checkpoint is not None else "in-memory"},
+        metadata={
+            "checkpoint": str(checkpoint) if checkpoint is not None else "in-memory",
+            "training_observation_resolution": _square_resolution(
+                components.config.get("observation_resolution")
+            ),
+        },
     )

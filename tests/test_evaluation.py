@@ -7,7 +7,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from src.evaluation.agents import LatentChunkAgent
+from src.evaluation.agents import LatentChunkAgent, bc_training_observation_resolution
 from src.envs import PUSHT_RENDER_SHAPE
 from src.evaluation.evaluate_pusht import (
     _write_metrics,
@@ -52,7 +52,10 @@ class FakePushTEnv(gym.Env):
 
 class ConstantAgent:
     agent_type = "constant"
-    metadata = {"source": "test"}
+    metadata = {
+        "source": "test",
+        "training_observation_resolution": PUSHT_RENDER_SHAPE[0],
+    }
 
     def __init__(self, action):
         self.action = np.asarray(action, dtype=np.float32)
@@ -128,6 +131,45 @@ class EvaluationRunnerTests(unittest.TestCase):
 
         self.assertEqual(agent.reset_seeds, [7, 8])
 
+    def test_cli_rejects_unknown_legacy_training_resolution(self):
+        args = build_parser().parse_args(
+            ["--agent-type", "bc", "--checkpoint", "legacy.pt"]
+        )
+        agent = ConstantAgent([0.0, 0.0])
+        agent.metadata = {"source": "legacy"}
+        with (
+            patch(
+                "src.evaluation.evaluate_pusht.make_bc_evaluation_agent",
+                return_value=agent,
+            ),
+            self.assertRaisesRegex(ValueError, "legacy checkpoint"),
+        ):
+            evaluate_from_args(args)
+
+    def test_cli_rejects_resolution_mismatch_before_allocating_run(self):
+        with TemporaryDirectory() as temporary_dir:
+            args = build_parser().parse_args(
+                [
+                    "--agent-type",
+                    "bc",
+                    "--checkpoint",
+                    "test.pt",
+                    "--output-root",
+                    temporary_dir,
+                ]
+            )
+            agent = ConstantAgent([0.0, 0.0])
+            agent.metadata = {"training_observation_resolution": 96}
+            with (
+                patch(
+                    "src.evaluation.evaluate_pusht.make_bc_evaluation_agent",
+                    return_value=agent,
+                ),
+                self.assertRaisesRegex(ValueError, "does not match model training"),
+            ):
+                evaluate_from_args(args)
+            self.assertEqual(list(Path(temporary_dir).iterdir()), [])
+
     def test_shared_repeated_runner_accepts_an_environment_factory(self):
         agent = ConstantAgent([0.0, 0.0])
         factory_seeds = []
@@ -195,6 +237,35 @@ class EvaluationRunnerTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             PushTEvalConfig(observation_resolution=0).validate()
+
+    def test_bc_training_resolution_supports_new_and_transitional_stats(self):
+        self.assertEqual(
+            bc_training_observation_resolution({"observation_resolution": 96}), 96
+        )
+        self.assertEqual(
+            bc_training_observation_resolution({"source_image_shape": [224, 224]}),
+            224,
+        )
+        self.assertIsNone(bc_training_observation_resolution({"image_size": [224, 224]}))
+
+    def test_known_training_resolution_mismatch_is_rejected_unless_explicit(self):
+        agent = ConstantAgent([0.0, 0.0])
+        with self.assertRaisesRegex(ValueError, "does not match model training"):
+            run_evaluation(
+                agent,
+                PushTEvalConfig(episodes=1, observation_resolution=96),
+                env=FakePushTEnv(),
+            )
+        result = run_evaluation(
+            agent,
+            PushTEvalConfig(
+                episodes=1,
+                observation_resolution=96,
+                allow_resolution_mismatch=True,
+            ),
+            env=FakePushTEnv(),
+        )
+        self.assertEqual(result.summary["episodes"], 1)
 
     @patch("src.evaluation.pusht.make_pusht_env")
     def test_block_start_radius_enables_near_goal_wrapper(self, make_env):

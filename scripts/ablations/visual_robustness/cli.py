@@ -123,6 +123,15 @@ def build_parser():
     )
     analyze_parser.add_argument("--bootstrap-samples", type=int, default=10000)
     analyze_parser.add_argument("--margin", type=float, default=0.10)
+    analyze_parser.add_argument(
+        "--observation-resolution",
+        type=int,
+        default=None,
+        help=(
+            "analyze only one evaluation suite resolution; required when "
+            "multiple resolution suites coexist under the output root"
+        ),
+    )
     analyze_parser.add_argument("--skip-action-metrics", action="store_true")
 
     all_parser = subparsers.add_parser(
@@ -307,6 +316,7 @@ def _run_all(args):
         margin=0.10,
         include_action_metrics=True,
         encoder_names=selected_encoders,
+        observation_resolution=args.observation_resolution,
     )
 
 
@@ -328,6 +338,7 @@ def main(argv=None):
             margin=args.margin,
             include_action_metrics=not args.skip_action_metrics,
             encoder_names=args.encoders,
+            observation_resolution=args.observation_resolution,
         )
     elif args.command == "all":
         _run_all(args)

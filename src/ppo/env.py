@@ -17,7 +17,7 @@ from typing import Callable
 
 import gymnasium as gym
 
-from src.envs import PUSHT_FIXED_TARGET_POSE, make_pusht_env
+from src.envs import PUSHT_FIXED_TARGET_POSE, PUSHT_RENDER_SHAPE, make_pusht_env
 from src.evaluation.pusht import success_from_info
 from src.representations.history import LatentHistory
 
@@ -28,6 +28,7 @@ def make_latent_env(
     seed: int = 0,
     idx: int = 0,
     max_episode_steps: int = 300,
+    observation_resolution: int = PUSHT_RENDER_SHAPE[0],
     record_stats: bool = True,
     fixed_target: bool = False,
     fixed_target_pose=PUSHT_FIXED_TARGET_POSE,
@@ -55,6 +56,7 @@ def make_latent_env(
         env = make_pusht_env(
             env_id=env_id,
             max_episode_steps=max_episode_steps,
+            resolution=observation_resolution,
             align_sampled_goal_to_fixed_target=fixed_target,
             fixed_target_pose=fixed_target_pose,
             fixed_target_block_success=fixed_target_block_success,

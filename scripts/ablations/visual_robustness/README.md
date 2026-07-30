@@ -26,17 +26,57 @@ and 142--191. Use `evaluate --force` (or `all --force-evaluate`) to replace
 results produced by the former single-run 200-episode protocol; caches and
 trained heads are reused.
 
-The ablation keeps its predefined 96x96 policy observations and records that
-choice as `config.observation_resolution` in every evaluation. Override it
-explicitly with `--observation-resolution`; production evaluation defaults to
-224x224. Results at different observation resolutions are separate protocols
-and should not be pooled.
+Latent caches are rendered at 96x96 unless a condition overrides that value.
+The standalone `evaluate` command defaults to 96x96 policy observations, while
+the predefined `all` suite defaults to 224x224 to match the current production
+evaluation protocol. Both commands record the suite resolution as
+`ablation.evaluation_base_resolution`; each condition's effective resolution is
+recorded as `config.observation_resolution`. Override the suite value explicitly
+with `--observation-resolution`. Evaluation files are stored below
+`resolution_<value>/`, so 96x96 and 224x224 suites coexist without replacement.
+Compatible files produced before this directory split are reused in place.
+
+Run the resolution matrix without rebuilding the existing latent caches:
+
+```bash
+# Existing 96-trained clean heads -> native 96 evaluation.
+python -m scripts.ablations.visual_robustness evaluate \
+  --encoders lewm --train-conditions clean --seeds 42 43 44 \
+  --observation-resolution 96
+
+# Train clean 224 heads from the existing native-224 clean cache.
+python -m scripts.ablations.visual_robustness train \
+  --encoders lewm --conditions resolution_224 --seeds 42 43 44
+
+# Clean 224 heads -> native 224 evaluation.
+python -m scripts.ablations.visual_robustness evaluate \
+  --encoders lewm --train-conditions resolution_224 --seeds 42 43 44 \
+  --observation-resolution 224
+
+# Optional cross-resolution direction: clean 224 heads -> 96 evaluation.
+python -m scripts.ablations.visual_robustness evaluate \
+  --encoders lewm --train-conditions resolution_224 --seeds 42 43 44 \
+  --observation-resolution 96
+```
+
+Select the resolution suite when aggregating coexisting results:
+
+```bash
+python -m scripts.ablations.visual_robustness analyze --encoders lewm \
+  --observation-resolution 96
+python -m scripts.ablations.visual_robustness analyze --encoders lewm \
+  --observation-resolution 224
+```
+
+These write separate result sets below `analysis/resolution_96/` and
+`analysis/resolution_224/`.
 
 The spatial-detail extension adds four predefined zero-shot conditions:
 
 - `resolution_224`: render the same clean state directly at 224x224.
 - `blur_1`, `blur_2`, and `blur_4`: deterministic Gaussian blur with the named
-  pixel-space sigma, applied after the baseline 96x96 rendering.
+  pixel-space sigma, applied after rendering at the resolution selected for
+  that cache or evaluation.
 
 The default `all`, `evaluate`, and `analyze` commands select only LeWM. They
 cache paired latents and evaluate its clean-trained heads on all four
@@ -47,8 +87,9 @@ adaptation. DINOv2 remains opt-in with `--encoders lewm dinov2`; analysis filter
 unselected encoder artifacts, including older results already on disk.
 
 `analyze` computes latent shift directly from the cached, counterfactually
-paired expert states. Results are written to `analysis/latent_metrics.csv` and
-to the `latent_metrics` table in `analysis/report.json`, including mean cosine
+paired expert states. Resolution-selected results are written below the matching
+`analysis/resolution_<value>/` directory, including `latent_metrics.csv` and the
+`latent_metrics` table in `report.json`, with mean cosine
 similarity, fifth-percentile cosine, normalized L2 change, and variance ratio.
 It also writes clean-head action MAE/RMSE to `analysis/action_metrics.csv`.
 Analysis rejects mixed episode/repeat/seed protocols and mixed resolutions for

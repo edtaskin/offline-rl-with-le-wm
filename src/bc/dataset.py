@@ -1,5 +1,8 @@
+import zipfile
+
 import numpy as np
 import torch
+from numpy.lib import format as npy_format
 from torch.utils.data import Dataset
 
 from src.bc.history import action_chunk_indices, history_indices
@@ -8,6 +11,62 @@ from src.bc.history import action_chunk_indices, history_indices
 PUSHT_ACTION_LOW = torch.tensor([-1.0, -1.0], dtype=torch.float32)
 PUSHT_ACTION_HIGH = torch.tensor([1.0, 1.0], dtype=torch.float32)
 PUSHT_ACTION_SCALE = 100.0
+
+
+def npz_array_shape(data_path, key):
+    """Read an array shape from an NPZ member without loading its payload."""
+
+    member = f"{key}.npy"
+    with zipfile.ZipFile(data_path) as archive:
+        try:
+            stream = archive.open(member)
+        except KeyError as exc:
+            raise KeyError(f"{data_path} does not contain {key!r}") from exc
+        with stream:
+            version = npy_format.read_magic(stream)
+            if version == (1, 0):
+                shape, _, _ = npy_format.read_array_header_1_0(stream)
+            elif version in {(2, 0), (3, 0)}:
+                shape, _, _ = npy_format.read_array_header_2_0(stream)
+            else:
+                raise ValueError(f"unsupported NPY format version {version} in {data_path}")
+    return tuple(int(value) for value in shape)
+
+
+def pusht_image_resolution(data_path):
+    """Return the native square image resolution stored in a PushT dataset."""
+
+    shape = npz_array_shape(data_path, "images")
+    if len(shape) != 4:
+        raise ValueError(f"expected 4D PushT images, got shape {shape}")
+    if shape[-1] == 3:
+        height, width = shape[1:3]
+    elif shape[1] == 3:
+        height, width = shape[2:4]
+    else:
+        raise ValueError(f"expected NHWC or NCHW RGB images, got shape {shape}")
+    if height != width:
+        raise ValueError(f"expected square PushT images, got {height}x{width}")
+    return int(height)
+
+
+def resolve_pusht_observation_resolution(data_path, requested=None):
+    """Infer or validate the native observation resolution for BC training."""
+
+    source_resolution = pusht_image_resolution(data_path)
+    if requested is None:
+        return source_resolution
+    requested = int(requested)
+    if requested < 1:
+        raise ValueError("observation_resolution must be positive")
+    if requested != source_resolution:
+        raise ValueError(
+            "BC observation resolution does not match the expert dataset: "
+            f"requested {requested}, dataset stores {source_resolution}x"
+            f"{source_resolution} images. Use a dataset rendered natively at the "
+            "requested resolution."
+        )
+    return requested
 
 
 def absolute_to_relative_action(action, agent_position, action_scale=PUSHT_ACTION_SCALE):

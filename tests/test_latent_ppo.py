@@ -130,6 +130,18 @@ def test_latent_path_deterministic():
     assert torch.allclose(v_a, v_b, atol=1e-6)
 
 
+def test_training_observation_resolution_is_validated():
+    from src.ppo.config import LatentConfig
+
+    assert LatentConfig(observation_resolution=96).observation_resolution == 96
+    try:
+        LatentConfig(observation_resolution=0)
+    except ValueError as exc:
+        assert "observation_resolution must be positive" in str(exc)
+    else:
+        raise AssertionError("expected a non-positive observation resolution to fail")
+
+
 def test_gradient_contract():
     """BC policy / log_std / critic receive grads; the frozen encoder does not."""
     b, f, adim, k, ld = 4, 3, 2, 5, 192
@@ -291,6 +303,7 @@ def test_trainer_end_to_end_fake_env(monkeypatch=None):
             trainer.run_dir / "best.pt", map_location="cpu", weights_only=False
         )
         assert "success_rate" in best_ckpt
+        assert best_ckpt["config"]["observation_resolution"] == cfg.observation_resolution
         assert trainer._best_success >= trainer._second_best_success
         # Encoder stayed frozen; the policy moved.
         for p, before in zip(trainer.encoder.parameters(), enc_before):

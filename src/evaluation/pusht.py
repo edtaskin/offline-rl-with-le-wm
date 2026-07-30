@@ -48,6 +48,7 @@ class PushTEvalConfig:
     video_fps: int = 10
     video_resolution: int = 512
     capture_traces: bool = False
+    allow_resolution_mismatch: bool = False
 
     def validate(self):
         if self.episodes < 1:
@@ -344,6 +345,18 @@ def run_repeated_evaluation(
 
 def run_evaluation(agent: EvaluationAgent, config: PushTEvalConfig, env=None):
     config.validate()
+    training_resolution = agent.metadata.get("training_observation_resolution")
+    if (
+        training_resolution is not None
+        and int(training_resolution) != int(config.observation_resolution)
+        and not config.allow_resolution_mismatch
+    ):
+        raise ValueError(
+            "evaluation observation resolution does not match model training: "
+            f"model={int(training_resolution)}, evaluation={config.observation_resolution}. "
+            "Use the training resolution, or explicitly allow the mismatch for a "
+            "resolution-robustness experiment."
+        )
     owns_env = env is None
     env = make_evaluation_env(config) if env is None else env
     episode_results = []

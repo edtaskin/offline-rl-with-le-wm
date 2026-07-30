@@ -70,6 +70,7 @@ class LatentPPOTrainer:
                 seed=cfg.seed,
                 idx=i,
                 max_episode_steps=cfg.max_episode_steps,
+                observation_resolution=cfg.observation_resolution,
                 fixed_target=cfg.fixed_target,
                 fixed_target_block_success=cfg.fixed_target_block_success,
                 agent_block_coef=cfg.agent_block_coef,
@@ -429,6 +430,7 @@ class LatentPPOTrainer:
                 seed=cfg.eval_seed,
                 idx=0,
                 max_episode_steps=cfg.max_episode_steps,
+                observation_resolution=cfg.observation_resolution,
                 record_stats=True,
                 fixed_target=True,
                 fixed_target_block_success=cfg.fixed_target_block_success,
@@ -463,6 +465,7 @@ class LatentPPOTrainer:
                     episodes=cfg.eval_episodes,
                     seed=cfg.eval_seed,
                     max_episode_steps=cfg.max_episode_steps,
+                    observation_resolution=cfg.observation_resolution,
                     fixed_target_block_success=cfg.fixed_target_block_success,
                     block_start_radius=(
                         cfg.block_start_radius if cfg.block_start_near_goal else None

@@ -19,6 +19,9 @@ from .shifts import CONDITION_NAMES
 from .training import load_policy
 
 
+BASELINE_TRAIN_CONDITIONS = ("clean", "resolution_224")
+
+
 def _write_csv(path, rows):
     if not rows:
         return
@@ -29,7 +32,13 @@ def _write_csv(path, rows):
         writer.writerows(rows)
 
 
-def load_evaluations(output_root, encoder_names=None):
+def load_evaluations(
+    output_root,
+    encoder_names=None,
+    observation_resolution=None,
+):
+    if observation_resolution is not None and int(observation_resolution) < 1:
+        raise ValueError("observation_resolution must be positive")
     selected_encoders = set(encoder_names) if encoder_names is not None else None
     records = []
     for path in sorted(Path(output_root).glob("evaluations/**/eval_*.json")):
@@ -38,6 +47,16 @@ def load_evaluations(output_root, encoder_names=None):
         if ablation and (
             selected_encoders is None or ablation.get("encoder") in selected_encoders
         ):
+            base_resolution = ablation.get("evaluation_base_resolution")
+            if base_resolution is None:
+                base_resolution = payload.get("config", {}).get(
+                    "observation_resolution"
+                )
+            if (
+                observation_resolution is not None
+                and base_resolution != int(observation_resolution)
+            ):
+                continue
             records.append({"path": str(path), "payload": payload, **ablation})
     return records
 
@@ -157,7 +176,10 @@ def paired_robustness_rows(records, bootstrap_samples=10000, margin=0.10):
     lookup = _group_records(records)
     comparisons = defaultdict(dict)
     for encoder, train_condition, training_seed, eval_condition in lookup:
-        if train_condition != "clean" or eval_condition == "clean":
+        if (
+            train_condition not in BASELINE_TRAIN_CONDITIONS
+            or eval_condition == "clean"
+        ):
             continue
         shifted = lookup[(encoder, train_condition, training_seed, eval_condition)]
         clean = lookup.get((encoder, train_condition, training_seed, "clean"))
@@ -195,7 +217,10 @@ def adaptation_rows(records, bootstrap_samples=10000, margin=0.10):
     lookup = _group_records(records)
     comparisons = defaultdict(dict)
     for encoder, train_condition, training_seed, eval_condition in lookup:
-        if train_condition == "clean" or eval_condition != train_condition:
+        if (
+            train_condition in BASELINE_TRAIN_CONDITIONS
+            or eval_condition != train_condition
+        ):
             continue
         adapted = lookup[(encoder, train_condition, training_seed, eval_condition)]
         baseline = lookup.get((encoder, "clean", training_seed, "clean"))
@@ -369,17 +394,38 @@ def _save_plots(analysis_dir, evaluation, latent):
     except ImportError:
         return []
     paths = []
-    zero_shot = [row for row in evaluation if row["train_condition"] == "clean"]
+    zero_shot = [
+        row
+        for row in evaluation
+        if row["train_condition"] in BASELINE_TRAIN_CONDITIONS
+    ]
     if zero_shot:
         fig, ax = plt.subplots(figsize=(12, 4))
         for encoder in ("lewm", "dinov2"):
-            values = {
-                row["eval_condition"]: row["success_rate"]
-                for row in zero_shot
-                if row["encoder"] == encoder
-            }
-            names = [name for name in CONDITION_NAMES if name in values]
-            ax.plot(names, [values[name] for name in names], marker="o", label=encoder)
+            train_conditions = sorted(
+                {
+                    row["train_condition"]
+                    for row in zero_shot
+                    if row["encoder"] == encoder
+                }
+            )
+            for train_condition in train_conditions:
+                values = {
+                    row["eval_condition"]: row["success_rate"]
+                    for row in zero_shot
+                    if row["encoder"] == encoder
+                    and row["train_condition"] == train_condition
+                }
+                names = [name for name in CONDITION_NAMES if name in values]
+                label = encoder
+                if len(train_conditions) > 1 or train_condition != "clean":
+                    label = f"{encoder} train={train_condition}"
+                ax.plot(
+                    names,
+                    [values[name] for name in names],
+                    marker="o",
+                    label=label,
+                )
         ax.set_ylabel("Success rate")
         ax.set_title("Clean-trained zero-shot performance")
         ax.tick_params(axis="x", rotation=45)
@@ -419,11 +465,16 @@ def analyze(
     margin=0.10,
     include_action_metrics=True,
     encoder_names=("lewm", "dinov2"),
+    observation_resolution=None,
 ):
     if bootstrap_samples < 1 or margin < 0:
         raise ValueError("bootstrap_samples must be positive and margin non-negative")
     encoder_names = tuple(encoder_names)
-    records = load_evaluations(output_root, encoder_names)
+    records = load_evaluations(
+        output_root,
+        encoder_names,
+        observation_resolution=observation_resolution,
+    )
     validate_evaluation_protocols(records)
     evaluation = evaluation_rows(records)
     robustness = paired_robustness_rows(records, bootstrap_samples, margin)
@@ -440,6 +491,8 @@ def analyze(
         else []
     )
     analysis_dir = Path(output_root) / "analysis"
+    if observation_resolution is not None:
+        analysis_dir = analysis_dir / f"resolution_{int(observation_resolution)}"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     tables = {
         "evaluation_summary": evaluation,
@@ -454,6 +507,11 @@ def analyze(
     plots = _save_plots(analysis_dir, evaluation, latent)
     report = {
         "encoders": list(encoder_names),
+        "evaluation_base_resolution": (
+            int(observation_resolution)
+            if observation_resolution is not None
+            else None
+        ),
         "bootstrap_samples": int(bootstrap_samples),
         "noninferiority_margin": -float(margin),
         "tables": tables,

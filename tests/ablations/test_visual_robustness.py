@@ -117,6 +117,7 @@ class VisualRobustnessTests(unittest.TestCase):
         self.assertEqual(args.encoders, ["lewm"])
         self.assertEqual(all_args.encoders, ["lewm"])
         self.assertEqual(analyze_args.encoders, ["lewm"])
+        self.assertIsNone(analyze_args.observation_resolution)
 
     def test_condition_registry_and_isolated_components(self):
         self.assertEqual(len(CONDITION_NAMES), 16)
@@ -384,9 +385,21 @@ class VisualRobustnessTests(unittest.TestCase):
         records += [
             record("lewm", "block_1", 42, "block_1", [1, 1, 0, 0]),
             record("lewm", "block_1", 43, "block_1", [1, 1, 0, 0]),
+            record("lewm", "resolution_224", 42, "clean", [1, 1, 0, 0]),
+            record("lewm", "resolution_224", 42, "goal_1", [1, 0, 0, 0]),
         ]
+        robust = paired_robustness_rows(records, bootstrap_samples=200)
+        high_resolution = next(
+            row
+            for row in robust
+            if row["train_condition"] == "resolution_224"
+        )
+        self.assertAlmostEqual(high_resolution["success_delta"], -0.25)
         adaptation = adaptation_rows(records, bootstrap_samples=200)
         self.assertAlmostEqual(adaptation[0]["matched_delta_vs_clean_baseline"], 0.0)
+        self.assertNotIn(
+            "resolution_224", {row["train_condition"] for row in adaptation}
+        )
 
     def test_analysis_rejects_mixed_evaluation_protocols(self):
         records = [
@@ -475,10 +488,15 @@ class VisualRobustnessTests(unittest.TestCase):
             )
             self.assertEqual(len(outputs), 3)
             self.assertTrue(outputs[0].exists())
+            self.assertEqual(outputs[0].parent.name, "resolution_96")
+            self.assertEqual(outputs[1].parent.name, "resolution_96")
             payload = json.loads(outputs[0].read_text())
             self.assertEqual(payload["config"]["repeats"], 2)
             self.assertEqual(payload["config"]["repeat_seeds"], [1000, 1001])
             self.assertEqual(payload["config"]["observation_resolution"], 96)
+            self.assertEqual(
+                payload["ablation"]["evaluation_base_resolution"], 96
+            )
             self.assertEqual(len(payload["repeat_summaries"]), 2)
             self.assertEqual(len(payload["episodes"]), 2)
             resolution_payload = json.loads(outputs[1].read_text())
@@ -487,27 +505,50 @@ class VisualRobustnessTests(unittest.TestCase):
             )
             blur_payload = json.loads(outputs[2].read_text())
             self.assertEqual(blur_payload["ablation"]["eval_condition"], "blur_1")
+            high_resolution_outputs = evaluate_checkpoint(
+                checkpoint_path=policy_path,
+                output_root=output_root,
+                condition_names=["clean"],
+                device="cpu",
+                episodes=1,
+                repeats=2,
+                eval_seed=1000,
+                max_episode_steps=2,
+                observation_resolution=224,
+                encoder=encoder,
+            )
+            self.assertEqual(
+                high_resolution_outputs[0].parent.name, "resolution_224"
+            )
+            high_resolution_payload = json.loads(
+                high_resolution_outputs[0].read_text()
+            )
+            self.assertEqual(
+                high_resolution_payload["ablation"][
+                    "evaluation_base_resolution"
+                ],
+                224,
+            )
+            self.assertNotEqual(outputs[0], high_resolution_outputs[0])
             with self.assertRaises(RuntimeError):
-                evaluate_checkpoint(
-                    checkpoint_path=policy_path,
+                analyze(
                     output_root=output_root,
-                    condition_names=["clean"],
-                    device="cpu",
-                    episodes=1,
-                    repeats=2,
-                    eval_seed=1000,
-                    max_episode_steps=2,
-                    observation_resolution=224,
-                    encoder=encoder,
+                    data_path=data_path,
+                    bootstrap_samples=20,
+                    include_action_metrics=False,
                 )
             report = analyze(
                 output_root=output_root,
                 data_path=data_path,
                 bootstrap_samples=20,
                 include_action_metrics=False,
+                observation_resolution=96,
             )
             self.assertTrue(report.exists())
-            self.assertEqual(json.loads(report.read_text())["bootstrap_samples"], 20)
+            self.assertEqual(report.parent.name, "resolution_96")
+            report_payload = json.loads(report.read_text())
+            self.assertEqual(report_payload["bootstrap_samples"], 20)
+            self.assertEqual(report_payload["evaluation_base_resolution"], 96)
 
 
 if __name__ == "__main__":

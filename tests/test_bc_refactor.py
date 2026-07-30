@@ -10,6 +10,8 @@ from src.bc.dataset import (
     PushTImageDataset,
     PushTLatentDataset,
     absolute_to_relative_action,
+    npz_array_shape,
+    resolve_pusht_observation_resolution,
 )
 from src.bc.history import (
     FeatureHistory,
@@ -69,6 +71,13 @@ class DatasetTests(unittest.TestCase):
             self.assertTrue(torch.equal(image_actions, latent_actions))
         self.assertEqual(latent_dataset._get_frame_indices(4, 4), [4, 4, 4])
         self.assertEqual(latent_dataset._get_action_indices(3, 4), [3, 3, 3])
+
+    def test_native_observation_resolution_is_inferred_without_loading_images(self):
+        self.assertEqual(npz_array_shape(self.data_path, "images"), (7, 4, 4, 3))
+        self.assertEqual(resolve_pusht_observation_resolution(self.data_path), 4)
+        self.assertEqual(resolve_pusht_observation_resolution(self.data_path, 4), 4)
+        with self.assertRaisesRegex(ValueError, "does not match the expert dataset"):
+            resolve_pusht_observation_resolution(self.data_path, 8)
 
     def test_tensor_only_legacy_cache_is_supported(self):
         legacy_path = Path(self.temp_dir.name) / "legacy.pt"

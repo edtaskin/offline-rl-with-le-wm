@@ -184,11 +184,31 @@ def make_ablation_agent(checkpoint_path, encoder, device):
             "encoder": metadata["encoder"],
             "train_condition": metadata["train_condition"],
             "training_seed": metadata["seed"],
+            "training_observation_resolution": metadata.get("cache_metadata", {})
+            .get("renderer", {})
+            .get("resolution"),
         },
     ), metadata
 
 
-def evaluation_path(output_root, metadata, condition_name):
+def evaluation_path(output_root, metadata, condition_name, base_resolution):
+    base_resolution = int(base_resolution)
+    if base_resolution < 1:
+        raise ValueError("base evaluation resolution must be positive")
+    return (
+        Path(output_root)
+        / "evaluations"
+        / metadata["encoder"]
+        / f"train_{metadata['train_condition']}"
+        / f"seed_{metadata['seed']}"
+        / f"resolution_{base_resolution}"
+        / f"eval_{condition_name}.json"
+    )
+
+
+def legacy_evaluation_path(output_root, metadata, condition_name):
+    """Path used before evaluation suites were separated by resolution."""
+
     return (
         Path(output_root)
         / "evaluations"
@@ -200,7 +220,7 @@ def evaluation_path(output_root, metadata, condition_name):
 
 
 def _existing_evaluation_matches(
-    path, *, metadata, condition_name, config, repeats
+    path, *, metadata, condition_name, config, repeats, base_resolution
 ):
     try:
         payload = json.loads(Path(path).read_text())
@@ -226,8 +246,14 @@ def _existing_evaluation_matches(
         "block_start_radius": config.block_start_radius,
     }
     expected_episode_count = int(config.episodes) * int(repeats)
+    recorded_base_resolution = ablation.get("evaluation_base_resolution")
+    if recorded_base_resolution is None:
+        # Legacy artifacts did not record the suite resolution. Their effective
+        # observation resolution is an unambiguous fallback for the old suites.
+        recorded_base_resolution = actual_config.get("observation_resolution")
     return (
         all(ablation.get(key) == value for key, value in expected.items())
+        and recorded_base_resolution == int(base_resolution)
         and all(
             actual_config.get(key) == value
             for key, value in expected_config.items()
@@ -259,7 +285,11 @@ def evaluate_checkpoint(
     agent, metadata = make_ablation_agent(checkpoint_path, encoder, resolved_device)
     paths = []
     for condition_name in condition_names:
-        output_path = evaluation_path(output_root, metadata, condition_name)
+        base_resolution = int(observation_resolution)
+        output_path = evaluation_path(
+            output_root, metadata, condition_name, base_resolution
+        )
+        legacy_path = legacy_evaluation_path(output_root, metadata, condition_name)
         video_dir = output_path.parent / f"videos_{condition_name}"
         config = config_for_condition(
             PushTEvalConfig(
@@ -270,6 +300,7 @@ def evaluate_checkpoint(
                 block_start_radius=float(block_start_radius),
                 record_video=bool(video),
                 video_dir=str(video_dir),
+                allow_resolution_mismatch=True,
             ),
             condition_name,
         )
@@ -280,6 +311,7 @@ def evaluate_checkpoint(
                 condition_name=condition_name,
                 config=config,
                 repeats=repeats,
+                base_resolution=base_resolution,
             ):
                 raise RuntimeError(
                     f"existing evaluation is incompatible with the requested settings: "
@@ -288,6 +320,22 @@ def evaluate_checkpoint(
             print(f"Using existing evaluation: {output_path}")
             paths.append(output_path)
             continue
+        legacy_matches = legacy_path.exists() and _existing_evaluation_matches(
+            legacy_path,
+            metadata=metadata,
+            condition_name=condition_name,
+            config=config,
+            repeats=repeats,
+            base_resolution=base_resolution,
+        )
+        if legacy_matches and not force:
+            print(f"Using compatible legacy evaluation: {legacy_path}")
+            paths.append(legacy_path)
+            continue
+        if legacy_matches and force and not output_path.exists():
+            # Refresh a matching legacy artifact in place instead of creating a
+            # duplicate record for the same model/condition/resolution suite.
+            output_path = legacy_path
         result = run_repeated_evaluation(
             agent,
             config,
@@ -303,6 +351,7 @@ def evaluate_checkpoint(
             "train_condition": metadata["train_condition"],
             "eval_condition": condition_name,
             "training_seed": metadata["seed"],
+            "evaluation_base_resolution": base_resolution,
         }
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
