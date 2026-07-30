@@ -315,6 +315,117 @@ def test_bc_penalty_cli_flags():
         assert parsed.bc_penalty is False
 
 
+def test_dense_reward_shaper_scores_projected_latents():
+    """Dense reward shaping uses projected latent checkpoints and bounded rewards."""
+    from src.ppo.dense_reward import DenseRewardClassifier, DenseRewardShaper
+
+    model = DenseRewardClassifier(input_dim=4, output_dim=2, hidden_dim=8, depth=1)
+    with TemporaryDirectory() as temporary_dir:
+        ckpt = Path(temporary_dir) / "dense_reward_classifier.pt"
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "input_dim": 4,
+                "output_dim": 2,
+                "hidden_dim": 8,
+                "depth": 1,
+                "monotonic_outputs": False,
+                "horizons": [2, 5],
+                "frameskip": 5,
+                "x_mean": np.zeros(4, dtype=np.float32),
+                "x_std": np.ones(4, dtype=np.float32),
+            },
+            ckpt,
+        )
+        shaper = DenseRewardShaper(
+            ckpt,
+            weights="1 0.5",
+            scale=2.0,
+            clip=0.25,
+            device="cpu",
+        )
+
+    z_prev = torch.zeros(3, 4)
+    z_curr = torch.ones(3, 4)
+    prev_score, _ = shaper.score(z_prev)
+    curr_score, probs = shaper.score(z_curr)
+    reward = shaper.reward(curr_score, prev_score, mode="potential", discount=0.9)
+
+    assert tuple(prev_score.shape) == (3,)
+    assert tuple(probs.shape) == (3, 2)
+    assert shaper.horizons == [2, 5]
+    assert shaper.frameskip == 5
+    assert torch.all(reward <= 0.25)
+    assert torch.all(reward >= -0.25)
+
+
+def test_dream_reward_mode_names():
+    """Dream PPO distinguishes learned dense reward from pose-distance reward."""
+    import src.ppo.train_lewm as train_lewm
+
+    cfg = train_lewm.DreamConfig(
+        reward_mode="pose_dense",
+        selection="rolling",
+        dream_eval_interval=0,
+        num_envs=1,
+        num_chunks=1,
+    )
+    assert cfg.reward_mode == "pose_dense"
+
+    cfg = train_lewm.DreamConfig(
+        reward_mode="dense",
+        dense_reward_checkpoint=None,
+        dense_reward_coef=0.1,
+        selection="rolling",
+        dream_eval_interval=0,
+        num_envs=1,
+        num_chunks=1,
+    )
+    assert cfg.reward_mode == "dense"
+
+    try:
+        train_lewm.DreamConfig(
+            reward_mode="dense",
+            dense_reward_checkpoint="models/probes/pusht_dense_reward/dense_reward_classifier.pt",
+            dense_reward_coef=0.0,
+            selection="rolling",
+            dream_eval_interval=0,
+            num_envs=1,
+            num_chunks=1,
+        )
+    except ValueError as exc:
+        assert "dense_reward_coef" in str(exc)
+    else:
+        raise AssertionError("reward_mode='dense' without positive coefficient did not fail")
+
+
+def test_dense_reward_checkpoint_resolution_uses_probe_dir():
+    """Dense reward checkpoints can be discovered under the configured probe_dir."""
+    import src.ppo.train_lewm as train_lewm
+
+    with TemporaryDirectory() as temporary_dir:
+        probe_dir = Path(temporary_dir) / "probe_set"
+        nested = probe_dir / "dense_reward"
+        nested.mkdir(parents=True)
+        direct = probe_dir / "dense_reward_classifier.pt"
+        direct.touch()
+        nested_ckpt = nested / "dense_reward_classifier.pt"
+        nested_ckpt.touch()
+
+        assert train_lewm._resolve_dense_reward_checkpoint(None, probe_dir) == direct
+        direct.unlink()
+        assert train_lewm._resolve_dense_reward_checkpoint(None, probe_dir) == nested_ckpt
+
+        custom = probe_dir / "custom.pt"
+        custom.touch()
+        assert train_lewm._resolve_dense_reward_checkpoint("custom.pt", probe_dir) == custom
+
+        repo_relative = Path("models/probes/pusht_dense_reward_1M/dense_reward_classifier.pt")
+        assert train_lewm._resolve_dense_reward_checkpoint(str(repo_relative), probe_dir) == (
+            REPO_ROOT / repo_relative
+        )
+
+
 class _FakeImageEnv(gym.Env):
     """Random-image PushT stand-in: truncates after ``max_steps``; dummy reward."""
 

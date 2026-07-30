@@ -15,10 +15,10 @@ onto the world model (history=3, frameskip=5). Per imagined step:
    renders the imagined latent to an RGB frame, which is re-encoded to the raw
    CLS latent the policy consumes -- the decoder bridges LeWM's projected
    latent space back to the BC policy's input space;
-4. reward and success come from the frozen ``block_rel_objective`` state probe
-   (``scripts/probes/train_probes_pusht.py``), mirroring the fixed-target
-   wrapper: ``dense`` = -||(pos_dist, angle_dist)||, ``sparse`` = 1.0 on
-   success (pos < 20 px and angle < pi/9), which also terminates the episode.
+4. reward and success come from frozen probes/classifiers on the imagined
+   projected latent: ``sparse`` = 1.0 on success, ``dense`` = learned
+   time-to-success classifier shaping, and ``pose_dense`` = the legacy
+   block-pose distance reward.
 
 Episodes start from ground-truth context windows sampled from the expert h5
 dataset (respecting ``block_start_near_goal``/``block_start_radius`` and
@@ -36,7 +36,7 @@ also published under hf.co/offline-rl-with-le-wm):
 * image decoder:     ``models/latent_decoder/pusht_lewm/decoder_lewm_pusht.pt``
 * state probes under ``models/probes/pusht_lewm/``: the ``objective_met``
   classifier (success + sparse reward) and/or the ``block_rel_objective``
-  regression probe (distances, required for dense reward)
+  regression probe (distances, required for ``pose_dense`` reward)
 
 Runnable either way::
 
@@ -68,6 +68,7 @@ import torch.optim as optim
 
 from src.ppo.agent import build_latent_agent
 from src.ppo.config import LatentConfig
+from src.ppo.dense_reward import DenseRewardShaper
 from src.ppo.env import LatentHistory
 from src.ppo.lewm_encoder import LeWMLatentEncoder
 from src.ppo.ppo import LatentPPOTrainer, _configure_logging, build_bc_ref_policy, logger
@@ -94,6 +95,38 @@ DREAM_SMOKE_OVERRIDES = {**SMOKE_OVERRIDES, "dream_episode_steps": 6}
 def repo_path(path: str | Path) -> Path:
     path = Path(path)
     return path if path.is_absolute() else _REPO_ROOT / path
+
+
+def _resolve_dense_reward_checkpoint(checkpoint: str | None, probe_dir: Path) -> str | Path:
+    """Resolve the learned dense reward checkpoint using ``probe_dir`` first."""
+    searched: list[Path] = []
+    if checkpoint:
+        if str(checkpoint).startswith("hf://"):
+            return checkpoint
+        path = Path(checkpoint)
+        candidates = [path] if path.is_absolute() else [probe_dir / path, repo_path(path)]
+    else:
+        candidates = [
+            probe_dir / "dense_reward_classifier.pt",
+            probe_dir / "dense_reward" / "dense_reward_classifier.pt",
+        ]
+
+    for candidate in candidates:
+        searched.append(candidate)
+        if candidate.is_file():
+            return candidate
+
+    searched_text = "\n  ".join(str(path) for path in searched)
+    if checkpoint:
+        raise FileNotFoundError(
+            f"Dense reward checkpoint {checkpoint!r} was not found. Searched:\n  "
+            f"{searched_text}"
+        )
+    raise FileNotFoundError(
+        "reward_mode='dense' needs a learned dense reward classifier. Pass "
+        "--dense-reward-checkpoint, or place dense_reward_classifier.pt under "
+        f"--probe-dir. Searched:\n  {searched_text}"
+    )
 
 
 @dataclass
@@ -140,6 +173,16 @@ class DreamConfig(LatentConfig):
     success_pos_tol: float = 20.0
     success_angle_tol: float = float(np.pi / 9)
 
+    # Learned dense reward from scripts/probes/train_dense_reward_pusht.py.
+    # Active when reward_mode == "dense". The classifier is evaluated on
+    # projected LeWM dynamics latents, not raw CLS policy latents.
+    dense_reward_checkpoint: str | None = None
+    dense_reward_coef: float = 0.0
+    dense_reward_weights: str = "1 1 1 1"
+    dense_reward_clip: float = 1.0
+    dense_reward_mode: str = "potential"  # "potential" | "delta" | "score"
+    dense_reward_positive_only: bool = False
+
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.frame_stride != self.wm_frameskip:
@@ -164,6 +207,17 @@ class DreamConfig(LatentConfig):
             raise ValueError("selection='real' requires eval_interval > 0")
         if not 0.0 < self.dream_val_fraction < 1.0:
             raise ValueError("dream_val_fraction must be in (0, 1)")
+        if self.reward_mode not in ("sparse", "dense", "pose_dense"):
+            raise ValueError("dream reward_mode must be 'sparse', 'dense' or 'pose_dense'")
+        if self.dense_reward_mode not in ("potential", "delta", "score"):
+            raise ValueError("dense_reward_mode must be 'potential', 'delta' or 'score'")
+        if self.dense_reward_coef < 0.0:
+            raise ValueError("dense_reward_coef must be non-negative")
+        if self.dense_reward_clip < 0.0:
+            raise ValueError("dense_reward_clip must be non-negative")
+        if self.reward_mode == "dense":
+            if self.dense_reward_coef <= 0.0:
+                raise ValueError("reward_mode='dense' requires dense_reward_coef > 0")
 
 
 class _StateProbe(nn.Module):
@@ -340,8 +394,9 @@ class LeWMDreamWorld:
         # Reward/success probes. Success (and the sparse reward) prefers the
         # objective_met classifier -- trained on exactly the fixed-target
         # success condition, with an F1-calibrated threshold; the
-        # block_rel_objective regression probe supplies distances, required
-        # for the dense reward and used for success when no classifier exists.
+        # block_rel_objective regression probe supplies pose distances for the
+        # legacy pose_dense reward and is used for success when no classifier
+        # exists.
         probe_dir = repo_path(cfg.probe_dir)
         self.success_probe = _StateProbe.find(
             probe_dir,
@@ -354,15 +409,15 @@ class LeWMDreamWorld:
         if self.success_probe is None and self.pose_probe is None:
             raise FileNotFoundError(
                 f"No usable probe under {probe_dir}: need objective_met (success/"
-                "sparse reward) and/or block_rel_objective (distances/dense reward). "
+                "sparse reward) and/or block_rel_objective (pose-distance reward). "
                 "Train them with scripts/probes/train_probes_pusht.py or download "
                 "from hf.co/offline-rl-with-le-wm/probes."
             )
-        if cfg.reward_mode == "dense" and self.pose_probe is None:
+        if cfg.reward_mode == "pose_dense" and self.pose_probe is None:
             raise FileNotFoundError(
-                f"reward_mode='dense' needs the block_rel_objective probe under "
-                f"{probe_dir} for distance-based rewards; use --reward-mode sparse "
-                "with the objective_met classifier, or train the probe."
+                f"reward_mode='pose_dense' needs the block_rel_objective probe under "
+                f"{probe_dir} for pose-distance rewards; use --reward-mode sparse "
+                "or --reward-mode dense with the learned dense reward classifier."
             )
         self.engagement_probe = None
         if cfg.agent_block_coef > 0.0:
@@ -379,6 +434,52 @@ class LeWMDreamWorld:
                 "agent_pos probe not found under %s; dream anchors integrate "
                 "commanded targets instead of reading the WM's imagined agent position.",
                 probe_dir,
+            )
+
+        self.dense_reward = None
+        self._dense_reward_prev_score = torch.zeros(cfg.num_envs, device=device)
+        self._last_dense_reward = np.zeros(cfg.num_envs, dtype=np.float32)
+        self._last_dense_score = np.zeros(cfg.num_envs, dtype=np.float32)
+        self._last_dense_probs = np.zeros((cfg.num_envs, 0), dtype=np.float32)
+        if cfg.reward_mode == "dense":
+            dense_checkpoint = _resolve_dense_reward_checkpoint(
+                cfg.dense_reward_checkpoint, probe_dir
+            )
+            self.dense_reward = DenseRewardShaper(
+                dense_checkpoint,
+                weights=cfg.dense_reward_weights,
+                scale=cfg.dense_reward_coef,
+                clip=cfg.dense_reward_clip,
+                device=device,
+            )
+            if self.dense_reward.x_mean.shape[-1] != cfg.latent_dim:
+                raise ValueError(
+                    f"dense reward checkpoint expects latent dim "
+                    f"{self.dense_reward.x_mean.shape[-1]}, cfg.latent_dim={cfg.latent_dim}"
+                )
+            if self.dense_reward.frameskip != cfg.wm_frameskip:
+                raise ValueError(
+                    f"dense reward checkpoint frameskip={self.dense_reward.frameskip}, "
+                    f"cfg.wm_frameskip={cfg.wm_frameskip}"
+                )
+            self._last_dense_probs = np.zeros(
+                (cfg.num_envs, len(self.dense_reward.horizons)), dtype=np.float32
+            )
+            logger.info(
+                "Loaded dense reward classifier %s | horizons %s wm steps | "
+                "mode %s | coef %.4g | clip %.4g | weights %s",
+                dense_checkpoint,
+                self.dense_reward.horizons,
+                cfg.dense_reward_mode,
+                cfg.dense_reward_coef,
+                cfg.dense_reward_clip,
+                self.dense_reward.weights.detach().cpu().numpy().round(4).tolist(),
+            )
+        elif cfg.dense_reward_checkpoint or cfg.dense_reward_coef > 0.0:
+            logger.warning(
+                "Ignoring dense reward classifier options because reward_mode=%r; "
+                "use --reward-mode dense to train with the learned dense reward.",
+                cfg.reward_mode,
             )
 
         anchors = self._valid_context_anchors()
@@ -494,6 +595,10 @@ class LeWMDreamWorld:
             self._steps,
             self._rng,
             self._episode_steps,
+            self._dense_reward_prev_score,
+            self._last_dense_reward,
+            self._last_dense_score,
+            self._last_dense_probs,
         )
         self._anchors = self._val_anchors
         self._emb_hist = [deque(maxlen=self.history_size) for _ in range(n)]
@@ -502,6 +607,10 @@ class LeWMDreamWorld:
         self._steps = np.zeros(n, dtype=np.int64)
         self._rng = np.random.default_rng(seed)
         self._episode_steps = int(episode_steps)
+        self._dense_reward_prev_score = torch.zeros(n, device=self.device)
+        self._last_dense_reward = np.zeros(n, dtype=np.float32)
+        self._last_dense_score = np.zeros(n, dtype=np.float32)
+        self._last_dense_probs = np.zeros_like(self._last_dense_probs)
         try:
             yield
         finally:
@@ -513,6 +622,10 @@ class LeWMDreamWorld:
                 self._steps,
                 self._rng,
                 self._episode_steps,
+                self._dense_reward_prev_score,
+                self._last_dense_reward,
+                self._last_dense_score,
+                self._last_dense_probs,
             ) = saved
 
     def _normalize_blocks(self, raw_blocks: torch.Tensor) -> torch.Tensor:
@@ -557,6 +670,12 @@ class LeWMDreamWorld:
         self._agent_pos[i] = torch.as_tensor(
             self._h5["state"][int(anchor)][:2], dtype=torch.float32, device=self.device
         )
+        if self.dense_reward is not None:
+            score, probs = self.dense_reward.score(emb[-1].unsqueeze(0))
+            self._dense_reward_prev_score[i] = score[0]
+            self._last_dense_score[i] = float(score[0].detach().cpu())
+            self._last_dense_reward[i] = 0.0
+            self._last_dense_probs[i] = probs[0].detach().cpu().numpy()
         self._steps[i] = 0
         return cls
 
@@ -604,10 +723,9 @@ class LeWMDreamWorld:
         frames = self.decoder(pred).clamp(0.0, 1.0)  # [n, 3, 224, 224]
         cls = self.cls_encoder(frames)
 
-        # Reward/success mirrors PushTAlignSampledGoalToFixedTargetWrapper, read
-        # from the imagined latent: the objective_met classifier decides success
-        # when available (falling back to probe-decoded pose vs tolerances);
-        # dense rewards need the decoded pose distances.
+        # Reward/success are read from the imagined projected latent. The
+        # objective_met classifier decides success when available, falling back
+        # to probe-decoded pose vs tolerances.
         state_dist = None
         if self.pose_probe is not None:
             rel = self.pose_probe(pred)  # [rel_x, rel_y, sin, cos]
@@ -623,11 +741,33 @@ class LeWMDreamWorld:
 
         if cfg.reward_mode == "sparse":
             reward = success.float()
-        else:
+        elif cfg.reward_mode == "pose_dense":
             reward = -state_dist * self._dense_chunk_scale
             if self.engagement_probe is not None:
                 agent_block = torch.linalg.norm(self.engagement_probe(pred)[:, :2], dim=1)
                 reward = reward - cfg.agent_block_coef * self._dense_chunk_scale * agent_block
+        else:
+            reward = torch.zeros(n, device=self.device)
+
+        if cfg.reward_mode == "dense":
+            if self.dense_reward is None:
+                raise RuntimeError("reward_mode='dense' is enabled without dense reward classifier")
+            dense_score, dense_probs = self.dense_reward.score(pred)
+            dense_shaping = self.dense_reward.reward(
+                dense_score,
+                self._dense_reward_prev_score,
+                mode=cfg.dense_reward_mode,
+                discount=cfg.chunk_gamma,
+                positive_only=cfg.dense_reward_positive_only,
+            )
+            reward = reward + dense_shaping
+            self._dense_reward_prev_score = dense_score.detach()
+            self._last_dense_reward = dense_shaping.detach().cpu().numpy().astype(np.float32)
+            self._last_dense_score = dense_score.detach().cpu().numpy().astype(np.float32)
+            self._last_dense_probs = dense_probs.detach().cpu().numpy().astype(np.float32)
+        else:
+            self._last_dense_reward = np.zeros(n, dtype=np.float32)
+            self._last_dense_score = np.zeros(n, dtype=np.float32)
 
         # Logged as "dist": true probe distance when available, else the
         # classifier's distance-to-success proxy 1 - P(objective_met).
@@ -716,6 +856,9 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
         self._ep_final_dist = deque(maxlen=100)
         self._ep_return_acc = np.zeros(cfg.num_envs, dtype=np.float64)
         self._ep_step_acc = np.zeros(cfg.num_envs, dtype=np.int64)
+        self._dense_reward_terms = deque(maxlen=100)
+        self._dense_reward_scores = deque(maxlen=100)
+        self._dense_reward_head_probs = deque(maxlen=100)
 
         self._best_success = -float("inf")
         self._second_best_success = -float("inf")
@@ -881,6 +1024,9 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
                 hist.append(ctx[t])
         self._ep_return_acc[:] = 0.0
         self._ep_step_acc[:] = 0
+        self._dense_reward_terms.clear()
+        self._dense_reward_scores.clear()
+        self._dense_reward_head_probs.clear()
 
     def collect_rollout(self, done: np.ndarray):
         cfg = self.cfg
@@ -912,6 +1058,12 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
             cls, chunk_reward, terminated, truncated, state_dist = self.world.step(
                 torch.clamp(action, -1.0, 1.0)
             )
+            if self.world.dense_reward is not None:
+                self._dense_reward_terms.append(float(np.mean(self.world._last_dense_reward)))
+                self._dense_reward_scores.append(float(np.mean(self.world._last_dense_score)))
+                self._dense_reward_head_probs.append(
+                    np.mean(self.world._last_dense_probs, axis=0).astype(np.float32)
+                )
             self.global_step += e * k
             self._ep_return_acc += chunk_reward
             self._ep_step_acc += k
@@ -954,6 +1106,30 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
 
         return b_latents, b_actions, b_logprobs, b_rewards, b_dones, b_values, done
 
+    def _log(self, iteration: int, stats: dict) -> None:
+        super()._log(iteration, stats)
+        if self.world.dense_reward is None or not self._dense_reward_terms:
+            return
+        dense_reward = float(np.mean(self._dense_reward_terms))
+        dense_score = float(np.mean(self._dense_reward_scores))
+        head_probs = np.mean(np.stack(tuple(self._dense_reward_head_probs), axis=0), axis=0)
+        logger.info(
+            "iter %d/%d | dense_reward %.4f | dense_score %.4f | dense_probs %s",
+            iteration,
+            self.cfg.num_iterations,
+            dense_reward,
+            dense_score,
+            np.round(head_probs, 3).tolist(),
+        )
+        if self.writer is not None:
+            metrics = {
+                "charts/dense_reward": dense_reward,
+                "charts/dense_reward_score": dense_score,
+            }
+            for horizon, prob in zip(self.world.dense_reward.horizons, head_probs):
+                metrics[f"charts/dense_reward_prob_{horizon}wm"] = float(prob)
+            self.writer.log(metrics, step=self.global_step)
+
     def train(self) -> None:
         try:
             super().train()
@@ -982,7 +1158,7 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
             )
         elif f.name == "target_kl":
             parser.add_argument(*names, dest=f.name, type=float, default=argparse.SUPPRESS)
-        elif f.name in _NULLABLE_STR_FIELDS:
+        elif f.name in _NULLABLE_STR_FIELDS or default is None:
             parser.add_argument(*names, dest=f.name, type=str, default=argparse.SUPPRESS)
         else:
             parser.add_argument(
