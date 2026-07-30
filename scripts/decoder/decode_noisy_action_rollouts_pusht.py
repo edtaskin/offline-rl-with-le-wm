@@ -49,6 +49,7 @@ from scripts.decoder.decode_rollouts_pusht import (
     save_metrics_csv,
     tensor_image_to_uint8,
 )
+from scripts.probes import probe_rollouts_pusht as probe_eval
 from src.envs import PUSHT_FIXED_TARGET_POSE, make_pusht_env
 
 
@@ -59,11 +60,18 @@ def repo_path(path: str | Path) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["visualize", "evaluate_rollouts"],
+        default="visualize",
+        help="Run the visual decoder comparison or the probe-based noisy rollout evaluation.",
+    )
     parser.add_argument("--dataset-path", default="le-wm/models/datasets/pusht_expert_train.h5")
     parser.add_argument("--checkpoint-cache-dir", default="le-wm/models")
     parser.add_argument("--checkpoint", default="hf_pusht/weights.pt")
     parser.add_argument("--decoder-checkpoint", default="models/latent_decoder/pusht_lewm/decoder_best.pt")
-    parser.add_argument("--output-dir", default="models/rollout_decode/pusht_lewm_noisy_actions")
+    parser.add_argument("--output-dir", default=None)
     parser.add_argument("--num-trajectories", type=int, default=1)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--context-steps", type=int, default=3)
@@ -74,13 +82,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-videos", action="store_true")
     parser.add_argument("--no-grids", action="store_true")
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--encode-batch-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--action-noise-std", type=float, default=0.05)
+    parser.add_argument(
+        "--noise-stds",
+        default="0,0.025,0.05,0.1,0.2",
+        help="Comma-separated action-noise stds/half-widths for evaluate_rollouts.",
+    )
     parser.add_argument(
         "--action-noise-mode",
         choices=["gaussian", "uniform"],
         default="gaussian",
     )
+    parser.add_argument("--probe-dir", default="models/probes/pusht_lewm_1M")
+    parser.add_argument("--probe-kind", choices=["linear", "mlp"], default="linear")
+    parser.add_argument("--objective-x", type=float, default=256.0)
+    parser.add_argument("--objective-y", type=float, default=256.0)
+    parser.add_argument("--objective-angle", type=float, default=float(np.pi / 4))
+    parser.add_argument("--objective-pos-tol", type=float, default=20.0)
+    parser.add_argument("--objective-angle-tol", type=float, default=float(np.pi / 9))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--foreground-threshold", type=float, default=0.05)
     parser.add_argument("--mask-dilate", type=int, default=7)
@@ -96,6 +117,15 @@ def parse_args() -> argparse.Namespace:
         help="Disable dataset z-score normalization before feeding noisy action blocks to LeWM.",
     )
     return parser.parse_args()
+
+
+def parse_noise_stds(value: str) -> list[float]:
+    noise_stds = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if not noise_stds:
+        raise ValueError("--noise-stds must contain at least one value")
+    if any(std < 0 for std in noise_stds):
+        raise ValueError("--noise-stds values must be non-negative")
+    return noise_stds
 
 
 def make_goal_state(goal_pose: np.ndarray, state_dim: int) -> np.ndarray:
@@ -217,8 +247,21 @@ def rollout_simulator_images(
     frameskip: int,
     resolution: int = 224,
 ) -> np.ndarray:
+    pixels, _ = rollout_simulator(init_states, noisy_actions, horizon=horizon, frameskip=frameskip, resolution=resolution)
+    return pixels
+
+
+def rollout_simulator(
+    init_states: np.ndarray,
+    noisy_actions: np.ndarray,
+    *,
+    horizon: int,
+    frameskip: int,
+    resolution: int = 224,
+) -> tuple[np.ndarray, np.ndarray]:
     bsz = len(init_states)
-    output = np.empty((bsz, horizon, resolution, resolution, 3), dtype=np.uint8)
+    pixels = np.empty((bsz, horizon, resolution, resolution, 3), dtype=np.uint8)
+    states = np.empty((bsz, horizon, init_states.shape[1]), dtype=np.float32)
     goal_pose = np.asarray(PUSHT_FIXED_TARGET_POSE, dtype=np.float64)
     goal_state = make_goal_state(goal_pose, init_states.shape[1])
 
@@ -250,10 +293,11 @@ def rollout_simulator_images(
                         unwrapped.goal_pose = goal_pose.copy()
                         unwrapped.goal_state = goal_state.copy()
                         last_frame = np.asarray(unwrapped.render(), dtype=np.uint8)
-                output[i, step] = last_frame
+                pixels[i, step] = last_frame
+                states[i, step] = np.asarray(unwrapped._get_obs(), dtype=np.float32)[: init_states.shape[1]]
     finally:
         env.close()
-    return output
+    return pixels, states
 
 
 def add_label(image: np.ndarray, label: str, header_height: int = 24) -> np.ndarray:
@@ -386,9 +430,325 @@ def save_noisy_metric_plots(output_dir: Path, env_steps: np.ndarray, curves: dic
     )
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = repo_path(args.output_dir)
+def flatten_curves_by_noise(results: dict[float, dict[str, dict[str, np.ndarray]]]) -> dict[str, np.ndarray]:
+    arrays = {}
+    for noise_std, groups in results.items():
+        noise_key = f"noise_{noise_std:g}".replace(".", "p")
+        for group_name, curves in groups.items():
+            for metric, values in curves.items():
+                arrays[f"{noise_key}_{group_name}_{metric}"] = values
+    return arrays
+
+
+def save_noisy_probe_csv(
+    path: Path,
+    env_steps: np.ndarray,
+    results: dict[float, dict[str, dict[str, np.ndarray]]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["noise_std", "source", "model_step", "env_step", "metric", "value"],
+        )
+        writer.writeheader()
+        for noise_std, groups in results.items():
+            for source, curves in groups.items():
+                for metric, values in sorted(curves.items()):
+                    for i, value in enumerate(values):
+                        writer.writerow(
+                            {
+                                "noise_std": float(noise_std),
+                                "source": source,
+                                "model_step": int(i + 1),
+                                "env_step": int(env_steps[i]),
+                                "metric": metric,
+                                "value": float(value),
+                            }
+                        )
+
+
+def plot_noise_metric(
+    path: Path,
+    env_steps: np.ndarray,
+    results: dict[float, dict[str, dict[str, np.ndarray]]],
+    metric: str,
+    title: str,
+    ylabel: str,
+    *,
+    include_encoded_gt: bool = True,
+    ylim: tuple[float, float] | None = None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
+    for noise_std, groups in sorted(results.items()):
+        if metric in groups["imagined"]:
+            ax.plot(env_steps, groups["imagined"][metric], linewidth=2, label=f"imagined std={noise_std:g}")
+        if include_encoded_gt and metric in groups["encoded_gt"]:
+            ax.plot(
+                env_steps,
+                groups["encoded_gt"][metric],
+                linewidth=1.5,
+                linestyle="--",
+                alpha=0.75,
+                label=f"encoded sim std={noise_std:g}",
+            )
+    ax.set_title(title)
+    ax.set_xlabel("Environment steps after context")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.25)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.legend(fontsize=8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def save_noisy_probe_plots(
+    output_dir: Path,
+    env_steps: np.ndarray,
+    results: dict[float, dict[str, dict[str, np.ndarray]]],
+) -> None:
+    specs = [
+        ("agent_pos_rmse_px", "Agent Position RMSE by Noise", "RMSE (px)", None),
+        ("block_pos_rmse_px", "Block Position RMSE by Noise", "RMSE (px)", None),
+        ("block_angle_rmse_deg", "Block Angle RMSE by Noise", "RMSE (deg)", None),
+        ("block_rel_objective_xy_rmse_px", "T Relative to Objective XY RMSE by Noise", "RMSE (px)", None),
+        ("block_rel_objective_angle_rmse_deg", "T Relative to Objective Angle RMSE by Noise", "RMSE (deg)", None),
+        ("block_rel_agent_xy_rmse_px", "T Relative to Agent XY RMSE by Noise", "RMSE (px)", None),
+        ("block_rel_agent_angle_rmse_deg", "T Relative to Agent Angle RMSE by Noise", "RMSE (deg)", None),
+        ("objective_met_mean_probability", "Mean P(Objective Met) by Noise", "Probability", None),
+        ("objective_met_false_positive_rate", "Objective-Met FPR by Noise", "Rate", (0.0, 1.05)),
+        ("objective_met_recall", "Objective-Met Recall by Noise", "Rate", (0.0, 1.05)),
+        ("objective_met_precision", "Objective-Met Precision by Noise", "Rate", (0.0, 1.05)),
+        ("objective_met_positive_count", "Objective-Met Support by Noise", "Count", None),
+        ("latent_rmse", "Imagined vs Encoded Sim Latent RMSE by Noise", "Latent RMSE", None),
+        ("latent_cosine", "Imagined vs Encoded Sim Latent Cosine by Noise", "Mean cosine", (-1.0, 1.0)),
+    ]
+    for metric, title, ylabel, ylim in specs:
+        plot_noise_metric(
+            output_dir / f"{metric}_by_noise.png",
+            env_steps,
+            results,
+            metric,
+            title,
+            ylabel,
+            include_encoded_gt=not metric.startswith("latent_"),
+            ylim=ylim,
+        )
+
+
+def evaluate_one_noise(
+    args: argparse.Namespace,
+    *,
+    h5: h5py.File,
+    starts: list[tuple[int, int]],
+    action_mean: np.ndarray,
+    action_std: np.ndarray,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+    model: torch.nn.Module,
+    history_size: int,
+    probes: dict[str, object],
+    classifier_probes: dict[str, object],
+    noise_std: float,
+    device: torch.device,
+) -> dict[str, dict[str, np.ndarray]]:
+    pred_embs = []
+    gt_embs = []
+    sim_states = []
+    rng = np.random.default_rng(args.seed + 10_000 + int(round(noise_std * 1_000_000)))
+    noise_args = argparse.Namespace(**vars(args))
+    noise_args.action_noise_std = noise_std
+
+    for batch_start in range(0, len(starts), args.batch_size):
+        batch_starts = starts[batch_start : batch_start + args.batch_size]
+        context_pixels, _, init_states = load_context_future_state(
+            h5,
+            batch_starts,
+            context_steps=args.context_steps,
+            horizon=args.horizon,
+            frameskip=args.frameskip,
+        )
+        action_blocks, noisy_actions = build_noisy_action_blocks(
+            h5,
+            batch_starts,
+            context_steps=args.context_steps,
+            horizon=args.horizon,
+            frameskip=args.frameskip,
+            action_mean=action_mean,
+            action_std=action_std,
+            normalize_actions=not args.no_normalize_actions,
+            action_low=action_low,
+            action_high=action_high,
+            args=noise_args,
+            rng=rng,
+        )
+        sim_pixels, states = rollout_simulator(
+            init_states,
+            noisy_actions,
+            horizon=args.horizon,
+            frameskip=args.frameskip,
+        )
+        pred_emb = rollout_embeddings(
+            model,
+            context_pixels,
+            action_blocks,
+            horizon=args.horizon,
+            history_size=history_size,
+            device=device,
+        ).detach().cpu().float().numpy()
+        gt_emb = probe_eval.encode_future_embeddings(
+            model,
+            sim_pixels,
+            encode_batch_size=args.encode_batch_size,
+            device=device,
+        )
+        pred_embs.append(pred_emb)
+        gt_embs.append(gt_emb)
+        sim_states.append(states)
+        print(
+            f"noise std {noise_std:g}: processed "
+            f"{min(batch_start + len(batch_starts), len(starts))}/{len(starts)} trajectories"
+        )
+
+    pred_emb = np.concatenate(pred_embs, axis=0)
+    gt_emb = np.concatenate(gt_embs, axis=0)
+    states = np.concatenate(sim_states, axis=0)
+
+    imagined_pred = probe_eval.probe_predictions(probes, pred_emb)
+    encoded_gt_pred = probe_eval.probe_predictions(probes, gt_emb)
+    imagined_class_pred = probe_eval.classifier_predictions(classifier_probes, pred_emb)
+    encoded_gt_class_pred = probe_eval.classifier_predictions(classifier_probes, gt_emb)
+
+    imagined_curves = probe_eval.compute_curves(imagined_pred, states, args)
+    encoded_gt_curves = probe_eval.compute_curves(encoded_gt_pred, states, args)
+    objective_threshold = classifier_probes["objective_met"].threshold
+    imagined_curves.update(
+        probe_eval.binary_curve_metrics(
+            imagined_class_pred["objective_met"],
+            states,
+            args,
+            threshold=objective_threshold,
+        )
+    )
+    encoded_gt_curves.update(
+        probe_eval.binary_curve_metrics(
+            encoded_gt_class_pred["objective_met"],
+            states,
+            args,
+            threshold=objective_threshold,
+        )
+    )
+    imagined_curves["latent_rmse"] = probe_eval.latent_curve(pred_emb, gt_emb)
+    imagined_curves["latent_cosine"] = probe_eval.latent_cosine_curve(pred_emb, gt_emb)
+    return {"imagined": imagined_curves, "encoded_gt": encoded_gt_curves}
+
+
+def run_evaluate_rollouts(args: argparse.Namespace) -> None:
+    output_dir = repo_path(
+        args.output_dir or f"models/rollout_probe/{Path(args.probe_dir).name}_{args.probe_kind}_noisy_actions"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(args.device)
+
+    dataset_path = repo_path(args.dataset_path)
+    checkpoint_cache_dir = repo_path(args.checkpoint_cache_dir)
+    probe_dir = repo_path(args.probe_dir)
+    noise_stds = parse_noise_stds(args.noise_stds)
+
+    probes, classifier_probes = probe_eval.load_probes(probe_dir, args.probe_kind)
+    model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=checkpoint_cache_dir)
+    model = model.to(device).eval()
+    model.requires_grad_(False)
+    history_size = int(getattr(model.predictor, "num_frames", 3))
+    env_steps = args.frameskip * np.arange(1, args.horizon + 1)
+
+    probe_env = make_pusht_env(render_obs=False, relative=True, disable_env_checker=True)
+    action_low = np.asarray(probe_env.action_space.low, dtype=np.float32)
+    action_high = np.asarray(probe_env.action_space.high, dtype=np.float32)
+    probe_env.close()
+
+    results = {}
+    sampled: list[tuple[int, int]] = []
+    with h5py.File(dataset_path, "r") as h5:
+        action_mean, action_std = action_stats(h5)
+        starts = sample_starts(
+            h5=h5,
+            num_trajectories=args.num_trajectories,
+            context_steps=args.context_steps,
+            horizon=args.horizon,
+            frameskip=args.frameskip,
+            seed=args.seed,
+        )
+        sampled = starts
+        for noise_std in noise_stds:
+            results[noise_std] = evaluate_one_noise(
+                args,
+                h5=h5,
+                starts=starts,
+                action_mean=action_mean,
+                action_std=action_std,
+                action_low=action_low,
+                action_high=action_high,
+                model=model,
+                history_size=history_size,
+                probes=probes,
+                classifier_probes=classifier_probes,
+                noise_std=noise_std,
+                device=device,
+            )
+
+    flat_curves = flatten_curves_by_noise(results)
+    save_noisy_probe_csv(output_dir / "noisy_probe_rollout_metrics.csv", env_steps, results)
+    save_noisy_probe_plots(output_dir, env_steps, results)
+    np.savez_compressed(
+        output_dir / "noisy_probe_rollout_arrays.npz",
+        env_steps=env_steps,
+        noise_stds=np.asarray(noise_stds, dtype=np.float32),
+        sampled=np.asarray(sampled, dtype=np.int64),
+        **flat_curves,
+    )
+
+    final_step = {
+        f"std_{noise_std:g}_{source}_{metric}": float(curves[metric][-1])
+        for noise_std, groups in results.items()
+        for source, curves in groups.items()
+        for metric in (
+            "agent_pos_rmse_px",
+            "block_pos_rmse_px",
+            "block_angle_rmse_deg",
+            "block_rel_objective_xy_rmse_px",
+            "block_rel_agent_xy_rmse_px",
+            "objective_met_false_positive_rate",
+            "objective_met_recall",
+            "objective_met_precision",
+            "objective_met_positive_count",
+        )
+        if metric in curves
+    }
+    summary = {
+        "config": vars(args),
+        "num_trajectories": len(sampled),
+        "history_size": history_size,
+        "noise_stds": noise_stds,
+        "objective_met_threshold": classifier_probes["objective_met"].threshold,
+        "env_steps": env_steps.tolist(),
+        "action_noise": {
+            "mode": args.action_noise_mode,
+            "action_low": action_low.tolist(),
+            "action_high": action_high.tolist(),
+        },
+        "final_step": final_step,
+    }
+    with (output_dir / "noisy_probe_rollout_summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+    print(json.dumps(final_step, indent=2))
+    print(f"saved noisy probe evaluation outputs to {output_dir}")
+
+
+def run_visualize(args: argparse.Namespace) -> None:
+    output_dir = repo_path(args.output_dir or "models/rollout_decode/pusht_lewm_noisy_actions")
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
@@ -538,6 +898,14 @@ def main() -> None:
     with (output_dir / "noisy_action_rollout_summary.json").open("w") as f:
         json.dump(summary, f, indent=2)
     print(f"saved outputs to {output_dir}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.command == "evaluate_rollouts":
+        run_evaluate_rollouts(args)
+    else:
+        run_visualize(args)
 
 
 if __name__ == "__main__":
