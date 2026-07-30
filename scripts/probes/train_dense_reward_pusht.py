@@ -43,6 +43,10 @@ from scripts.probes.train_probes_pusht import (  # noqa: E402
 )
 
 
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+
+
 class DenseRewardClassifier(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, hidden_dim: int, depth: int):
         super().__init__()
@@ -66,9 +70,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="models/probes/pusht_dense_reward")
     parser.add_argument("--latent-cache", default=None)
     parser.add_argument("--label-cache", default=None)
+    parser.add_argument("--imagined-cache", default=None)
     parser.add_argument("--max-samples", type=int, default=1_000_000)
     parser.add_argument("--sample-block-size", type=int, default=16)
     parser.add_argument("--encode-batch-size", type=int, default=256)
+    parser.add_argument("--rollout-batch-size", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=8)
@@ -78,10 +84,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--horizons", type=int, nargs="+", default=[2, 5, 10, 20])
     parser.add_argument("--frameskip", type=int, default=5)
+    parser.add_argument("--context-steps", type=int, default=3)
+    parser.add_argument("--imagined-rollout-horizon", type=int, default=None)
+    parser.add_argument("--include-imagined-rollouts", action="store_true")
+    parser.add_argument("--imagined-fraction", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--force-recache", action="store_true")
     parser.add_argument("--force-label-recache", action="store_true")
+    parser.add_argument("--force-imagined-recache", action="store_true")
+    parser.add_argument(
+        "--no-normalize-actions",
+        action="store_true",
+        help="Disable dataset z-score normalization of GT actions before feeding LeWM rollouts.",
+    )
     parser.add_argument(
         "--keep-censored-negatives",
         action="store_true",
@@ -106,6 +122,35 @@ def objective_met_from_state(state: np.ndarray, args: argparse.Namespace) -> np.
     return (pos_err <= args.objective_pos_tol) & (angle_err <= args.objective_angle_tol)
 
 
+def dense_labels_for_rows(
+    rows: np.ndarray,
+    offsets: np.ndarray,
+    lengths: np.ndarray,
+    met_prefix: np.ndarray,
+    horizons: list[int],
+    frameskip: int,
+    keep_censored_negatives: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    rows = rows.astype(np.int64)
+    episode = np.searchsorted(offsets, rows, side="right") - 1
+    episode_end = offsets[episode] + lengths[episode] - 1
+    y = np.zeros((len(rows), len(horizons)), dtype=np.float32)
+    valid = np.zeros_like(y)
+
+    for j, horizon in enumerate(horizons):
+        lookahead = int(horizon) * int(frameskip)
+        requested_end = rows + lookahead
+        observed_end = np.minimum(requested_end, episode_end)
+        any_success = (met_prefix[observed_end + 1] - met_prefix[rows]) > 0
+        full_window_observed = requested_end <= episode_end
+        y[:, j] = any_success.astype(np.float32)
+        if keep_censored_negatives:
+            valid[:, j] = 1.0
+        else:
+            valid[:, j] = np.logical_or(any_success, full_window_observed).astype(np.float32)
+    return y, valid
+
+
 def derive_dense_labels(
     h5_path: Path,
     rows_by_split: dict[str, np.ndarray],
@@ -118,29 +163,20 @@ def derive_dense_labels(
         offsets = f["ep_offset"][:].astype(np.int64)
         state = f["state"][:].astype(np.float32)
 
-    met = objective_met_from_state(state, args).astype(np.int64)
-    met_prefix = np.concatenate([[0], np.cumsum(met)])
+    met_prefix = np.concatenate([[0], np.cumsum(objective_met_from_state(state, args).astype(np.int64))])
     output: dict[str, dict[str, np.ndarray]] = {}
 
     for split, rows in rows_by_split.items():
         rows = rows.astype(np.int64)
-        episode = np.searchsorted(offsets, rows, side="right") - 1
-        episode_end = offsets[episode] + lengths[episode] - 1
-        y = np.zeros((len(rows), len(horizons)), dtype=np.float32)
-        valid = np.zeros_like(y)
-
-        for j, horizon in enumerate(horizons):
-            lookahead = int(horizon) * int(frameskip)
-            requested_end = rows + lookahead
-            observed_end = np.minimum(requested_end, episode_end)
-            any_success = (met_prefix[observed_end + 1] - met_prefix[rows]) > 0
-            full_window_observed = requested_end <= episode_end
-            y[:, j] = any_success.astype(np.float32)
-            if args.keep_censored_negatives:
-                valid[:, j] = 1.0
-            else:
-                valid[:, j] = np.logical_or(any_success, full_window_observed).astype(np.float32)
-
+        y, valid = dense_labels_for_rows(
+            rows,
+            offsets,
+            lengths,
+            met_prefix,
+            horizons,
+            frameskip,
+            args.keep_censored_negatives,
+        )
         output[split] = {"y": y, "valid": valid, "rows": rows}
     return output
 
@@ -188,6 +224,225 @@ def default_latent_cache(output_dir: Path, args: argparse.Namespace) -> Path:
     if args.max_samples == 1_000_000 and existing_1m.exists():
         return existing_1m
     return output_dir / "latents.npz"
+
+
+def preprocess_context_pixels(pixels: np.ndarray, device: torch.device) -> torch.Tensor:
+    x = torch.from_numpy(pixels).to(device=device, dtype=torch.float32)
+    x = x.permute(0, 1, 4, 2, 3).div_(255.0)
+    return (x - IMAGENET_MEAN.to(device)) / IMAGENET_STD.to(device)
+
+
+def action_stats(h5: h5py.File) -> tuple[np.ndarray, np.ndarray]:
+    action = h5["action"][:]
+    mean = action.mean(axis=0).astype(np.float32)
+    std = action.std(axis=0).astype(np.float32)
+    std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
+    return mean, std
+
+
+def sample_rollout_starts(
+    offsets: np.ndarray,
+    lengths: np.ndarray,
+    train_rows: np.ndarray,
+    num_windows: int,
+    context_steps: int,
+    horizon: int,
+    frameskip: int,
+    seed: int,
+) -> list[tuple[int, int]]:
+    train_episodes = np.unique(np.searchsorted(offsets, train_rows, side="right") - 1)
+    required_last_frame = (context_steps + horizon - 1) * frameskip
+    valid_eps = train_episodes[lengths[train_episodes] > required_last_frame]
+    if len(valid_eps) == 0:
+        raise ValueError("No train episodes are long enough for imagined rollout generation.")
+
+    rng = np.random.default_rng(seed)
+    ep_probs = lengths[valid_eps].astype(np.float64)
+    ep_probs = ep_probs / ep_probs.sum()
+    starts = []
+    for _ in range(num_windows):
+        ep = int(rng.choice(valid_eps, p=ep_probs))
+        max_start = int(lengths[ep] - required_last_frame - 1)
+        local_start = int(rng.integers(0, max_start + 1))
+        starts.append((ep, int(offsets[ep] + local_start)))
+    return starts
+
+
+def load_rollout_batch(
+    h5: h5py.File,
+    starts: list[tuple[int, int]],
+    context_steps: int,
+    horizon: int,
+    frameskip: int,
+    action_mean: np.ndarray,
+    action_std: np.ndarray,
+    normalize_actions: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    bsz = len(starts)
+    action_steps = context_steps + horizon - 1
+    context_pixels = np.empty((bsz, context_steps, 224, 224, 3), dtype=np.uint8)
+    action_blocks = np.empty((bsz, action_steps, frameskip * 2), dtype=np.float32)
+    future_rows = np.empty((bsz, horizon), dtype=np.int64)
+    episodes = np.empty((bsz,), dtype=np.int64)
+
+    for i, (ep, start) in enumerate(starts):
+        episodes[i] = ep
+        context_idx = start + np.arange(context_steps) * frameskip
+        context_pixels[i] = h5["pixels"][context_idx]
+        future_rows[i] = start + (context_steps + np.arange(horizon)) * frameskip
+        for t in range(action_steps):
+            a0 = start + t * frameskip
+            raw_action = h5["action"][a0 : a0 + frameskip].astype(np.float32)
+            if normalize_actions:
+                raw_action = (raw_action - action_mean) / action_std
+            action_blocks[i, t] = raw_action.reshape(-1)
+    return context_pixels, action_blocks, future_rows, episodes
+
+
+@torch.inference_mode()
+def rollout_embeddings(
+    model: nn.Module,
+    context_pixels: np.ndarray,
+    action_blocks: np.ndarray,
+    horizon: int,
+    history_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    context = preprocess_context_pixels(context_pixels, device)
+    actions = torch.from_numpy(action_blocks).to(device=device, dtype=torch.float32)
+    init = model.encode({"pixels": context})
+    emb_list = list(init["emb"].unbind(dim=1))
+    all_act_emb = model.action_encoder(actions)
+    context_steps = context.shape[1]
+
+    for step in range(horizon):
+        end = context_steps + step
+        lo = max(0, end - history_size)
+        emb_trunc = torch.stack(emb_list[lo:end], dim=1)
+        act_trunc = all_act_emb[:, lo:end]
+        pred = model.predict(emb_trunc, act_trunc)[:, -1]
+        emb_list.append(pred)
+    return torch.stack(emb_list[context_steps:], dim=1).detach().cpu()
+
+
+def save_imagined_cache(path: Path, arrays: dict[str, np.ndarray], metadata: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"metadata": np.array(json.dumps(metadata))}
+    payload.update(arrays)
+    np.savez_compressed(path, **payload)
+
+
+def load_imagined_cache(path: Path) -> tuple[dict[str, np.ndarray], dict]:
+    raw = np.load(path, allow_pickle=False)
+    metadata = json.loads(str(raw["metadata"]))
+    arrays = {key: raw[key] for key in raw.files if key != "metadata"}
+    return arrays, metadata
+
+
+def imagined_metadata_matches(found: dict, expected: dict) -> bool:
+    keys = (
+        "dataset",
+        "checkpoint",
+        "horizons",
+        "frameskip",
+        "context_steps",
+        "rollout_horizon",
+        "num_samples",
+        "objective_x",
+        "objective_y",
+        "objective_angle",
+        "objective_pos_tol",
+        "objective_angle_tol",
+        "keep_censored_negatives",
+        "normalize_actions",
+    )
+    return all(found.get(key) == expected.get(key) for key in keys)
+
+
+def build_imagined_train_cache(
+    h5_path: Path,
+    model: nn.Module,
+    train_rows: np.ndarray,
+    num_samples: int,
+    rollout_horizon: int,
+    args: argparse.Namespace,
+) -> dict[str, np.ndarray]:
+    device = torch.device(args.device)
+    model = model.to(device).eval()
+    model.requires_grad_(False)
+    history_size = int(getattr(model.predictor, "num_frames", args.context_steps))
+
+    with h5py.File(h5_path, "r") as h5:
+        offsets = h5["ep_offset"][:].astype(np.int64)
+        lengths = h5["ep_len"][:].astype(np.int64)
+        state = h5["state"][:].astype(np.float32)
+        action_mean, action_std = action_stats(h5)
+        starts = sample_rollout_starts(
+            offsets,
+            lengths,
+            train_rows,
+            num_windows=int(np.ceil(num_samples / rollout_horizon)),
+            context_steps=args.context_steps,
+            horizon=rollout_horizon,
+            frameskip=args.frameskip,
+            seed=args.seed + 17,
+        )
+        met_prefix = np.concatenate([[0], np.cumsum(objective_met_from_state(state, args).astype(np.int64))])
+
+        z_parts = []
+        row_parts = []
+        episode_parts = []
+        model_step_parts = []
+        start_parts = []
+        y_parts = []
+        valid_parts = []
+        for start_idx in range(0, len(starts), args.rollout_batch_size):
+            batch_starts = starts[start_idx : start_idx + args.rollout_batch_size]
+            context_pixels, action_blocks, future_rows, episodes = load_rollout_batch(
+                h5,
+                batch_starts,
+                context_steps=args.context_steps,
+                horizon=rollout_horizon,
+                frameskip=args.frameskip,
+                action_mean=action_mean,
+                action_std=action_std,
+                normalize_actions=not args.no_normalize_actions,
+            )
+            emb = rollout_embeddings(model, context_pixels, action_blocks, rollout_horizon, history_size, device)
+            flat_rows = future_rows.reshape(-1)
+            y, valid = dense_labels_for_rows(
+                flat_rows,
+                offsets,
+                lengths,
+                met_prefix,
+                args.horizons,
+                args.frameskip,
+                args.keep_censored_negatives,
+            )
+            z_parts.append(emb.reshape(-1, emb.shape[-1]).numpy())
+            row_parts.append(flat_rows)
+            episode_parts.append(np.repeat(episodes, rollout_horizon))
+            model_step_parts.append(np.tile(np.arange(1, rollout_horizon + 1, dtype=np.int64), len(episodes)))
+            start_parts.append(np.repeat(np.asarray([s for _, s in batch_starts], dtype=np.int64), rollout_horizon))
+            y_parts.append(y)
+            valid_parts.append(valid)
+            done = min(sum(len(part) for part in row_parts), num_samples)
+            print(f"imagined rollout cache: {done}/{num_samples}")
+
+    z = np.concatenate(z_parts, axis=0)[:num_samples].astype(np.float32)
+    rows = np.concatenate(row_parts, axis=0)[:num_samples].astype(np.int64)
+    y = np.concatenate(y_parts, axis=0)[:num_samples].astype(np.float32)
+    valid = np.concatenate(valid_parts, axis=0)[:num_samples].astype(np.float32)
+    return {
+        "z": z,
+        "y": y,
+        "valid": valid,
+        "rows": rows,
+        "episode": np.concatenate(episode_parts, axis=0)[:num_samples].astype(np.int64),
+        "model_step": np.concatenate(model_step_parts, axis=0)[:num_samples].astype(np.int64),
+        "start": np.concatenate(start_parts, axis=0)[:num_samples].astype(np.int64),
+        "history_size": np.asarray([history_size], dtype=np.int64),
+    }
 
 
 def standardize(train: np.ndarray, *others: np.ndarray) -> tuple[np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
@@ -398,6 +653,9 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if not 0.0 <= args.imagined_fraction <= 1.0:
+        raise ValueError("--imagined-fraction must be between 0 and 1.")
+    rollout_horizon = int(args.imagined_rollout_horizon or max(args.horizons))
 
     output_dir = repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -407,6 +665,9 @@ def main() -> None:
 
     latent_cache = repo_path(args.latent_cache) if args.latent_cache else default_latent_cache(output_dir, args)
     label_cache = repo_path(args.label_cache) if args.label_cache else output_dir / "dense_reward_labels.npz"
+    imagined_cache = (
+        repo_path(args.imagined_cache) if args.imagined_cache else output_dir / "imagined_train_rollouts.npz"
+    )
 
     if latent_cache.exists() and not args.force_recache:
         data, latent_metadata = load_latent_cache(latent_cache)
@@ -473,13 +734,65 @@ def main() -> None:
         print(f"saved label cache: {label_cache}")
 
     merged = merge_latents_and_labels(data, labels)
-    x_train, (x_val, x_test), x_mean, x_std = standardize(
-        merged["train"]["z"], merged["val"]["z"], merged["test"]["z"]
-    )
+    train_source_counts = {"gt": int(len(merged["train"]["z"])), "imagined": 0}
+    imagined_metadata = None
+
+    train_z_raw = merged["train"]["z"]
     y_train = merged["train"]["y"]
+    valid_train = merged["train"]["valid"]
+    train_rows = merged["train"]["rows"]
+
+    if args.include_imagined_rollouts and args.imagined_fraction > 0:
+        n_train_total = len(train_z_raw)
+        n_imagined = int(round(n_train_total * args.imagined_fraction))
+        n_gt_keep = n_train_total - n_imagined
+        imagined_metadata_expected = {
+            "dataset": args.dataset,
+            "checkpoint": args.checkpoint,
+            "horizons": args.horizons,
+            "frameskip": args.frameskip,
+            "context_steps": args.context_steps,
+            "rollout_horizon": rollout_horizon,
+            "num_samples": n_imagined,
+            "objective_x": args.objective_x,
+            "objective_y": args.objective_y,
+            "objective_angle": args.objective_angle,
+            "objective_pos_tol": args.objective_pos_tol,
+            "objective_angle_tol": args.objective_angle_tol,
+            "keep_censored_negatives": args.keep_censored_negatives,
+            "normalize_actions": not args.no_normalize_actions,
+        }
+        if imagined_cache.exists() and not args.force_imagined_recache:
+            imagined, imagined_metadata = load_imagined_cache(imagined_cache)
+            if imagined_metadata_matches(imagined_metadata, imagined_metadata_expected):
+                print(f"loaded imagined rollout cache: {imagined_cache}")
+            else:
+                print(f"imagined cache metadata mismatch, recaching: {imagined_cache}")
+                model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=cache_dir)
+                imagined = build_imagined_train_cache(h5_path, model, train_rows, n_imagined, rollout_horizon, args)
+                imagined_metadata = imagined_metadata_expected
+                save_imagined_cache(imagined_cache, imagined, imagined_metadata)
+                print(f"saved imagined rollout cache: {imagined_cache}")
+        else:
+            model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=cache_dir)
+            imagined = build_imagined_train_cache(h5_path, model, train_rows, n_imagined, rollout_horizon, args)
+            imagined_metadata = imagined_metadata_expected
+            save_imagined_cache(imagined_cache, imagined, imagined_metadata)
+            print(f"saved imagined rollout cache: {imagined_cache}")
+
+        rng = np.random.default_rng(args.seed + 23)
+        gt_keep_idx = rng.choice(n_train_total, size=n_gt_keep, replace=False) if n_gt_keep > 0 else np.array([], dtype=np.int64)
+        train_z_raw = np.concatenate([train_z_raw[gt_keep_idx], imagined["z"].astype(np.float32)], axis=0)
+        y_train = np.concatenate([y_train[gt_keep_idx], imagined["y"].astype(np.float32)], axis=0)
+        valid_train = np.concatenate([valid_train[gt_keep_idx], imagined["valid"].astype(np.float32)], axis=0)
+        train_source_counts = {"gt": int(n_gt_keep), "imagined": int(n_imagined)}
+        print(f"training mix: {n_gt_keep} GT latents + {n_imagined} imagined rollout latents")
+
+    x_train, (x_val, x_test), x_mean, x_std = standardize(
+        train_z_raw, merged["val"]["z"], merged["test"]["z"]
+    )
     y_val = merged["val"]["y"]
     y_test = merged["test"]["y"]
-    valid_train = merged["train"]["valid"]
     valid_val = merged["val"]["valid"]
     valid_test = merged["test"]["valid"]
 
@@ -508,6 +821,10 @@ def main() -> None:
             "depth": args.depth,
             "horizons": args.horizons,
             "frameskip": args.frameskip,
+            "context_steps": args.context_steps,
+            "include_imagined_rollouts": args.include_imagined_rollouts,
+            "imagined_fraction": args.imagined_fraction,
+            "imagined_rollout_horizon": rollout_horizon,
             "thresholds": thresholds,
             "x_mean": x_mean,
             "x_std": x_std,
@@ -527,8 +844,11 @@ def main() -> None:
         "config": vars(args),
         "latent_cache": str(latent_cache),
         "label_cache": str(label_cache),
+        "imagined_cache": str(imagined_cache) if args.include_imagined_rollouts else None,
         "latent_cache_metadata": latent_metadata,
         "label_cache_metadata": label_metadata,
+        "imagined_cache_metadata": imagined_metadata,
+        "train_source_counts": train_source_counts,
         "normalizer": {"mean": x_mean.tolist(), "std": x_std.tolist()},
         "thresholds": thresholds.tolist(),
         "val": val_metrics,
