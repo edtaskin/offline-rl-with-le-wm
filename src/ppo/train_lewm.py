@@ -37,6 +37,8 @@ also published under hf.co/offline-rl-with-le-wm):
 * state probes under ``models/probes/pusht_lewm/``: the ``objective_met``
   classifier (success + sparse reward) and/or the ``block_rel_objective``
   regression probe (distances, required for ``pose_dense`` reward)
+* dense reward:      ``hf://offline-rl-with-le-wm/dense_reward_classifier/``
+  ``dense_reward_classifier.pt`` (downloaded automatically for ``dense`` reward)
 
 Runnable either way::
 
@@ -91,42 +93,14 @@ PUSHT_COORD_HIGH = 512.0
 
 DREAM_SMOKE_OVERRIDES = {**SMOKE_OVERRIDES, "dream_episode_steps": 6}
 
+DENSE_REWARD_CHECKPOINT_HF = (
+    "hf://offline-rl-with-le-wm/dense_reward_classifier/dense_reward_classifier.pt"
+)
+
 
 def repo_path(path: str | Path) -> Path:
     path = Path(path)
     return path if path.is_absolute() else _REPO_ROOT / path
-
-
-def _resolve_dense_reward_checkpoint(checkpoint: str | None, probe_dir: Path) -> str | Path:
-    """Resolve the learned dense reward checkpoint using ``probe_dir`` first."""
-    searched: list[Path] = []
-    if checkpoint:
-        if str(checkpoint).startswith("hf://"):
-            return checkpoint
-        path = Path(checkpoint)
-        candidates = [path] if path.is_absolute() else [probe_dir / path, repo_path(path)]
-    else:
-        candidates = [
-            probe_dir / "dense_reward_classifier.pt",
-            probe_dir / "dense_reward" / "dense_reward_classifier.pt",
-        ]
-
-    for candidate in candidates:
-        searched.append(candidate)
-        if candidate.is_file():
-            return candidate
-
-    searched_text = "\n  ".join(str(path) for path in searched)
-    if checkpoint:
-        raise FileNotFoundError(
-            f"Dense reward checkpoint {checkpoint!r} was not found. Searched:\n  "
-            f"{searched_text}"
-        )
-    raise FileNotFoundError(
-        "reward_mode='dense' needs a learned dense reward classifier. Pass "
-        "--dense-reward-checkpoint, or place dense_reward_classifier.pt under "
-        f"--probe-dir. Searched:\n  {searched_text}"
-    )
 
 
 @dataclass
@@ -175,8 +149,9 @@ class DreamConfig(LatentConfig):
 
     # Learned dense reward from scripts/probes/train_dense_reward_pusht.py.
     # Active when reward_mode == "dense". The classifier is evaluated on
-    # projected LeWM dynamics latents, not raw CLS policy latents.
-    dense_reward_checkpoint: str | None = None
+    # projected LeWM dynamics latents, not raw CLS policy latents. Override with
+    # --dense-reward-checkpoint using either an hf:// URI or a local file path.
+    dense_reward_checkpoint: str = DENSE_REWARD_CHECKPOINT_HF
     dense_reward_coef: float = 0.1
     dense_reward_weights: str = "0.1 0.5 1 1"
     dense_reward_clip: float = 0.5
@@ -216,6 +191,10 @@ class DreamConfig(LatentConfig):
         if self.dense_reward_clip < 0.0:
             raise ValueError("dense_reward_clip must be non-negative")
         if self.reward_mode == "dense":
+            if not self.dense_reward_checkpoint:
+                raise ValueError(
+                    "reward_mode='dense' requires a dense_reward_checkpoint"
+                )
             if self.dense_reward_coef <= 0.0:
                 raise ValueError("reward_mode='dense' requires dense_reward_coef > 0")
 
@@ -442,11 +421,8 @@ class LeWMDreamWorld:
         self._last_dense_score = np.zeros(cfg.num_envs, dtype=np.float32)
         self._last_dense_probs = np.zeros((cfg.num_envs, 0), dtype=np.float32)
         if cfg.reward_mode == "dense":
-            dense_checkpoint = _resolve_dense_reward_checkpoint(
-                cfg.dense_reward_checkpoint, probe_dir
-            )
             self.dense_reward = DenseRewardShaper(
-                dense_checkpoint,
+                cfg.dense_reward_checkpoint,
                 weights=cfg.dense_reward_weights,
                 scale=cfg.dense_reward_coef,
                 clip=cfg.dense_reward_clip,
@@ -468,7 +444,7 @@ class LeWMDreamWorld:
             logger.info(
                 "Loaded dense reward classifier %s | horizons %s wm steps | "
                 "mode %s | coef %.4g | clip %.4g | weights %s",
-                dense_checkpoint,
+                cfg.dense_reward_checkpoint,
                 self.dense_reward.horizons,
                 cfg.dense_reward_mode,
                 cfg.dense_reward_coef,
