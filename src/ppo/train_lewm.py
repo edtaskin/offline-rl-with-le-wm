@@ -16,9 +16,9 @@ onto the world model (history=3, frameskip=5). Per imagined step:
    CLS latent the policy consumes -- the decoder bridges LeWM's projected
    latent space back to the BC policy's input space;
 4. reward and success come from frozen probes/classifiers on the imagined
-   projected latent: ``sparse`` = 1.0 on success, ``dense`` = learned
-   time-to-success classifier shaping, and ``pose_dense`` = the legacy
-   block-pose distance reward.
+   projected latent: ``sparse`` = 1.0 on success, ``dense`` = sparse success
+   plus learned time-to-success classifier shaping, and ``pose_dense`` = the
+   legacy block-pose distance reward.
 
 Episodes start from ground-truth context windows sampled from the expert h5
 dataset (respecting ``block_start_near_goal``/``block_start_radius`` and
@@ -739,15 +739,13 @@ class LeWMDreamWorld:
             success_prob = None
             success = (pos_dist < cfg.success_pos_tol) & (angle_dist < cfg.success_angle_tol)
 
-        if cfg.reward_mode == "sparse":
+        if cfg.reward_mode in ("sparse", "dense"):
             reward = success.float()
         elif cfg.reward_mode == "pose_dense":
             reward = -state_dist * self._dense_chunk_scale
             if self.engagement_probe is not None:
                 agent_block = torch.linalg.norm(self.engagement_probe(pred)[:, :2], dim=1)
                 reward = reward - cfg.agent_block_coef * self._dense_chunk_scale * agent_block
-        else:
-            reward = torch.zeros(n, device=self.device)
 
         if cfg.reward_mode == "dense":
             if self.dense_reward is None:

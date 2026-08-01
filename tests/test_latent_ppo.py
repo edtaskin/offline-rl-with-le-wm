@@ -426,6 +426,77 @@ def test_dense_reward_checkpoint_resolution_uses_probe_dir():
         )
 
 
+def test_dream_dense_reward_adds_sparse_success():
+    """Dense dream reward is sparse success plus dense shaping, never shaping alone."""
+    from collections import deque
+    from types import SimpleNamespace
+
+    import src.ppo.train_lewm as train_lewm
+
+    class FakeWM:
+        predictor = SimpleNamespace(num_frames=1)
+
+        def action_encoder(self, act):
+            return act
+
+        def predict(self, emb, act_emb):
+            return torch.full((emb.shape[0], 1, emb.shape[-1]), 0.5)
+
+    class FakeSuccessProbe(nn.Module):
+        threshold = 0.5
+
+        def forward(self, z):
+            return torch.ones((z.shape[0], 1), device=z.device)
+
+    class FakeDenseReward:
+        def score(self, z):
+            return torch.full((z.shape[0],), 2.0, device=z.device), torch.ones((z.shape[0], 2), device=z.device)
+
+        def reward(self, current_score, previous_score, **kwargs):
+            return torch.full_like(current_score, 0.25)
+
+    world = object.__new__(train_lewm.LeWMDreamWorld)
+    world.cfg = train_lewm.DreamConfig(
+        reward_mode="dense",
+        dense_reward_coef=0.1,
+        selection="rolling",
+        dream_eval_interval=0,
+        num_envs=2,
+        action_chunk_size=5,
+        wm_frameskip=5,
+        frame_stride=5,
+        frame_stack=3,
+    )
+    world.device = torch.device("cpu")
+    world.wm = FakeWM()
+    world.history_size = 1
+    world.decoder = nn.Identity()
+    world.cls_encoder = nn.Identity()
+    world.pose_probe = None
+    world.success_probe = FakeSuccessProbe()
+    world.engagement_probe = None
+    world.pos_probe = None
+    world.dense_reward = FakeDenseReward()
+    world.action_mean = torch.zeros(2)
+    world.action_std = torch.ones(2)
+    world.absolute_actions = False
+    world._agent_pos = torch.zeros((2, 2))
+    world._emb_hist = [deque([torch.zeros(192)], maxlen=1) for _ in range(2)]
+    world._act_hist = [deque([torch.zeros(10)], maxlen=1) for _ in range(2)]
+    world._dense_reward_prev_score = torch.zeros(2)
+    world._last_dense_reward = np.zeros(2, dtype=np.float32)
+    world._last_dense_score = np.zeros(2, dtype=np.float32)
+    world._last_dense_probs = np.zeros((2, 2), dtype=np.float32)
+    world._steps = np.zeros(2, dtype=np.int64)
+    world._episode_steps = 10
+
+    _, reward, terminated, truncated, _ = world.step(torch.zeros((2, 5, 2)))
+
+    assert np.allclose(reward, np.asarray([1.25, 1.25]))
+    assert terminated.tolist() == [True, True]
+    assert truncated.tolist() == [False, False]
+
+
 class _FakeImageEnv(gym.Env):
     """Random-image PushT stand-in: truncates after ``max_steps``; dummy reward."""
 
