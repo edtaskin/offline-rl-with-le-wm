@@ -374,7 +374,6 @@ def test_dream_reward_mode_names():
 
     cfg = train_lewm.DreamConfig(
         reward_mode="dense",
-        dense_reward_checkpoint=None,
         dense_reward_coef=0.1,
         selection="rolling",
         dream_eval_interval=0,
@@ -399,31 +398,46 @@ def test_dream_reward_mode_names():
         raise AssertionError("reward_mode='dense' without positive coefficient did not fail")
 
 
-def test_dense_reward_checkpoint_resolution_uses_probe_dir():
-    """Dense reward checkpoints can be discovered under the configured probe_dir."""
+def test_dense_reward_checkpoint_config():
+    """Dense reward defaults to HF and accepts an explicit checkpoint override."""
     import src.ppo.train_lewm as train_lewm
 
-    with TemporaryDirectory() as temporary_dir:
-        probe_dir = Path(temporary_dir) / "probe_set"
-        nested = probe_dir / "dense_reward"
-        nested.mkdir(parents=True)
-        direct = probe_dir / "dense_reward_classifier.pt"
-        direct.touch()
-        nested_ckpt = nested / "dense_reward_classifier.pt"
-        nested_ckpt.touch()
+    defaults = train_lewm.DreamConfig(
+        selection="rolling",
+        dream_eval_interval=0,
+        num_envs=1,
+        num_chunks=1,
+    )
+    assert defaults.dense_reward_checkpoint == train_lewm.DENSE_REWARD_CHECKPOINT_HF
 
-        assert train_lewm._resolve_dense_reward_checkpoint(None, probe_dir) == direct
-        direct.unlink()
-        assert train_lewm._resolve_dense_reward_checkpoint(None, probe_dir) == nested_ckpt
+    override = "hf://owner/custom-reward/checkpoint.pt"
+    configured = train_lewm.DreamConfig(
+        dense_reward_checkpoint=override,
+        selection="rolling",
+        dream_eval_interval=0,
+        num_envs=1,
+        num_chunks=1,
+    )
+    assert configured.dense_reward_checkpoint == override
 
-        custom = probe_dir / "custom.pt"
-        custom.touch()
-        assert train_lewm._resolve_dense_reward_checkpoint("custom.pt", probe_dir) == custom
+    parser = argparse.ArgumentParser()
+    train_lewm._add_args(parser)
+    cli = parser.parse_args(["--dense-reward-checkpoint", override])
+    assert cli.dense_reward_checkpoint == override
 
-        repo_relative = Path("models/probes/pusht_dense_reward_1M/dense_reward_classifier.pt")
-        assert train_lewm._resolve_dense_reward_checkpoint(str(repo_relative), probe_dir) == (
-            REPO_ROOT / repo_relative
+    try:
+        train_lewm.DreamConfig(
+            reward_mode="dense",
+            dense_reward_checkpoint="",
+            selection="rolling",
+            dream_eval_interval=0,
+            num_envs=1,
+            num_chunks=1,
         )
+    except ValueError as exc:
+        assert "dense_reward_checkpoint" in str(exc)
+    else:
+        raise AssertionError("dense reward accepted an empty checkpoint")
 
 
 def test_dream_dense_reward_adds_sparse_success():
