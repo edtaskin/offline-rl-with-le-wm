@@ -177,7 +177,7 @@ class DreamConfig(LatentConfig):
     # Active when reward_mode == "dense". The classifier is evaluated on
     # projected LeWM dynamics latents, not raw CLS policy latents.
     dense_reward_checkpoint: str | None = None
-    dense_reward_coef: float = 0.1
+    dense_reward_coef: float = 0.05
     dense_reward_weights: str = "1 0.75 0.4 0.1"
     dense_reward_clip: float = 0.5
     dense_reward_mode: str = "potential"  # "potential" | "delta" | "score"
