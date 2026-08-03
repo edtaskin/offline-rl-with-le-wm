@@ -17,6 +17,7 @@ with an exploration `log_std` and a separate value head.
 | `utils.py`        | seeding, device selection, reward normalizer                         |
 | `ppo.py`          | `LatentPPOTrainer` — chunk rollout, GAE, clipped PPO update, checkpointing |
 | `train.py`        | CLI entry point (`python -m src.ppo.train`)                          |
+| `train_lewm.py`   | PPO rollouts inside LeWM, with paired dream/real diagnostics         |
 | `../evaluation/`  | canonical BC/PPO PushT evaluation and agent adapters                  |
 
 ## How it works
@@ -65,6 +66,20 @@ Checkpoints (`latest.pt`, `best.pt`, `second_best.pt`, `final.pt`) and videos
 are written under `runs/<exp_name>__seed<seed>/<timestamp>/`. With
 `--eval_interval N > 0`, `best.pt` is selected by deterministic held-out
 success using the same canonical runner as external BC/PPO evaluation.
+
+For dream PPO, add `--record-real-eval` to evaluate the same in-memory policy
+both on held-out imagined anchors and in the real simulator. If
+`--eval-interval` is not set, real evaluation automatically uses the
+`--dream-eval-interval` cadence. With `--selection dream`, real success is only
+diagnostic and does not select `best.pt`. Paired values are appended to
+`selection_log.jsonl`; real evaluation steps are counted in
+`env_steps_consumed`.
+
+```bash
+python -m src.ppo.train_lewm \
+  --selection dream --dream-eval-interval 25 \
+  --record-real-eval --eval-episodes 20 --eval-seed 0
+```
 
 ## Logged metrics
 

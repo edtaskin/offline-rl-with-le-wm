@@ -24,8 +24,9 @@ Episodes start from ground-truth context windows sampled from the expert h5
 dataset (respecting ``block_start_near_goal``/``block_start_radius`` and
 skipping already-solved frames) and truncate after ``dream_episode_steps``
 predictor steps with a value bootstrap, exactly like time-limit truncation in
-the real-env trainer. With ``eval_interval > 0`` the inherited held-out eval
-still runs in the *real* env, measuring dream-to-real transfer.
+the real-env trainer. ``--record-real-eval`` runs the inherited held-out eval
+in the *real* env at the dream-eval cadence, measuring dream-to-real transfer
+while leaving checkpoint selection based on ``--selection``.
 
 Requires (defaults match the decoder/probe scripts; decoder and probes are
 also published under hf.co/offline-rl-with-le-wm):
@@ -137,6 +138,11 @@ class DreamConfig(LatentConfig):
     dream_eval_seed: int = 12345
     # Imagined eval horizon in predictor steps; 0 = reuse dream_episode_steps.
     dream_eval_steps: int = 0
+    # Record the real held-out metric alongside dream validation. When the
+    # inherited eval_interval is 0, this synchronizes it to dream_eval_interval
+    # so selection_log.jsonl contains paired dream/real measurements. Real eval
+    # is diagnostic unless selection="real", but its env steps are always charged.
+    record_real_eval: bool = False
     # Fraction of expert *episodes* reserved for evaluation anchors. Held out at
     # episode granularity, not frame granularity, so a validation start state is
     # never a few frames away from a training start state.
@@ -159,6 +165,13 @@ class DreamConfig(LatentConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.record_real_eval and self.eval_interval <= 0:
+            self.eval_interval = self.dream_eval_interval
+        if self.record_real_eval and self.eval_interval <= 0:
+            raise ValueError(
+                "record_real_eval requires eval_interval > 0 or "
+                "dream_eval_interval > 0"
+            )
         if self.frame_stride != self.wm_frameskip:
             raise ValueError(
                 f"frame_stride ({self.frame_stride}) must equal wm_frameskip "
@@ -951,9 +964,10 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
             dream_stats = self._evaluate_dream()
             self._log_dream_eval(iteration, dream_stats)
 
-        # Real-env eval is opt-in (eval_interval > 0) and, unless selection is
-        # "real", purely diagnostic -- it is logged for the correlation analysis
-        # and charged to the interaction budget, but does not pick best.pt.
+        # Real-env eval is opt-in (record_real_eval, or the backwards-compatible
+        # eval_interval > 0) and, unless selection is "real", purely diagnostic:
+        # it is logged for correlation analysis and charged to the interaction
+        # budget, but does not pick best.pt.
         real_stats = None
         if cfg.eval_interval > 0 and iteration % cfg.eval_interval == 0:
             real_stats = self._evaluate_heldout()

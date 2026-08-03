@@ -35,6 +35,13 @@ class PushTEvalConfig:
     env_id: str = "swm/PushT-v1"
     episodes: int = 20
     seed: int = 42
+    # Gap between consecutive episode seeds. Consecutive integer seeds collide in
+    # the underlying PushT reset roughly 17% of the time, which silently turns
+    # some evaluation episodes into duplicates of their neighbour. The near-goal
+    # start wrapper hides this (it resamples the block from its own reseeded RNG),
+    # so a stride is only needed for unrestricted starts; any value >= 7 was
+    # measured to give fully distinct start states.
+    seed_stride: int = 1
     max_episode_steps: int = 300
     fixed_target_pose: tuple[float, float, float] = tuple(PUSHT_FIXED_TARGET_POSE.tolist())
     fixed_target_block_success: bool = True
@@ -50,6 +57,8 @@ class PushTEvalConfig:
     def validate(self):
         if self.episodes < 1:
             raise ValueError("episodes must be at least 1")
+        if self.seed_stride < 1:
+            raise ValueError("seed_stride must be at least 1")
         if self.max_episode_steps < 1:
             raise ValueError("max_episode_steps must be at least 1")
         if self.block_start_radius is not None and self.block_start_radius < 0:
@@ -179,7 +188,7 @@ def make_evaluation_env(config: PushTEvalConfig):
 
 
 def run_episode(env, agent: EvaluationAgent, config: PushTEvalConfig, episode_index: int):
-    episode_seed = config.seed + episode_index
+    episode_seed = config.seed + episode_index * config.seed_stride
     observation, info = env.reset(seed=episode_seed)
     agent.reset(episode_seed)
     frames = [np.asarray(observation).copy()] if config.record_video else None

@@ -54,6 +54,13 @@ def build_parser():
         help="number of evaluation repeats with non-overlapping seed ranges (default: 3)",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed-stride",
+        type=int,
+        default=1,
+        help="gap between consecutive episode seeds; use >=7 with unrestricted "
+        "block starts, where consecutive seeds collide (see PushTEvalConfig)",
+    )
     parser.add_argument("--max-episode-steps", type=int, default=300)
     parser.add_argument(
         "--fixed-target-pose",
@@ -94,14 +101,16 @@ def _slug(value):
     return slug or "eval"
 
 
-def make_repeat_seeds(seed, repeats, episodes):
+def make_repeat_seeds(seed, repeats, episodes, stride=1):
     """Derive deterministic, non-overlapping episode-seed ranges."""
 
     if repeats < 1:
         raise ValueError("repeats must be at least 1")
     if episodes < 1:
         raise ValueError("episodes must be at least 1")
-    return [seed + repeat * episodes for repeat in range(repeats)]
+    if stride < 1:
+        raise ValueError("stride must be at least 1")
+    return [seed + repeat * episodes * stride for repeat in range(repeats)]
 
 
 def create_run_directory(
@@ -151,7 +160,7 @@ def evaluate_from_args(args):
         raise ValueError("BC evaluation is deterministic; --stochastic is only valid for PPO")
     if args.stochastic and args.execution_mode == "temporal-ensemble":
         raise ValueError("temporal ensembling requires deterministic chunk predictions")
-    repeat_seeds = make_repeat_seeds(args.seed, args.repeats, args.episodes)
+    repeat_seeds = make_repeat_seeds(args.seed, args.repeats, args.episodes, args.seed_stride)
     agent_kwargs = {
         "checkpoint": args.checkpoint,
         "device": args.device,
@@ -180,6 +189,7 @@ def evaluate_from_args(args):
             env_id=args.env_id,
             episodes=args.episodes,
             seed=repeat_seed,
+            seed_stride=args.seed_stride,
             max_episode_steps=args.max_episode_steps,
             fixed_target_pose=tuple(args.fixed_target_pose),
             fixed_target_block_success=args.fixed_target_block_success,
@@ -195,7 +205,7 @@ def evaluate_from_args(args):
         print(
             f"Repeat {repeat + 1}/{args.repeats} | agent={args.agent_type} | "
             f"fixed-target episodes={config.episodes} | "
-            f"seeds={config.seed}..{config.seed + config.episodes - 1}"
+            f"seeds={config.seed}..{config.seed + (config.episodes - 1) * config.seed_stride}"
         )
         results.append(run_evaluation(agent, config))
     result = aggregate_evaluation_results(results)
