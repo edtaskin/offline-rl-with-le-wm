@@ -10,6 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from src.envs import PUSHT_RENDER_SHAPE
+from src.representations.lewm import (
+    LEWM_LATENT_RAW_CLS,
+    LEWM_LATENT_REPRESENTATIONS,
+)
 
 
 @dataclass
@@ -49,6 +53,11 @@ class LatentConfig:
         "hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc_stats.pth"
     )
     encoder_checkpoint: str | None = None  # None -> default swm cache path
+    # Which frozen LeWM feature the policy consumes: "raw_cls" (historical
+    # encoder CLS) or "projected" (that CLS through LeWM's JEPA projector, i.e.
+    # the space its dynamics predict into). Read from ``bc_stats`` by the entry
+    # point so it can never disagree with the BC checkpoint being loaded.
+    latent_representation: str = LEWM_LATENT_RAW_CLS
 
     # ----- agent contract (defaults match the published BC checkpoint; the entry
     # point overrides these from ``bc_stats`` when present) -----
@@ -83,7 +92,9 @@ class LatentConfig:
     ent_coef: float = 0.0
     vf_coef: float = 0.5
     bc_penalty: bool = False
-    bc_penalty_coef: float = 0
+    # Float literal: the CLI infers each flag's type from its default, so an
+    # int 0 here would reject --bc_penalty_coef 0.05.
+    bc_penalty_coef: float = 0.0
     max_grad_norm: float = 0.5
     target_kl: float | None = 0.03
 
@@ -110,6 +121,13 @@ class LatentConfig:
     eval_interval: int = 0
     eval_episodes: int = 20
     eval_seed: int = 0
+    # Repeats with non-overlapping seed ranges, pooled into one estimate -- the
+    # same protocol knob src.evaluation.evaluate_pusht exposes. Left at 1 during
+    # training: every eval episode is charged to the interaction budget (see
+    # real_env_steps), so the reported 3 x 50 protocol is run post-hoc over
+    # saved snapshots instead of mid-run.
+    eval_repeats: int = 1
+    eval_seed_stride: int = 1
 
     # ----- optional Hugging Face upload of the final checkpoint -----
     push_to_hf: bool = False
@@ -130,6 +148,10 @@ class LatentConfig:
     def __post_init__(self) -> None:
         if self.observation_resolution < 1:
             raise ValueError("observation_resolution must be positive")
+        if self.latent_representation not in LEWM_LATENT_REPRESENTATIONS:
+            raise ValueError(
+                f"unsupported LeWM latent representation: {self.latent_representation}"
+            )
         self.batch_size = int(self.num_envs * self.num_chunks)
         self.minibatch_size = max(1, int(self.batch_size // self.num_minibatches))
         steps_per_iter = self.batch_size * self.action_chunk_size

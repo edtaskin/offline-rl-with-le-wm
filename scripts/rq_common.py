@@ -315,6 +315,9 @@ def evaluate_agent_repeats(
     seed_stride: int = 1,
     block_start_radius: float = CANONICAL_EVAL["block_start_radius"],
     max_episode_steps: int = CANONICAL_EVAL["max_episode_steps"],
+    env_id: str | None = None,
+    observation_resolution: int | None = None,
+    fixed_target_block_success: bool | None = None,
 ):
     """The canonical repeat loop for an already-constructed evaluation agent.
 
@@ -322,7 +325,14 @@ def evaluate_agent_repeats(
     :class:`PushTEvalConfig`, same non-overlapping seed ranges, a fresh env per
     repeat -- minus the argparse and run-directory shell. Used where one encoder
     is amortized over many checkpoints (the budget curve), which is the only
-    thing that makes evaluating every snapshot affordable.
+    thing that makes evaluating every snapshot affordable, and by the in-training
+    held-out eval in :mod:`src.ppo.ppo`, so a mid-run number and a reported one
+    come from the same code.
+
+    The trailing env-identity arguments fall back to :class:`PushTEvalConfig`'s
+    own defaults when left as ``None``; they exist so a caller whose training env
+    differs (a non-default resolution, say) cannot silently evaluate against a
+    different environment.
     """
     from src.evaluation.evaluate_pusht import make_repeat_seeds
     from src.evaluation.pusht import (
@@ -331,6 +341,15 @@ def evaluate_agent_repeats(
         run_evaluation,
     )
 
+    env_identity = {
+        key: value
+        for key, value in (
+            ("env_id", env_id),
+            ("observation_resolution", observation_resolution),
+            ("fixed_target_block_success", fixed_target_block_success),
+        )
+        if value is not None
+    }
     results = []
     for repeat_seed in make_repeat_seeds(seed, repeats, episodes, seed_stride):
         config = PushTEvalConfig(
@@ -339,6 +358,7 @@ def evaluate_agent_repeats(
             seed_stride=seed_stride,
             max_episode_steps=max_episode_steps,
             block_start_radius=block_start_radius,
+            **env_identity,
         )
         results.append(run_evaluation(agent, config))
     return aggregate_evaluation_results(results)

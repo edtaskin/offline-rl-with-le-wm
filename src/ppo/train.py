@@ -49,6 +49,12 @@ CONTRACT_FIELDS = (
     "action_dim",
 )
 
+# Non-integer contract fields carried over from the BC stats. The latent
+# representation must match the BC checkpoint being loaded -- a projected BC
+# fed raw CLS latents silently produces garbage rather than failing -- so it is
+# taken from the stats rather than left to a CLI flag.
+STR_CONTRACT_FIELDS = ("latent_representation",)
+
 # Tiny overrides for --smoke: a couple of quick iterations end-to-end.
 SMOKE_OVERRIDES = dict(
     num_envs=2,
@@ -114,6 +120,7 @@ def _stats_contract(stats_path: str) -> dict:
     resolved_stats_path = resolve_artifact(stats_path)
     stats = torch.load(resolved_stats_path, map_location="cpu")
     overrides = {k: int(stats[k]) for k in CONTRACT_FIELDS if k in stats}
+    overrides.update({k: str(stats[k]) for k in STR_CONTRACT_FIELDS if k in stats})
     if overrides:
         print(f"Contract from {stats_path} ({resolved_stats_path}): {overrides}")
     return overrides

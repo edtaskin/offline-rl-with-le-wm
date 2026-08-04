@@ -60,7 +60,12 @@ class LatentChunkAgent:
         self.agent_type = agent_type
         self.encoder = encoder
         self.predict_chunk = predict_chunk
-        self.contract = {key: int(value) for key, value in contract.items()}
+        # Numeric shape fields are coerced; descriptive ones (latent_representation)
+        # are carried through as-is so a contract can name the feature space too.
+        self.contract = {
+            key: int(value) if isinstance(value, (int, float, bool)) else value
+            for key, value in contract.items()
+        }
         self.device = torch.device(device)
         self.deterministic = bool(deterministic)
         self.execution_mode = execution_mode
@@ -246,12 +251,26 @@ def load_ppo_components(checkpoint, device="auto", encoder=None):
             "action_dim",
         }
     }
+    # Pre-projection checkpoints carry neither key, so both fall back to the
+    # historical raw-CLS contract.
+    latent_representation = payload.get("contract", {}).get(
+        "latent_representation", config.get("latent_representation", LEWM_LATENT_RAW_CLS)
+    )
+    contract["latent_representation"] = latent_representation
     if encoder is None:
         encoder = LeWMEncoder.from_checkpoint(
             device=device,
             checkpoint_path=config.get("encoder_checkpoint"),
             latent_dim=contract["latent_dim"],
             normalization=config.get("image_normalization", LEWM_IMAGE_NORMALIZATION),
+            latent_representation=latent_representation,
+        )
+    elif getattr(encoder, "latent_representation", LEWM_LATENT_RAW_CLS) != latent_representation:
+        # The RQ1 budget curve shares one encoder across dozens of snapshots;
+        # a mismatched one would silently feed the policy the wrong space.
+        raise ValueError(
+            f"provided encoder is {getattr(encoder, 'latent_representation', None)!r} "
+            f"but checkpoint {checkpoint} expects {latent_representation!r}"
         )
     agent = build_latent_agent(
         encoder=encoder,

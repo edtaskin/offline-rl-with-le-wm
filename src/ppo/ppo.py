@@ -110,6 +110,7 @@ class LatentPPOTrainer:
                 self.device,
                 cfg.encoder_checkpoint,
                 latent_dim=cfg.latent_dim,
+                latent_representation=cfg.latent_representation,
             )
         self.encoder = encoder
         self.agent = build_latent_agent(
@@ -159,7 +160,6 @@ class LatentPPOTrainer:
         # cfg.eval_interval > 0, else the rolling window).
         self._best_success = -float("inf")
         self._second_best_success = -float("inf")
-        self._eval_env = None  # dedicated held-out env, built lazily on first eval
 
         run_stamp = datetime.now().strftime("%d%m%Y-%H%M%S")
         self.run_dir = Path(cfg.save_dir) / f"{cfg.exp_name}__seed{cfg.seed}" / run_stamp
@@ -440,6 +440,7 @@ class LatentPPOTrainer:
                 "latent_dim": self.cfg.latent_dim,
                 "hidden_dim": self.cfg.hidden_dim,
                 "action_dim": self.cfg.action_dim,
+                "latent_representation": self.cfg.latent_representation,
             },
         }
         if self.reward_norm is not None:
@@ -465,24 +466,19 @@ class LatentPPOTrainer:
 
     @torch.no_grad()
     def _evaluate_heldout(self) -> dict:
-        """Evaluate the in-memory agent through the canonical PushT runner."""
+        """Evaluate the in-memory agent through the canonical PushT protocol.
+
+        Routed through :func:`scripts.rq_common.evaluate_agent_repeats`, the same
+        helper the RQ evaluation scripts use, so a mid-run held-out number and a
+        reported one differ only in ``episodes``/``repeats`` -- never in how the
+        env is built or how seeds are laid out. Each repeat gets a fresh
+        canonical env (``make_evaluation_env``), so successive evals are not
+        affected by a shared env's carried-over RNG state.
+        """
+        from scripts.rq_common import evaluate_agent_repeats
         from src.evaluation.agents import PPOComponents, make_ppo_evaluation_agent
-        from src.evaluation.pusht import PushTEvalConfig, run_evaluation
 
         cfg = self.cfg
-        if self._eval_env is None:
-            self._eval_env = make_latent_env(
-                env_id=cfg.env_id,
-                seed=cfg.eval_seed,
-                idx=0,
-                max_episode_steps=cfg.max_episode_steps,
-                observation_resolution=cfg.observation_resolution,
-                record_stats=True,
-                fixed_target=True,
-                fixed_target_block_success=cfg.fixed_target_block_success,
-                block_start_near_goal=cfg.block_start_near_goal,
-                block_start_radius=cfg.block_start_radius,
-            )()
         contract = {
             "frame_stack": cfg.frame_stack,
             "frame_stride": cfg.frame_stride,
@@ -504,38 +500,44 @@ class LatentPPOTrainer:
         cpu_rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         try:
-            result = run_evaluation(
+            result = evaluate_agent_repeats(
                 adapter,
-                PushTEvalConfig(
-                    env_id=cfg.env_id,
-                    episodes=cfg.eval_episodes,
-                    seed=cfg.eval_seed,
-                    max_episode_steps=cfg.max_episode_steps,
-                    observation_resolution=cfg.observation_resolution,
-                    fixed_target_block_success=cfg.fixed_target_block_success,
-                    block_start_radius=(
-                        cfg.block_start_radius if cfg.block_start_near_goal else None
-                    ),
+                episodes=cfg.eval_episodes,
+                repeats=cfg.eval_repeats,
+                seed=cfg.eval_seed,
+                seed_stride=cfg.eval_seed_stride,
+                block_start_radius=(
+                    cfg.block_start_radius if cfg.block_start_near_goal else None
                 ),
-                env=self._eval_env,
+                max_episode_steps=cfg.max_episode_steps,
+                env_id=cfg.env_id,
+                observation_resolution=cfg.observation_resolution,
+                fixed_target_block_success=cfg.fixed_target_block_success,
             )
         finally:
             torch.set_rng_state(cpu_rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
-        # Selection is paid for in env steps too; see real_env_steps().
-        self._eval_env_steps += int(sum(episode.length for episode in result.episodes))
+        # Selection is paid for in env steps too; see real_env_steps(). Every
+        # repeat counts, which is why eval_repeats stays at 1 during training.
+        total_episodes = cfg.eval_episodes * cfg.eval_repeats
+        self._eval_env_steps += int(
+            sum(episode.length for repeat in result.results for episode in repeat.episodes)
+        )
         logger.info(
-            "Held-out eval | success %4.2f | len %5.1f | (%d eps, seed %d)",
+            "Held-out eval | success %4.2f | len %5.1f | (%d x %d eps, seed %d)",
             result.summary["success_rate"],
             result.summary["mean_length"],
+            cfg.eval_repeats,
             cfg.eval_episodes,
             cfg.eval_seed,
         )
         return {
             "success_rate": result.summary["success_rate"],
             "mean_length": result.summary["mean_length"],
-            "episodes": cfg.eval_episodes,
+            "episodes": total_episodes,
+            "repeats": cfg.eval_repeats,
+            "episodes_per_repeat": cfg.eval_episodes,
         }
 
     def _log_heldout(self, iteration: int, stats: dict) -> None:
@@ -678,8 +680,6 @@ class LatentPPOTrainer:
         )
         for env in self.envs:
             env.close()
-        if self._eval_env is not None:
-            self._eval_env.close()
 
     def _log(self, iteration: int, stats: dict) -> None:
         elapsed = max(time.time() - self.start_time, 1e-6)

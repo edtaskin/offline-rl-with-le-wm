@@ -124,6 +124,9 @@ def build_world_and_agent(args):
 
     device = resolve_device(args.device)
     world = LeWMDreamWorld(cfg, device)
+    # This gallery renders what the agent imagined, so frames are needed even
+    # when a projected-latent policy no longer routes through the decoder.
+    world.capture_frames = True
     # The policy must consume exactly the latents the dream world produces, from
     # the same frozen ViT, as it did during training.
     components = load_ppo_components(checkpoint, device, encoder=world.cls_encoder)

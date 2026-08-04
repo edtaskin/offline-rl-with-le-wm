@@ -11,10 +11,13 @@ onto the world model (history=3, frameskip=5). Per imagined step:
 2. the chunk is converted to the dataset action space, z-scored with dataset
    stats, and fed to ``wm.action_encoder`` + ``wm.predict`` to imagine the next
    *projected* latent (the space LeWM dynamics run in);
-3. the latent image decoder (``scripts/decoder/train_decoder_pusht.py``)
-   renders the imagined latent to an RGB frame, which is re-encoded to the raw
-   CLS latent the policy consumes -- the decoder bridges LeWM's projected
-   latent space back to the BC policy's input space;
+3. the imagined latent is handed to the policy. With a ``projected`` BC prior
+   this is direct: LeWM's training loss ties ``predict`` output to
+   ``projector(encoder(frame))``, which is the space that policy consumes. With
+   the historical ``raw_cls`` prior the latent image decoder
+   (``scripts/decoder/train_decoder_pusht.py``) renders it to an RGB frame that
+   is re-encoded to raw CLS -- a bridge that costs decoder reconstruction error
+   plus a ViT pass over synthetic frames on every imagined step;
 4. reward and success come from frozen probes/classifiers on the imagined
    projected latent: ``sparse`` = 1.0 on success, ``dense`` = sparse success
    plus learned time-to-success classifier shaping, and ``pose_dense`` = the
@@ -35,6 +38,7 @@ also published under hf.co/offline-rl-with-le-wm):
   (falls back to the converted ``lewm_object.ckpt`` in the swm cache)
 * expert dataset:    ``le-wm/models/datasets/pusht_expert_train.h5``
 * image decoder:     ``models/latent_decoder/pusht_lewm/decoder_lewm_pusht.pt``
+  (only for a ``raw_cls`` policy, or for frame diagnostics; loaded lazily)
 * state probes under ``models/probes/pusht_lewm/``: the ``objective_met``
   classifier (success + sparse reward) and/or the ``block_rel_objective``
   regression probe (distances, required for ``pose_dense`` reward)
@@ -83,6 +87,7 @@ from src.ppo.train import (
     _stats_contract,
 )
 from src.ppo.utils import RewardNormalizer, get_device, set_seed
+from src.representations.lewm import LEWM_LATENT_PROJECTED
 
 # The dataset stores absolute pointer targets; the env/BC/PPO action space is
 # SWM-relative: env target = agent_xy + action * PUSHT_ACTION_SCALE.
@@ -315,13 +320,24 @@ class LeWMDreamWorld:
         self.wm = _load_world_model(cfg, device)
         self.history_size = int(getattr(self.wm.predictor, "num_frames", 3))
 
-        self.decoder = _load_decoder(repo_path(cfg.decoder_checkpoint), device)
-        # Shared frozen ViT: raw CLS latents for the agent (and real-env eval);
-        # the WM's projector lifts the same CLS into the dynamics latent space.
+        # A projected-latent policy consumes exactly what ``wm.predict`` emits,
+        # so the decoder bridge drops off the policy path entirely. It stays
+        # available for diagnostics (scripts/rq2/dream_success_gallery.py) and
+        # is loaded lazily, so a projected run needs no decoder checkpoint.
+        self.policy_uses_projected = cfg.latent_representation == LEWM_LATENT_PROJECTED
+        self._decoder = None
+        self.capture_frames = not self.policy_uses_projected
+        # Shared frozen ViT, reused for real-env eval. The WM's own projector is
+        # handed over so the policy encoder and ``reset_env`` below lift CLS into
+        # the dynamics space with the same weights.
         # Pass the device explicitly: LeWMEncoder defaults to CPU and moves the
         # module it wraps, which would strand the WM's ViT off-device.
         self.cls_encoder = LeWMLatentEncoder(
-            self.wm.encoder, device=device, latent_dim=cfg.latent_dim
+            self.wm.encoder,
+            device=device,
+            latent_dim=cfg.latent_dim,
+            projector=self.wm.projector if self.policy_uses_projected else None,
+            latent_representation=cfg.latent_representation,
         )
 
         dataset_path = repo_path(cfg.dataset_path)
@@ -602,8 +618,9 @@ class LeWMDreamWorld:
     def reset_env(self, i: int) -> torch.Tensor:
         """Re-seed dream env ``i`` from a fresh ground-truth context window.
 
-        Returns the raw CLS latents of the context frames ``[context_steps, D]``
-        for the trainer to refill the agent's dilated history.
+        Returns the context frames' latents ``[context_steps, D]`` in whatever
+        space the policy consumes (raw CLS or projected), for the trainer to
+        refill the agent's dilated history.
         """
         cfg = self.cfg
         fs = cfg.wm_frameskip
@@ -622,8 +639,13 @@ class LeWMDreamWorld:
         pixels = self._h5["pixels"][idx]  # [C, H, W, 3] uint8
         frames = torch.from_numpy(pixels).permute(0, 3, 1, 2).to(self.device)
         with torch.no_grad():
-            cls = self.cls_encoder(frames)  # [C, D] raw CLS
-            emb = self.wm.projector(cls)  # [C, D] dynamics latent space
+            if self.policy_uses_projected:
+                # cls_encoder already applies the projector, so the context
+                # latents the WM needs are exactly what the agent consumes.
+                emb = obs = self.cls_encoder(frames)  # [C, D] dynamics space
+            else:
+                obs = self.cls_encoder(frames)  # [C, D] raw CLS
+                emb = self.wm.projector(obs)  # [C, D] dynamics latent space
 
         self._emb_hist[i].clear()
         for t in range(self.context_steps):
@@ -650,7 +672,7 @@ class LeWMDreamWorld:
             self._last_dense_reward[i] = 0.0
             self._last_dense_probs[i] = probs[0].detach().cpu().numpy()
         self._steps[i] = 0
-        return cls
+        return obs
 
     # ------------------------------------------------------------------ step
     @torch.no_grad()
@@ -691,13 +713,22 @@ class LeWMDreamWorld:
         for i in range(n):
             self._emb_hist[i].append(pred[i])
 
-        # Decoder bridge: imagined dynamics latent -> RGB frame -> the raw CLS
-        # latent the (BC-initialized) policy actually consumes.
-        frames = self.decoder(pred).clamp(0.0, 1.0)  # [n, 3, 224, 224]
-        cls = self.cls_encoder(frames)
-        # Kept for inspection only (scripts/rq2/dream_success_gallery.py renders
-        # the frames PPO believed were successes); training never reads these.
-        self.last_frames = frames
+        if self.policy_uses_projected:
+            # ``wm.predict`` already emits the space a projected-latent policy
+            # was trained on (LeWM's own loss ties it to projector(encoder(x))),
+            # so the imagined latent goes straight to the agent.
+            obs = pred
+            if self.capture_frames:
+                self.last_frames = self.decoder(pred).clamp(0.0, 1.0)
+        else:
+            # Decoder bridge: imagined dynamics latent -> RGB frame -> the raw
+            # CLS latent the (BC-initialized) policy actually consumes.
+            frames = self.decoder(pred).clamp(0.0, 1.0)  # [n, 3, 224, 224]
+            obs = self.cls_encoder(frames)
+            # Kept for inspection only (scripts/rq2/dream_success_gallery.py
+            # renders the frames PPO believed were successes); training never
+            # reads these.
+            self.last_frames = frames
         self.last_latent = pred
 
         # Reward/success are read from the imagined projected latent. The
@@ -756,12 +787,23 @@ class LeWMDreamWorld:
         truncated = (self._steps >= self._episode_steps) & ~terminated
 
         return (
-            cls,
+            obs,
             reward.cpu().numpy().astype(np.float64),
             terminated,
             truncated,
             state_dist.cpu().numpy(),
         )
+
+    @property
+    def decoder(self) -> nn.Module:
+        """Frozen latent image decoder, loaded on first use."""
+        if self._decoder is None:
+            self._decoder = _load_decoder(repo_path(self.cfg.decoder_checkpoint), self.device)
+        return self._decoder
+
+    @decoder.setter
+    def decoder(self, module: nn.Module) -> None:
+        self._decoder = module
 
     def close(self) -> None:
         self._h5.close()
@@ -838,7 +880,6 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
 
         self._best_success = -float("inf")
         self._second_best_success = -float("inf")
-        self._eval_env = None  # real env, built lazily by the inherited eval
 
         run_stamp = datetime.now().strftime("%d%m%Y-%H%M%S")
         self.run_dir = Path(cfg.save_dir) / f"{cfg.exp_name}__seed{cfg.seed}" / run_stamp

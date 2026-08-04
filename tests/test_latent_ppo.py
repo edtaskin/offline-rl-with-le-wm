@@ -496,6 +496,8 @@ def test_dream_dense_reward_adds_sparse_success():
     world.device = torch.device("cpu")
     world.wm = FakeWM()
     world.history_size = 1
+    world.policy_uses_projected = False
+    world.capture_frames = True
     world.decoder = nn.Identity()
     world.cls_encoder = nn.Identity()
     world.pose_probe = None
