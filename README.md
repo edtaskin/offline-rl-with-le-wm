@@ -85,15 +85,16 @@ starts around the same fixed target.
 ```bash
 python -m src.evaluation.evaluate_pusht \
   --agent-type bc \
-  --checkpoint hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc/pusht_latent_bc_best.pth \
-  --stats hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc/pusht_latent_bc_best_stats.pth \
+  --checkpoint hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best.pth  \
+  --stats hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best_stats.pth \
   --training-observation-resolution 224 \
+  --execution-mode open-loop \
   --block-start-radius 200 \
   --episodes 50 \
+    --seed 42 \
+  --repeats 3 \
   --max-episode-steps 300 \
-  --video \
-  --seed 42 \
-  --repeats 3
+  --video
 ```
 
 ## PPO 
@@ -125,8 +126,9 @@ checkpoint and agent type select the PPO adapter.
 python -m src.evaluation.evaluate_pusht \
   --agent-type ppo \
   --checkpoint hf://offline-rl-with-le-wm/ppo/best.pt \
-  --observation-resolution 96 \
-  --training-observation-resolution 96 \
+  --observation-resolution 224 \
+  --training-observation-resolution 224 \
+  --execution-mode open-loop \
   --block-start-radius 200 \
   --episodes 50 \
   --max-episode-steps 300 \
