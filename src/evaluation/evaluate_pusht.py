@@ -8,12 +8,12 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.envs import PUSHT_FIXED_TARGET_POSE
+from src.envs import PUSHT_FIXED_TARGET_POSE, PUSHT_RENDER_SHAPE
 from src.evaluation.agents import make_bc_evaluation_agent, make_ppo_evaluation_agent
 from src.evaluation.pusht import (
     PushTEvalConfig,
-    aggregate_evaluation_results,
-    run_evaluation,
+    make_repeat_seeds,
+    run_repeated_evaluation,
 )
 
 
@@ -62,6 +62,23 @@ def build_parser():
         "block starts, where consecutive seeds collide (see PushTEvalConfig)",
     )
     parser.add_argument("--max-episode-steps", type=int, default=300)
+    parser.add_argument(
+        "--observation-resolution",
+        type=int,
+        default=PUSHT_RENDER_SHAPE[0],
+        help="square policy-observation resolution (default: 224)",
+    )
+    parser.add_argument(
+        "--training-observation-resolution",
+        type=int,
+        default=None,
+        help="native training resolution for a legacy checkpoint that does not record it",
+    )
+    parser.add_argument(
+        "--allow-resolution-mismatch",
+        action="store_true",
+        help="intentionally evaluate at a resolution different from training",
+    )
     parser.add_argument(
         "--fixed-target-pose",
         type=float,
@@ -174,6 +191,36 @@ def evaluate_from_args(args):
         agent = make_ppo_evaluation_agent(
             deterministic=not args.stochastic,
             **agent_kwargs,
+        )
+    recorded_resolution = agent.metadata.get("training_observation_resolution")
+    supplied_resolution = args.training_observation_resolution
+    if supplied_resolution is not None and supplied_resolution < 1:
+        raise ValueError("training_observation_resolution must be positive")
+    if (
+        recorded_resolution is not None
+        and supplied_resolution is not None
+        and int(recorded_resolution) != int(supplied_resolution)
+    ):
+        raise ValueError(
+            "--training-observation-resolution conflicts with checkpoint metadata: "
+            f"argument={supplied_resolution}, checkpoint={recorded_resolution}"
+        )
+    training_resolution = recorded_resolution or supplied_resolution
+    if training_resolution is None:
+        raise ValueError(
+            "checkpoint does not record its training observation resolution; pass "
+            "--training-observation-resolution for this legacy checkpoint"
+        )
+    agent.metadata["training_observation_resolution"] = int(training_resolution)
+    if (
+        int(training_resolution) != int(args.observation_resolution)
+        and not args.allow_resolution_mismatch
+    ):
+        raise ValueError(
+            "evaluation observation resolution does not match model training: "
+            f"model={int(training_resolution)}, evaluation={args.observation_resolution}. "
+            "Pass the model's training resolution, or use "
+            "--allow-resolution-mismatch for an intentional transfer experiment."
         )
     run_dir = create_run_directory(
         args.output_root,

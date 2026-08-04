@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from typing import Any, Protocol
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import Any, Callable, Protocol
 
 import gymnasium as gym
 import numpy as np
 
-from src.envs import PUSHT_FIXED_TARGET_POSE, make_pusht_env
+from src.envs import PUSHT_FIXED_TARGET_POSE, PUSHT_RENDER_SHAPE, make_pusht_env
 from src.evaluation.video import write_episode_video
 
 
@@ -43,6 +44,7 @@ class PushTEvalConfig:
     # measured to give fully distinct start states.
     seed_stride: int = 1
     max_episode_steps: int = 300
+    observation_resolution: int = PUSHT_RENDER_SHAPE[0]
     fixed_target_pose: tuple[float, float, float] = tuple(PUSHT_FIXED_TARGET_POSE.tolist())
     fixed_target_block_success: bool = True
     fixed_target_max_reset_attempts: int = 100
@@ -53,6 +55,7 @@ class PushTEvalConfig:
     video_fps: int = 10
     video_resolution: int = 512
     capture_traces: bool = False
+    allow_resolution_mismatch: bool = False
 
     def validate(self):
         if self.episodes < 1:
@@ -61,6 +64,8 @@ class PushTEvalConfig:
             raise ValueError("seed_stride must be at least 1")
         if self.max_episode_steps < 1:
             raise ValueError("max_episode_steps must be at least 1")
+        if self.observation_resolution < 1:
+            raise ValueError("observation_resolution must be positive")
         if self.block_start_radius is not None and self.block_start_radius < 0:
             raise ValueError("block_start_radius must be non-negative")
         if self.record_video and self.video_fps <= 0:
@@ -180,6 +185,7 @@ def make_evaluation_env(config: PushTEvalConfig):
         fixed_target_agent_block_coef=config.agent_block_coef,
         block_start_near_goal=config.block_start_radius is not None,
         block_start_radius=config.block_start_radius or 0.0,
+        resolution=config.observation_resolution,
     )
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env.action_space.seed(config.seed)
@@ -296,8 +302,70 @@ def aggregate_evaluation_results(results):
     )
 
 
+def make_repeat_seeds(seed, repeats, episodes):
+    """Derive deterministic, non-overlapping episode-seed ranges."""
+
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1")
+    if episodes < 1:
+        raise ValueError("episodes must be at least 1")
+    return [int(seed) + repeat * int(episodes) for repeat in range(int(repeats))]
+
+
+def run_repeated_evaluation(
+    agent: EvaluationAgent,
+    config: PushTEvalConfig,
+    *,
+    repeats=3,
+    env_factory: Callable[[PushTEvalConfig], gym.Env] | None = None,
+):
+    """Run and pool repeated evaluations using one canonical seed protocol.
+
+    ``env_factory`` lets callers supply an environment variant while retaining
+    the exact same repeat construction, episode loop, and aggregation.
+    """
+
+    config.validate()
+    repeat_seeds = make_repeat_seeds(config.seed, repeats, config.episodes)
+    results = []
+    for repeat, repeat_seed in enumerate(repeat_seeds):
+        video_dir = (
+            Path(config.video_dir)
+            / f"repeat_{repeat:02d}_seed_{repeat_seed}"
+        )
+        repeat_config = replace(
+            config,
+            seed=repeat_seed,
+            video_dir=str(video_dir),
+        )
+        print(
+            f"Repeat {repeat + 1}/{repeats} | agent={agent.agent_type} | "
+            f"fixed-target episodes={repeat_config.episodes} | "
+            f"seeds={repeat_seed}..{repeat_seed + repeat_config.episodes - 1}"
+        )
+        env = env_factory(repeat_config) if env_factory is not None else None
+        try:
+            results.append(run_evaluation(agent, repeat_config, env=env))
+        finally:
+            if env is not None:
+                env.close()
+    return aggregate_evaluation_results(results)
+
+
 def run_evaluation(agent: EvaluationAgent, config: PushTEvalConfig, env=None):
     config.validate()
+    training_resolution = agent.metadata.get("training_observation_resolution")
+    if (
+        training_resolution is not None
+        and int(training_resolution) != int(config.observation_resolution)
+        and not config.allow_resolution_mismatch
+    ):
+        raise ValueError(
+            "evaluation observation resolution does not match model training: "
+            f"model={int(training_resolution)}, evaluation={config.observation_resolution}. "
+            "Use the training resolution, or explicitly allow the mismatch for a "
+            "resolution-robustness experiment."
+        )
     owns_env = env is None
     env = make_evaluation_env(config) if env is None else env
     episode_results = []

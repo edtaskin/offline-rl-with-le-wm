@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from src.envs import PUSHT_RENDER_SHAPE
+
 
 @dataclass
 class LatentConfig:
@@ -25,6 +27,7 @@ class LatentConfig:
     # ----- environment -----
     env_id: str = "swm/PushT-v1"
     max_episode_steps: int = 300
+    observation_resolution: int = PUSHT_RENDER_SHAPE[0]
     fixed_target: bool = False
     fixed_target_block_success: bool = True
     # Reward shaping (fixed_target only): subtract agent_block_coef * ||agent-block||
@@ -125,6 +128,8 @@ class LatentConfig:
     chunk_gamma: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        if self.observation_resolution < 1:
+            raise ValueError("observation_resolution must be positive")
         self.batch_size = int(self.num_envs * self.num_chunks)
         self.minibatch_size = max(1, int(self.batch_size // self.num_minibatches))
         steps_per_iter = self.batch_size * self.action_chunk_size

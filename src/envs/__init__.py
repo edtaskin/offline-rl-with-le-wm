@@ -1,5 +1,6 @@
 from src.envs.pusht_wrappers import (
     PUSHT_FIXED_TARGET_POSE,
+    PUSHT_RENDER_SHAPE,
     PushTAlignSampledGoalToFixedTargetWrapper,
     PushTBlockStartNearGoalWrapper,
     PushTGoalPoseFromStateWrapper,
@@ -12,6 +13,7 @@ from src.envs.pusht_wrappers import (
 
 __all__ = [
     "PUSHT_FIXED_TARGET_POSE",
+    "PUSHT_RENDER_SHAPE",
     "PushTAlignSampledGoalToFixedTargetWrapper",
     "PushTBlockStartNearGoalWrapper",
     "PushTGoalPoseFromStateWrapper",

@@ -32,6 +32,7 @@ checkpoint:
 python -m src.bc.train_bc_latent \
   --data_path data/expert_trajectories/pusht_expert_224.npz \
   --checkpoint_path runs/bc/pusht_latent_bc.pth \
+  --observation-resolution 224 \
   --epochs 100 \
   --batch_size 64 \
   --lr 0.001 \
@@ -57,6 +58,16 @@ episode videos are saved in repeat-specific directories under `videos/`. Use
 `--output-root` to change the parent directory and `--run-name` to append a
 readable label. Set `--repeats 1` for a single evaluation.
 
+Policy observations render at 224x224 by default. This resolution is stored in
+`metrics.json` as `config.observation_resolution`; pass
+`--observation-resolution 96` to reproduce the earlier low-resolution
+evaluation protocol. `--video-resolution` controls only saved-video scaling
+and does not affect policy inputs. New BC stats and PPO checkpoints record their
+native training observation resolution, and evaluation rejects a mismatch by
+default. For older artifacts that predate this metadata, provide
+`--training-observation-resolution`. Use `--allow-resolution-mismatch` only for
+an intentional resolution-transfer experiment.
+
 Evaluate BC on the fixed-target task. Passing `--block-start-radius 200`
 matches the PPO training start distribution; omit it for unrestricted block
 starts around the same fixed target.
@@ -66,6 +77,7 @@ python -m src.evaluation.evaluate_pusht \
   --agent-type bc \
   --checkpoint hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc.pth \
   --stats hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc_stats.pth \
+  --training-observation-resolution 224 \
   --block-start-radius 200 \
   --episodes 50 \
   --max-episode-steps 300 \
@@ -86,6 +98,7 @@ python src/ppo/train.py \
   --frame_stack 3 \
   --frame_stride 5 \
   --action_chunk_size 5 \
+  --observation-resolution 224 \
   --fixed_target \
   --log_interval 10 \
   --save_interval 10 \
@@ -102,6 +115,8 @@ checkpoint and agent type select the PPO adapter.
 python -m src.evaluation.evaluate_pusht \
   --agent-type ppo \
   --checkpoint hf://offline-rl-with-le-wm/ppo/best.pt \
+  --observation-resolution 96 \
+  --training-observation-resolution 96 \
   --block-start-radius 200 \
   --episodes 50 \
   --max-episode-steps 300 \
