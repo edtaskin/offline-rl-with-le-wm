@@ -1,13 +1,18 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import gymnasium as gym
 import numpy as np
 import torch
 
-from src.evaluation.agents import LatentChunkAgent, bc_training_observation_resolution
+from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
+from src.evaluation.agents import (
+    LatentChunkAgent,
+    bc_training_observation_resolution,
+    load_bc_components,
+)
 from src.envs import PUSHT_RENDER_SHAPE
 from src.evaluation.evaluate_pusht import (
     _write_metrics,
@@ -123,7 +128,7 @@ class EvaluationRunnerTests(unittest.TestCase):
                     return_value=agent,
                 ),
                 patch(
-                    "src.evaluation.pusht.run_evaluation",
+                    "src.evaluation.evaluate_pusht.run_evaluation",
                     side_effect=evaluate_fake_env,
                 ),
             ):
@@ -389,6 +394,45 @@ class LatentChunkAgentTests(unittest.TestCase):
         for _ in range(3):
             agent.act(observation, {})
         self.assertEqual(len(calls), 3)
+
+    def test_bc_loader_restores_projected_latent_contract(self):
+        with TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            checkpoint = root / "policy.pth"
+            stats_path = root / "policy_stats.pth"
+            policy = LatentBCPolicy(
+                latent_dim=3,
+                frame_stack=1,
+                action_dim=2,
+                hidden_dim=4,
+                action_chunk_size=1,
+            )
+            torch.save(policy.state_dict(), checkpoint)
+            torch.save(
+                {
+                    "latent_dim": 3,
+                    "frame_stack": 1,
+                    "action_dim": 2,
+                    "hidden_dim": 4,
+                    "action_chunk_size": 1,
+                    "latent_representation": "projected",
+                    "image_normalization": "imagenet",
+                },
+                stats_path,
+            )
+            frozen_encoder = MagicMock(spec=torch.nn.Module)
+            with patch(
+                "src.evaluation.agents.LeWMEncoder.from_checkpoint",
+                return_value=frozen_encoder,
+            ) as load_encoder:
+                components = load_bc_components(
+                    str(checkpoint), str(stats_path), device="cpu"
+                )
+
+            self.assertIs(components.encoder, frozen_encoder)
+            self.assertEqual(
+                load_encoder.call_args.kwargs["latent_representation"], "projected"
+            )
 
 if __name__ == "__main__":
     unittest.main()

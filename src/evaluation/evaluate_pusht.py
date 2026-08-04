@@ -12,8 +12,8 @@ from src.envs import PUSHT_FIXED_TARGET_POSE, PUSHT_RENDER_SHAPE
 from src.evaluation.agents import make_bc_evaluation_agent, make_ppo_evaluation_agent
 from src.evaluation.pusht import (
     PushTEvalConfig,
-    make_repeat_seeds,
-    run_repeated_evaluation,
+    aggregate_evaluation_results,
+    run_evaluation,
 )
 
 
@@ -238,6 +238,7 @@ def evaluate_from_args(args):
             seed=repeat_seed,
             seed_stride=args.seed_stride,
             max_episode_steps=args.max_episode_steps,
+            observation_resolution=args.observation_resolution,
             fixed_target_pose=tuple(args.fixed_target_pose),
             fixed_target_block_success=args.fixed_target_block_success,
             fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
@@ -248,6 +249,7 @@ def evaluate_from_args(args):
             video_fps=args.video_fps,
             video_resolution=args.video_resolution,
             capture_traces=args.capture_traces,
+            allow_resolution_mismatch=args.allow_resolution_mismatch,
         )
         print(
             f"Repeat {repeat + 1}/{args.repeats} | agent={args.agent_type} | "
