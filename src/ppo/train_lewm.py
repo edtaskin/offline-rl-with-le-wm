@@ -267,45 +267,15 @@ class _StateProbe(nn.Module):
 
 
 def _load_world_model(cfg: DreamConfig, device: torch.device) -> nn.Module:
-    """Load the full (frozen) LeWM world model.
+    """Load the full (frozen) LeWM world model for this run's config."""
+    from src.representations.lewm import load_lewm_world_model
 
-    Tries ``swm.wm.utils.load_pretrained`` first (the loading path the decoder
-    and probe scripts use). On transformers >= 5 the HF ``weights.pt`` fails
-    its strict load because the ViT module names changed; in that case fall
-    back to the converted object checkpoint, which
-    ``scripts/download_lewm_checkpoint.py`` saves with the keys remapped --
-    identical weights either way.
-    """
-    import stable_worldmodel as swm
-
-    try:
-        wm = swm.wm.utils.load_pretrained(
-            cfg.wm_checkpoint, cache_dir=str(repo_path(cfg.wm_cache_dir))
-        )
-    except (RuntimeError, FileNotFoundError) as exc:
-        from src.ppo.lewm_encoder import default_lewm_checkpoint_path
-        from src.representations.lewm import _ensure_lewm_source_path
-
-        obj_path = default_lewm_checkpoint_path()
-        if not obj_path.exists():
-            raise FileNotFoundError(
-                f"Could not load LeWM weights via load_pretrained ({exc}) and no "
-                f"object checkpoint at {obj_path}. Run "
-                "`python -m scripts.download_lewm_checkpoint` first."
-            ) from exc
-        logger.warning(
-            "load_pretrained('%s') failed (%s); falling back to the converted "
-            "object checkpoint %s",
-            cfg.wm_checkpoint,
-            type(exc).__name__,
-            obj_path,
-        )
-        _ensure_lewm_source_path()
-        wm = torch.load(obj_path, map_location="cpu", weights_only=False)
-
-    wm = wm.to(device).eval()
-    wm.requires_grad_(False)
-    return wm
+    return load_lewm_world_model(
+        cfg.wm_checkpoint,
+        cache_dir=repo_path(cfg.wm_cache_dir),
+        device=device,
+        logger=logger,
+    )
 
 
 def _load_decoder(path: Path, device: torch.device) -> nn.Module:
@@ -490,6 +460,13 @@ class LeWMDreamWorld:
         self._act_hist = [deque(maxlen=self.history_size) for _ in range(n)]
         self._agent_pos = torch.zeros((n, 2), device=device)
         self._steps = np.zeros(n, dtype=np.int64)
+        # Inspection-only state, written by reset_env/step and never read by
+        # training: the dataset provenance of each env's current dream episode,
+        # and the most recent decoded frames / latents / probe probabilities.
+        self.last_anchor: list[dict | None] = [None] * n
+        self.last_frames: torch.Tensor | None = None
+        self.last_latent: torch.Tensor | None = None
+        self.last_success_prob: torch.Tensor | None = None
 
         # Dense chunk reward ~ within-chunk discounted sum of the per-step
         # reward, matching the real trainer's sum_j gamma**j r_j scale.
@@ -630,7 +607,15 @@ class LeWMDreamWorld:
         """
         cfg = self.cfg
         fs = cfg.wm_frameskip
-        _, anchor = self._anchors[self._rng.integers(len(self._anchors))]
+        episode, anchor = self._anchors[self._rng.integers(len(self._anchors))]
+        # Remember where this dream episode was seeded from. Training ignores it,
+        # but grounding an imagined rollout against the simulator (see
+        # scripts/rq2/dream_success_gallery.py) needs the exact start state.
+        self.last_anchor[i] = {
+            "episode": int(episode),
+            "row": int(anchor),
+            "state": np.asarray(self._h5["state"][int(anchor)], dtype=np.float64),
+        }
         start = int(anchor) - (self.context_steps - 1) * fs
         idx = start + np.arange(self.context_steps) * fs
 
@@ -710,6 +695,10 @@ class LeWMDreamWorld:
         # latent the (BC-initialized) policy actually consumes.
         frames = self.decoder(pred).clamp(0.0, 1.0)  # [n, 3, 224, 224]
         cls = self.cls_encoder(frames)
+        # Kept for inspection only (scripts/rq2/dream_success_gallery.py renders
+        # the frames PPO believed were successes); training never reads these.
+        self.last_frames = frames
+        self.last_latent = pred
 
         # Reward/success are read from the imagined projected latent. The
         # objective_met classifier decides success when available, falling back
@@ -726,6 +715,7 @@ class LeWMDreamWorld:
         else:
             success_prob = None
             success = (pos_dist < cfg.success_pos_tol) & (angle_dist < cfg.success_angle_tol)
+        self.last_success_prob = success_prob
 
         if cfg.reward_mode in ("sparse", "dense"):
             reward = success.float()
@@ -953,6 +943,17 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
             "selection": self.cfg.selection,
             "dream_success": dream["success_rate"] if dream else None,
             "real_success": real["success_rate"] if real else None,
+            # Episode lengths, in predictor steps (dream) and env steps (real).
+            # The imagined one is how deep into the horizon the probe is actually
+            # being trusted, which is what the RQ2 false-positive-vs-horizon
+            # curve has to be read against.
+            "dream_length_steps": dream["mean_length"] if dream else None,
+            "dream_length_env_steps": (
+                dream["mean_length"] * self.cfg.wm_frameskip if dream else None
+            ),
+            "real_length_env_steps": real["mean_length"] if real else None,
+            "dream_episode_steps": self.cfg.dream_eval_steps or self.cfg.dream_episode_steps,
+            "wm_frameskip": self.cfg.wm_frameskip,
         }
         with (self.run_dir / "selection_log.jsonl").open("a", encoding="utf-8") as file:
             file.write(json.dumps(row) + "\n")

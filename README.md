@@ -109,3 +109,111 @@ python -m src.evaluation.evaluate_pusht \
   --repeats 3 \
   --video
 ```
+
+## RQ1: can policy improvement happen inside the world model?
+
+`src/ppo/train_lewm.py` runs the same chunk-level latent PPO as `src/ppo/ppo.py`,
+but rolls out inside LeWM instead of the simulator: expert data supplies episode
+starts, the frozen world model supplies dynamics, the decoder bridges back to the
+policy's latent space, and a frozen probe supplies reward and success. No
+`env.step` is called.
+
+Two things make "zero environment interaction" a checkable claim rather than a
+description:
+
+* **Interaction is counted.** Every checkpoint records `env_steps_consumed`
+  (`train_env_steps + eval_env_steps`). Held-out evaluation counts, because
+  picking `best.pt` by real-env success is interaction even though it trains
+  nothing. Dream runs report training steps as 0 by construction.
+* **Selection can be interaction-free.** `--selection dream` ranks checkpoints by
+  imagined success on expert episodes held out at *episode* granularity
+  (`--dream_val_fraction`), so `best.pt` is chosen without a simulator. Use
+  `--selection real` for the interaction-paying contrast, and `final.pt` as the
+  no-selection control.
+
+Train one dream agent whose entire interaction budget is zero:
+
+```bash
+python -m src.ppo.train_lewm \
+  --exp_name rq1_dream_ppo --seed 1 \
+  --fixed_target --reward_mode sparse \
+  --block_start_near_goal --block_start_radius 200 \
+  --total_timesteps 1000000 --num_envs 8 --num_chunks 64 \
+  --eval_interval 0 \
+  --selection dream --dream_eval_interval 25 --dream_eval_episodes 96 \
+  --snapshot_interval 25
+```
+
+`--snapshot_interval` keeps permanent `snapshot_step<env_steps>_it<iteration>.pt`
+checkpoints; unlike `latest.pt` they are never overwritten, which is what makes an
+interaction-budget curve possible after the fact. It applies to `src/ppo/train.py`
+too.
+
+### Running the RQ1 campaign
+
+Three matched seeds per agent, one evaluation protocol, then the table, the
+success figure and the interaction-budget curve:
+
+```bash
+bash scripts/rq1/run_campaign.sh --seeds "1 2 3"   # trains real-env PPO and dream PPO
+python -m scripts.rq1.evaluate_grid --seeds 1 2 3  # canonical eval, 3 repeats x 50 episodes
+python -m scripts.rq1.budget_curve  --seeds 1 2 3  # real-PPO snapshots vs env steps
+python -m scripts.rq1.report                       # table.md + figures + summary.json
+```
+
+`run_campaign.sh` is the reference training command with `--snapshot_interval 10`
+added on the real-PPO side — without step-tagged snapshots there is no budget
+curve to draw. Training is not resumable, but evaluation is: both evaluation
+scripts append to `runs/rq1/*.jsonl` and skip checkpoints already scored under the
+same protocol, so an interrupted campaign continues where it stopped.
+
+`evaluate_grid.py` scores three checkpoints per PPO run, which is what makes the
+selection story explicit:
+
+| variant | what selected it | interaction it required |
+|---|---|---|
+| `final` | nothing — the last checkpoint | training only (0 for dream PPO) |
+| `best` | the run's own `--selection` rule | 0 for `--selection dream` |
+| `best_real_sel` | real held-out success, reconstructed post-hoc from `selection_log.jsonl` | training + every eval step up to that checkpoint |
+
+`report.py` reports **required** env steps, not merely consumed ones: a dream run
+launched with `--record-real-eval` also spends simulator steps, but those are RQ2
+instrumentation that never feeds selection, so they are listed separately as
+diagnostic rather than charged to the claim.
+
+## RQ2: is the imagined reward trustworthy?
+
+The dream reward *and* the dream episode's termination both come from one frozen
+probe reading a latent the simulator never corrects. That is the textbook setup
+for model exploitation, and the run is already instrumented to measure it — three
+scripts, one per piece of evidence:
+
+```bash
+# 1. optimism: imagined vs real held-out success, same weights, same x-axis
+python -m scripts.rq2.optimism_gap --seeds 1 2 3
+
+# 2. trust vs depth: probe false-positive rate over a 5 -> 100 env-step horizon
+python -m scripts.rq2.probe_horizon --seeds 1 2 3
+
+# 3. the frames PPO believed were successes, checked against the simulator
+python -m scripts.rq2.dream_success_gallery --seed 1 --episodes 96 --verify-in-sim
+```
+
+* **`optimism_gap.py`** needs `--record-real-eval` on the dream run: the trainer
+  then writes both metrics into `selection_log.jsonl` at the same cadence for the
+  same weights. Reports the level gap, the rank agreement (Spearman ρ), and the
+  real success given up by selecting on the imagined metric.
+* **`probe_horizon.py`** resolves the `objective_met` classifier exactly the way
+  `LeWMDreamWorld` does and pins `scripts/probes/probe_rollouts_pusht.py` to that
+  file, so the curve describes the probe PPO actually optimized against. It plots
+  the imagined false-positive rate against the *encoded ground-truth* rate, which
+  separates probe error from world-model drift, and marks the horizon the agent
+  actually lives in.
+* **`dream_success_gallery.py`** rolls the trained policy in the dream, catches
+  probe-declared successes, and decodes the latent the probe made that call on.
+  `--verify-in-sim` replays the same action chunks in the simulator from the same
+  dataset start state, turning "these look wrong" into a hallucination rate. The
+  replay is open-loop by design — the question is whether the *imagined
+  trajectory* was real, not how good the policy is (that is RQ1's job) — and its
+  `mean_anchor_pixel_error` reports how exactly the simulator reproduced the
+  dream's start frame, so an unreliable verdict is visible rather than silent.

@@ -196,7 +196,14 @@ def load_bc_components(checkpoint, stats_path=None, device="auto"):
     return BCComponents(encoder=encoder, policy=policy, contract=contract, stats=stats)
 
 
-def load_ppo_components(checkpoint, device="auto"):
+def load_ppo_components(checkpoint, device="auto", encoder=None):
+    """Load a PPO checkpoint into an evaluable agent.
+
+    ``encoder`` lets a caller reuse an already-built frozen ViT across many
+    checkpoints from the same run (the RQ1 budget curve evaluates dozens of
+    snapshots); it must match ``contract['latent_dim']``. Left as ``None`` the
+    encoder is rebuilt from the checkpoint's own config, as before.
+    """
     device = resolve_device(device)
     checkpoint_path = resolve_artifact(checkpoint)
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -214,12 +221,13 @@ def load_ppo_components(checkpoint, device="auto"):
             "action_dim",
         }
     }
-    encoder = LeWMEncoder.from_checkpoint(
-        device=device,
-        checkpoint_path=config.get("encoder_checkpoint"),
-        latent_dim=contract["latent_dim"],
-        normalization=config.get("image_normalization", LEWM_IMAGE_NORMALIZATION),
-    )
+    if encoder is None:
+        encoder = LeWMEncoder.from_checkpoint(
+            device=device,
+            checkpoint_path=config.get("encoder_checkpoint"),
+            latent_dim=contract["latent_dim"],
+            normalization=config.get("image_normalization", LEWM_IMAGE_NORMALIZATION),
+        )
     agent = build_latent_agent(
         encoder=encoder,
         latent_dim=contract["latent_dim"],

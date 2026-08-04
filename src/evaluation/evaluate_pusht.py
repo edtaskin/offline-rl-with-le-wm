@@ -216,7 +216,11 @@ def evaluate_from_args(args):
 
 
 def _save_and_track_result(args, result, run_dir):
-    _write_metrics(result, run_dir)
+    metrics_path = _write_metrics(result, run_dir)
+    # Expose where the metrics landed so programmatic callers (the RQ campaign
+    # scripts) can reference the artifact they just produced.
+    result.run_dir = str(run_dir)
+    result.metrics_path = str(metrics_path)
     if args.wandb:
         import wandb
 

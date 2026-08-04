@@ -52,6 +52,49 @@ def lewm_preprocessing_metadata(normalization=LEWM_IMAGE_NORMALIZATION):
     }
 
 
+def load_lewm_world_model(
+    checkpoint="hf_pusht/weights.pt",
+    cache_dir=None,
+    device="cpu",
+    logger=None,
+) -> nn.Module:
+    """Load the full (frozen) LeWM world model: encoder, projector, predictor.
+
+    Tries ``swm.wm.utils.load_pretrained`` first, the loading path the decoder
+    and probe scripts were written against. On transformers >= 5 the published
+    ``weights.pt`` fails its strict load because the ViT submodule names changed
+    (``encoder.encoder.layer.N.attention.attention.query`` became
+    ``encoder.layers.N.attention.q_proj``); in that case fall back to the
+    converted object checkpoint that ``scripts/download_lewm_checkpoint.py``
+    saves with the keys remapped. The weights are identical either way.
+    """
+    swm = load_stable_worldmodel()
+    cache_dir = str(cache_dir or Path(__file__).resolve().parents[2] / "le-wm/models")
+    try:
+        model = swm.wm.utils.load_pretrained(checkpoint, cache_dir=cache_dir)
+    except (RuntimeError, FileNotFoundError) as exc:
+        object_path = default_lewm_checkpoint_path()
+        if not object_path.exists():
+            raise FileNotFoundError(
+                f"Could not load LeWM weights via load_pretrained ({exc}) and no "
+                f"object checkpoint at {object_path}. Run "
+                "`python -m scripts.download_lewm_checkpoint` first."
+            ) from exc
+        message = (
+            f"load_pretrained({checkpoint!r}) failed ({type(exc).__name__}); "
+            f"falling back to the converted object checkpoint {object_path}"
+        )
+        if logger is not None:
+            logger.warning("%s", message)
+        else:
+            print(f"warning: {message}")
+        model = torch.load(object_path, map_location="cpu", weights_only=False)
+
+    model = model.to(device).eval()
+    model.requires_grad_(False)
+    return model
+
+
 def load_lewm_encoder(device="cpu", checkpoint_path=None) -> nn.Module:
     load_stable_worldmodel()
     checkpoint_path = Path(checkpoint_path or default_lewm_checkpoint_path())

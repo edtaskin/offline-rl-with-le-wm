@@ -1,293 +1,279 @@
-"""Evaluate every RQ1 checkpoint under one fixed protocol, resumably.
+"""RQ1 headline table: BC vs real-env PPO vs dream PPO, over training seeds.
 
-RQ1 asks whether policy improvement can happen entirely inside the world model.
-Answering it means putting BC, real-env PPO and dream PPO on exactly the same
-evaluator (``src.evaluation.evaluate_pusht``) and recording, next to each
-success rate, the number of real ``env.step`` calls that checkpoint cost --
-including the ones spent selecting it.
+Every number is produced by the canonical evaluator,
+``python -m src.evaluation.evaluate_pusht --repeats 3 --episodes 50``, on the
+start-state distribution the agents were trained on
+(``--block-start-radius 200``). Three repeats with non-overlapping seed ranges
+give 150 episodes per checkpoint; the spread across *training* seeds is reported
+separately by ``scripts/rq1/report.py``.
 
-Each checkpoint is evaluated through the canonical entry point, so results are
-identical to running that module by hand; this script only adds the grid, the
-interaction-budget bookkeeping, and a ``results.jsonl`` ledger it can resume
-from (a full grid is hours of simulation, and interrupting it is normal).
+The point of RQ1 is not only "how good", it is "bought with how much environment
+interaction", so each row also carries the interaction budget recorded inside the
+checkpoint: rollout steps plus the steps spent on real-env checkpoint selection.
 
-Examples::
+Three checkpoint variants per PPO run make the selection story explicit:
 
-    # headline table: one row per agent x training seed
-    python -m scripts.rq1.evaluate_grid \
-        --bc hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc.pth \
-        --run real-ppo=runs/latent_ppo_pusht_sparse_circle__seed1/14072026-202921 \
-        --run dream-ppo=runs/latent_ppo_pusht_lewm_dream__seed1/16072026-144748 \
-        --checkpoints best final
+* ``final``          -- the last checkpoint. No selection at all, so its budget is
+                        purely training. For dream PPO this is the honest,
+                        genuinely interaction-free number.
+* ``best``           -- ``best.pt``, selected by whatever ``--selection`` the run
+                        used (``dream`` for the dream runs = zero env steps,
+                        held-out real success for the real runs = extra env steps).
+* ``best_real_sel``  -- (dream runs only) the snapshot that the *real* held-out
+                        metric would have picked, reconstructed from
+                        ``selection_log.jsonl``. This is the contrast that shows
+                        what interaction-free selection gives up -- and it is not
+                        an interaction-free number.
 
-    # interaction-budget curve: every step-tagged snapshot of a real-PPO run
-    python -m scripts.rq1.evaluate_grid \
-        --run real-ppo=runs/latent_ppo_pusht_sparse_circle__seed2/<stamp> \
-        --checkpoints snapshots
+Usage::
+
+    python -m scripts.rq1.evaluate_grid --seeds 1 2 3
+    python -m scripts.rq1.evaluate_grid --seeds 1 2 3 --variants final --no-bc
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import re
+import sys
 from pathlib import Path
 
-import torch
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from src.evaluation.evaluate_pusht import build_parser as build_eval_parser
-from src.evaluation.evaluate_pusht import evaluate_from_args
+from scripts.rq_common import (
+    CANONICAL_EVAL,
+    checkpoint_budget,
+    find_run_dir,
+    read_jsonl,
+    read_selection_log,
+    repo_path,
+    run_canonical_eval,
+    snapshot_checkpoints,
+    upsert_jsonl,
+)
+
+BC_CHECKPOINT = "hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc.pth"
+BC_STATS = "hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc_stats.pth"
+
+# Identifies one row in results.jsonl; a re-evaluation replaces its predecessor.
+RESULT_KEY = ("method", "variant", "seed")
 
 
-DEFAULT_LEDGER = "runs/rq1/results.jsonl"
-DEFAULT_BC_STATS = "hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc_stats.pth"
-
-
-def build_parser():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--real-exp", default="latent_ppo_pusht_real_dense_bc_v2")
+    parser.add_argument("--dream-exp", default="latent_ppo_pusht_lewm_sparse_dense_correlation")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument("--runs-root", default="runs")
+    parser.add_argument("--output-root", default="runs/rq1")
+    parser.add_argument("--episodes", type=int, default=CANONICAL_EVAL["episodes"])
+    parser.add_argument("--repeats", type=int, default=CANONICAL_EVAL["repeats"])
+    parser.add_argument("--eval-seed", type=int, default=CANONICAL_EVAL["seed"])
     parser.add_argument(
-        "--run",
-        action="append",
-        default=[],
-        metavar="LABEL=RUN_DIR",
-        help="a training run directory to evaluate, e.g. dream-ppo=runs/<exp>__seed1/<stamp>",
+        "--block-start-radius", type=float, default=CANONICAL_EVAL["block_start_radius"]
     )
     parser.add_argument(
-        "--checkpoints",
+        "--variants",
         nargs="+",
-        default=["best", "final"],
-        help="checkpoint names within each run dir; 'snapshots' expands to every "
-        "snapshot_step*.pt (the interaction-budget curve)",
+        default=["final", "best", "best_real_sel"],
+        choices=["final", "best", "best_real_sel"],
     )
-    parser.add_argument("--bc", default=None, help="BC checkpoint to evaluate as the zero-interaction baseline")
-    parser.add_argument("--bc-stats", default=DEFAULT_BC_STATS)
-    parser.add_argument("--bc-label", default="bc")
-    parser.add_argument("--bc-seed", type=int, default=None, help="training seed to record for the BC row")
-
-    # Evaluation protocol. Defaults are the README's canonical settings; the
-    # block-start radius matches the PPO/dream training start distribution.
-    parser.add_argument("--episodes", type=int, default=50)
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--seed-stride",
-        type=int,
-        default=1,
-        help="gap between episode seeds; use >=7 for unrestricted starts",
-    )
-    parser.add_argument("--max-episode-steps", type=int, default=300)
-    parser.add_argument("--block-start-radius", type=float, default=200.0)
-    parser.add_argument(
-        "--no-block-start-radius",
-        dest="block_start_radius",
-        action="store_const",
-        const=None,
-        help="unrestricted block starts -- the whole workspace, not a disk around the goal",
-    )
+    parser.add_argument("--bc-checkpoint", default=BC_CHECKPOINT)
+    parser.add_argument("--bc-stats", default=BC_STATS)
+    parser.add_argument("--no-bc", action="store_true", help="skip the BC baseline row")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--output-root", default="runs/evaluations")
-    parser.add_argument("--ledger", default=DEFAULT_LEDGER)
-    parser.add_argument("--force", action="store_true", help="re-evaluate rows already in the ledger")
-    parser.add_argument("--dry-run", action="store_true", help="list what would be evaluated, then exit")
-    return parser
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="re-evaluate rows already present in results.jsonl (default: skip them)",
+    )
+    return parser.parse_args()
 
 
-# --------------------------------------------------------------------- specs
-def parse_run_spec(spec: str) -> tuple[str, Path]:
-    if "=" not in spec:
-        raise ValueError(f"--run expects LABEL=RUN_DIR, got {spec!r}")
-    label, run_dir = spec.split("=", 1)
-    path = Path(run_dir)
-    if not path.is_dir():
-        raise FileNotFoundError(f"run directory not found: {path}")
-    return label.strip(), path
+def real_selected_snapshot(run_dir: Path):
+    """The snapshot the *real* held-out metric would have selected.
 
-
-def seed_from_run_dir(run_dir: Path) -> int | None:
-    """Recover the training seed from the ``<exp>__seed<k>/<stamp>`` layout."""
-    for part in run_dir.parts[::-1]:
-        match = re.search(r"__seed(\d+)$", part)
-        if match:
-            return int(match.group(1))
-    return None
-
-
-def expand_checkpoints(run_dir: Path, names: list[str]) -> list[Path]:
-    paths: list[Path] = []
-    for name in names:
-        if name == "snapshots":
-            paths.extend(sorted(run_dir.glob("snapshot_step*.pt")))
-            continue
-        candidate = run_dir / (name if name.endswith(".pt") else f"{name}.pt")
-        if candidate.exists():
-            paths.append(candidate)
-        else:
-            print(f"  ! missing {candidate}, skipping")
-    return paths
-
-
-def checkpoint_budget(path: Path) -> dict:
-    """Interaction budget recorded in a checkpoint, tolerating older files.
-
-    Checkpoints written before env-step accounting existed only carry
-    ``global_step``. For a real-env run that is the training interaction, so it
-    is a sound fallback; for a dream run it counts *imagined* steps and cannot be
-    reinterpreted, so it is reported as unknown rather than guessed at.
+    Ties go to the earliest iteration: if two checkpoints score the same, the
+    cheaper one is what a real selection rule running online would have kept.
     """
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    config = payload.get("config", {})
-    is_dream = "wm_frameskip" in config
-    if "env_steps_consumed" in payload:
-        return {
-            "env_steps_consumed": int(payload["env_steps_consumed"]),
-            "train_env_steps": int(payload.get("train_env_steps", 0)),
-            "eval_env_steps": int(payload.get("eval_env_steps", 0)),
-            "budget_source": "recorded",
-            "imagined_steps": int(payload.get("global_step", 0)),
-            "selection": config.get("selection"),
-            "train_success_rate": payload.get("success_rate"),
-        }
-    global_step = int(payload.get("global_step", 0))
-    return {
-        "env_steps_consumed": None if is_dream else global_step,
-        "train_env_steps": None if is_dream else global_step,
-        "eval_env_steps": None,
-        "budget_source": "legacy_dream_global_step" if is_dream else "legacy_global_step",
-        "imagined_steps": global_step,
-        "selection": config.get("selection"),
-        "train_success_rate": payload.get("success_rate"),
-    }
+    rows = [row for row in read_selection_log(run_dir) if row.get("real_success") is not None]
+    if not rows:
+        return None, None
+    best = max(rows, key=lambda row: (row["real_success"], -row["iteration"]))
+    for snapshot in snapshot_checkpoints(run_dir):
+        if snapshot["iteration"] == best["iteration"]:
+            return snapshot, best
+    return None, best
 
 
-# -------------------------------------------------------------------- ledger
-def protocol_key(args) -> str:
-    stride = "" if args.seed_stride == 1 else f"_stride{args.seed_stride}"
-    return (
-        f"eps{args.episodes}_rep{args.repeats}_seed{args.seed}{stride}"
-        f"_max{args.max_episode_steps}_radius{args.block_start_radius}"
+def already_done(existing: list[dict], method: str, variant: str, seed) -> bool:
+    return any(
+        row["method"] == method and row["variant"] == variant and row["seed"] == seed
+        for row in existing
     )
 
 
-def load_ledger(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open(encoding="utf-8") as file:
-        return [json.loads(line) for line in file if line.strip()]
-
-
-def append_ledger(path: Path, row: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(row, sort_keys=True) + "\n")
-
-
-# ----------------------------------------------------------------- evaluation
-def evaluate_one(args, agent_type: str, checkpoint: str, run_name: str, stats: str | None = None):
-    """Run the canonical evaluator; returns its pooled result."""
-    argv = [
-        "--agent-type", agent_type,
-        "--checkpoint", str(checkpoint),
-        "--episodes", str(args.episodes),
-        "--repeats", str(args.repeats),
-        "--seed", str(args.seed),
-        "--seed-stride", str(args.seed_stride),
-        "--max-episode-steps", str(args.max_episode_steps),
-        "--device", args.device,
-        "--output-root", args.output_root,
-        "--run-name", run_name,
-    ]
-    if args.block_start_radius is not None:
-        argv += ["--block-start-radius", str(args.block_start_radius)]
-    if stats:
-        argv += ["--stats", stats]
-    return evaluate_from_args(build_eval_parser().parse_args(argv))
+def evaluate_one(args, *, method, variant, seed, agent_type, checkpoint, stats=None, extra_fields=None):
+    run_name = f"{method}_{variant}_seed{seed}" if seed is not None else f"{method}_{variant}"
+    result = run_canonical_eval(
+        agent_type,
+        checkpoint,
+        output_root=Path(args.output_root) / "evaluations",
+        run_name=run_name,
+        stats=stats,
+        device=args.device,
+        episodes=args.episodes,
+        repeats=args.repeats,
+        seed=args.eval_seed,
+        block_start_radius=args.block_start_radius,
+    )
+    summary = result.summary
+    row = {
+        "method": method,
+        "variant": variant,
+        "seed": seed,
+        "agent_type": agent_type,
+        "checkpoint": str(checkpoint),
+        "success_rate": summary["success_rate"],
+        "mean_length": summary["mean_length"],
+        "mean_return": summary["mean_return"],
+        "episodes": summary["episodes"],
+        "repeats": summary["repeats"],
+        "repeat_success_rates": [r.summary["success_rate"] for r in result.results],
+        "eval": {
+            "episodes_per_repeat": args.episodes,
+            "repeats": args.repeats,
+            "seed": args.eval_seed,
+            "block_start_radius": args.block_start_radius,
+        },
+        "metrics_path": getattr(result, "metrics_path", None),
+    }
+    row.update(extra_fields or {})
+    return row
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    ledger_path = Path(args.ledger)
-    protocol = protocol_key(args)
-    done = {
-        (row["label"], row["checkpoint"], row["protocol"])
-        for row in load_ledger(ledger_path)
-    }
+    args = parse_args()
+    results_path = repo_path(args.output_root) / "results.jsonl"
+    existing = read_jsonl(results_path) if results_path.exists() else []
 
-    jobs: list[dict] = []
-    if args.bc:
-        jobs.append(
-            {
-                "label": args.bc_label,
-                "agent_type": "bc",
-                "checkpoint": args.bc,
-                "stats": args.bc_stats,
-                "seed": args.bc_seed,
-                "checkpoint_name": "bc",
-                # BC is trained purely offline: the zero-interaction reference
-                # point the whole RQ is measured against.
-                "budget": {
-                    "env_steps_consumed": 0,
-                    "train_env_steps": 0,
-                    "eval_env_steps": 0,
-                    "budget_source": "offline_bc",
-                    "imagined_steps": 0,
-                    "selection": None,
-                    "train_success_rate": None,
-                },
-            }
-        )
-
-    for spec in args.run:
-        label, run_dir = parse_run_spec(spec)
-        seed = seed_from_run_dir(run_dir)
-        for checkpoint in expand_checkpoints(run_dir, args.checkpoints):
-            jobs.append(
-                {
-                    "label": label,
-                    "agent_type": "ppo",
-                    "checkpoint": str(checkpoint),
-                    "stats": None,
-                    "seed": seed,
-                    "checkpoint_name": checkpoint.stem,
-                    "budget": checkpoint_budget(checkpoint),
-                }
-            )
-
-    pending = [job for job in jobs if args.force or (job["label"], job["checkpoint"], protocol) not in done]
-    print(f"RQ1 grid | protocol {protocol} | {len(jobs)} checkpoints, {len(pending)} pending")
-    for job in pending:
-        print(f"  - {job['label']:12s} seed={job['seed']} {job['checkpoint']}")
-    if args.dry_run or not pending:
-        return
-
-    episodes_per_eval = args.episodes * args.repeats
-    for index, job in enumerate(pending, start=1):
-        print(f"\n[{index}/{len(pending)}] {job['label']} :: {job['checkpoint']}")
-        run_name = f"rq1_{job['label']}_seed{job['seed']}_{job['checkpoint_name']}"
-        result = evaluate_one(
+    if not args.no_bc and (args.overwrite or not already_done(existing, "bc", "published", None)):
+        # One published BC checkpoint backs every PPO seed, so BC is a single row.
+        # The consequence -- seed spread covers PPO/dream RNG only, not the BC
+        # prior -- is carried into the report as a stated caveat.
+        row = evaluate_one(
             args,
-            job["agent_type"],
-            job["checkpoint"],
-            run_name,
-            stats=job["stats"],
+            method="bc",
+            variant="published",
+            seed=None,
+            agent_type="bc",
+            checkpoint=args.bc_checkpoint,
+            stats=args.bc_stats,
+            extra_fields={
+                "env_steps_consumed": 0,
+                "train_env_steps": 0,
+                "eval_env_steps": 0,
+                "required_env_steps": 0,
+                "diagnostic_env_steps": 0,
+                "interaction_free": True,
+                "selection": "none",
+            },
         )
-        summary = result.summary
-        row = {
-            "label": job["label"],
-            "agent_type": job["agent_type"],
-            "seed": job["seed"],
-            "checkpoint": job["checkpoint"],
-            "checkpoint_name": job["checkpoint_name"],
-            "protocol": protocol,
-            "episodes": episodes_per_eval,
-            "success_rate": summary["success_rate"],
-            "mean_length": summary["mean_length"],
-            "mean_return": summary["mean_return"],
-            "repeat_success_rates": [r.summary["success_rate"] for r in result.results],
-            "repeat_seeds": list(result.repeat_seeds),
-            **job["budget"],
-        }
-        append_ledger(ledger_path, row)
-        print(f"  -> success {summary['success_rate']:.3f} over {episodes_per_eval} episodes; logged to {ledger_path}")
+        upsert_jsonl(results_path, row, RESULT_KEY)
+        print(f"[bc/published] success={row['success_rate']:.3f}")
+
+    for method, exp_name in (("real_ppo", args.real_exp), ("dream_ppo", args.dream_exp)):
+        for seed in args.seeds:
+            try:
+                run = find_run_dir(exp_name, seed, args.runs_root)
+            except FileNotFoundError as exc:
+                print(f"[{method}/seed{seed}] SKIPPED: {exc}")
+                continue
+            print(f"[{method}/seed{seed}] run dir: {run.path}")
+
+            for variant in args.variants:
+                if variant == "best_real_sel" and method != "dream_ppo":
+                    continue  # real-PPO's best.pt already *is* the real-selected one
+                if already_done(existing, method, variant, seed) and not args.overwrite:
+                    print(f"[{method}/{variant}/seed{seed}] already in results.jsonl, skipping")
+                    continue
+
+                selection_note = None
+                if variant == "best_real_sel":
+                    snapshot, log_row = real_selected_snapshot(run.path)
+                    if snapshot is None:
+                        print(
+                            f"[{method}/{variant}/seed{seed}] SKIPPED: no snapshot matches the "
+                            "best real_success row (train with --snapshot-interval matching "
+                            "--eval-interval and --record-real-eval)"
+                        )
+                        continue
+                    checkpoint = snapshot["path"]
+                    selection_note = {
+                        "selected_iteration": log_row["iteration"],
+                        "selected_on_real_success": log_row["real_success"],
+                    }
+                else:
+                    checkpoint = run.path / f"{variant}.pt"
+                    if not checkpoint.exists():
+                        print(f"[{method}/{variant}/seed{seed}] SKIPPED: {checkpoint} missing")
+                        continue
+
+                budget = checkpoint_budget(checkpoint)
+                # Interaction-free means: no env step was spent either training
+                # this policy or deciding to keep it. Dream training spends none;
+                # a real-env selection rule does, which is exactly the cost RQ1
+                # is trying to expose.
+                if method == "dream_ppo":
+                    selects_on_real = variant == "best_real_sel" or budget.get("selection") == "real"
+                    interaction_free = not selects_on_real
+                    if variant == "best" and budget.get("selection") != "dream":
+                        print(
+                            f"[{method}/best/seed{seed}] WARNING: run used "
+                            f"selection={budget.get('selection')!r}, so best.pt is NOT "
+                            "interaction-free. Re-train with --selection dream."
+                        )
+                else:
+                    interaction_free = False
+
+                # What this checkpoint *needed*, as opposed to what its run
+                # happened to spend. A dream run with --selection dream needs
+                # zero: its real-env eval is RQ2 instrumentation that a real
+                # deployment would simply not run. Anything selected on the
+                # simulator needs the selection steps too, which is the cost RQ1
+                # exists to expose -- so it is never discounted away.
+                required = (
+                    budget["train_env_steps"] if interaction_free else budget["env_steps_consumed"]
+                )
+                row = evaluate_one(
+                    args,
+                    method=method,
+                    variant=variant,
+                    seed=seed,
+                    agent_type="ppo",
+                    checkpoint=checkpoint,
+                    extra_fields={
+                        **budget,
+                        "required_env_steps": required,
+                        "diagnostic_env_steps": budget["env_steps_consumed"] - required,
+                        "run_dir": str(run.path),
+                        "interaction_free": interaction_free,
+                        **(selection_note or {}),
+                    },
+                )
+                upsert_jsonl(results_path, row, RESULT_KEY)
+                existing.append(row)
+                diagnostic = row["diagnostic_env_steps"]
+                note = f", {diagnostic:,} diagnostic-only" if diagnostic else ""
+                print(
+                    f"[{method}/{variant}/seed{seed}] success={row['success_rate']:.3f} "
+                    f"| env steps required={row['required_env_steps']:,} "
+                    f"(train {row['train_env_steps']:,} + selection {row['eval_env_steps']:,}{note})"
+                )
+
+    print(f"\nresults -> {results_path}")
+    print("Next: python -m scripts.rq1.report")
 
 
 if __name__ == "__main__":
