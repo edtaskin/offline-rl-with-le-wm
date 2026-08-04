@@ -40,15 +40,25 @@ python -m src.bc.train_bc_latent \
   --frame_stack 3 \
   --frame_stride 5 \
   --action_chunk_size 5 \
-  --data_path data/expert_trajectories/pusht_expert_224.npz \
   --seed 42 \
   --num_workers 0 \
   --deterministic \
   --log_interval 10 \
   --save_interval 100 \
+  --eval_interval 50 \
+  --eval_episodes 50 \
+  --eval_repeats 3 \
   --push_to_hf \
   --hf_repo_id offline-rl-with-le-wm/behavioral-cloning
 ```
+
+The trainer runs the canonical fixed-target PushT evaluator every 50 epochs and
+once at the final epoch if needed. It writes `pusht_latent_bc_best.pth`, selected
+by aggregate evaluation success rate, and `pusht_latent_bc_final.pth`, together
+with matching `_stats.pth` files and an evaluation-history JSON file. When Hub
+uploading is enabled, all artifacts from one training run are placed in one
+folder. The folder defaults to `--wandb_run_name` when set, otherwise to the
+checkpoint stem; set `--hf_path_prefix` to choose it explicitly.
 
 Each evaluation creates a timestamped directory under `runs/evaluations/`.
 By default, it runs 3 repeats of 50 episodes. `--seed` sets the first repeat's
@@ -75,8 +85,8 @@ starts around the same fixed target.
 ```bash
 python -m src.evaluation.evaluate_pusht \
   --agent-type bc \
-  --checkpoint hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc.pth \
-  --stats hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc_stats.pth \
+  --checkpoint hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc/pusht_latent_bc_best.pth \
+  --stats hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc/pusht_latent_bc_best_stats.pth \
   --training-observation-resolution 224 \
   --block-start-radius 200 \
   --episodes 50 \
@@ -92,8 +102,8 @@ To train a latent PPO policy, you can use the following command:
 
 ```bash
 python src/ppo/train.py \
-  --bc_checkpoint hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc.pth \
-  --bc_stats hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc_stats.pth \
+  --bc_checkpoint hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc/pusht_latent_bc_best.pth \
+  --bc_stats hf://offline-rl-with-le-wm/behavioral-cloning/pusht_latent_bc/pusht_latent_bc_best_stats.pth \
   --hidden_dim 256 \
   --frame_stack 3 \
   --frame_stride 5 \

@@ -1,7 +1,10 @@
 import argparse
+import json
 import os
 import random
+import re
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -43,10 +46,147 @@ from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 from src.bc.tracking import (
     args_for_config,
     init_wandb,
+    json_safe,
     log_wandb_artifact,
+    sidecar_path,
     write_run_config,
 )
 from src.utils.hf_hub import push_files_to_hub
+
+
+def checkpoint_artifact_paths(checkpoint_path):
+    """Return the stable artifact names derived from a checkpoint base path."""
+
+    path = Path(checkpoint_path)
+    stem = path.stem if path.suffix else path.name
+    base = path.with_name(stem)
+    return {
+        "best": str(base.with_name(f"{stem}_best.pth")),
+        "best_stats": str(base.with_name(f"{stem}_best_stats.pth")),
+        "final": str(base.with_name(f"{stem}_final.pth")),
+        "final_stats": str(base.with_name(f"{stem}_final_stats.pth")),
+        "eval_history": str(base.with_name(f"{stem}_eval_history.json")),
+    }
+
+
+def _slug(value):
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip("-._")
+    return slug or "bc-run"
+
+
+def _hf_run_folder(args):
+    """Choose one Hub folder for all artifacts produced by this training run."""
+
+    if args.hf_path_prefix:
+        return args.hf_path_prefix.strip("/")
+    run_name = args.wandb_run_name or Path(args.checkpoint_path).stem
+    return _slug(run_name)
+
+
+def _write_evaluation_history(path, evaluations):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(json_safe(evaluations), file, indent=2, sort_keys=True)
+        file.write("\n")
+    return str(path)
+
+
+def _periodic_evaluation_args(
+    train_args,
+    *,
+    checkpoint_path,
+    stats_path,
+    epoch,
+    device,
+    observation_resolution,
+):
+    """Build arguments through the canonical evaluation script's own parser."""
+
+    from src.evaluation.evaluate_pusht import build_parser as build_eval_parser
+
+    eval_argv = [
+        "--agent-type",
+        "bc",
+        "--checkpoint",
+        str(checkpoint_path),
+        "--stats",
+        str(stats_path),
+        "--device",
+        str(device),
+        "--execution-mode",
+        train_args.eval_execution_mode,
+        "--replan-interval",
+        str(train_args.eval_replan_interval),
+        "--episodes",
+        str(train_args.eval_episodes),
+        "--repeats",
+        str(train_args.eval_repeats),
+        "--seed",
+        str(train_args.seed if train_args.eval_seed is None else train_args.eval_seed),
+        "--seed-stride",
+        str(train_args.eval_seed_stride),
+        "--max-episode-steps",
+        str(train_args.eval_max_episode_steps),
+        "--observation-resolution",
+        str(observation_resolution),
+        "--output-root",
+        train_args.eval_output_root,
+        "--run-name",
+        f"{Path(train_args.checkpoint_path).stem}-epoch-{epoch}",
+    ]
+    if train_args.eval_block_start_radius is not None:
+        eval_argv.extend(
+            ["--block-start-radius", str(train_args.eval_block_start_radius)]
+        )
+    return build_eval_parser().parse_args(eval_argv)
+
+
+def _run_periodic_evaluation(
+    train_args,
+    *,
+    policy,
+    run_metadata,
+    epoch,
+    device,
+    observation_resolution,
+):
+    """Evaluate the current policy with ``evaluate_pusht.py`` without RNG drift."""
+
+    from src.evaluation.evaluate_pusht import evaluate_from_args
+
+    python_rng_state = random.getstate()
+    numpy_rng_state = np.random.get_state()
+    torch_rng_state = torch.random.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    was_training = policy.training
+    try:
+        policy.eval()
+        with tempfile.TemporaryDirectory(
+            prefix=f".{Path(train_args.checkpoint_path).stem}_eval_epoch{epoch}_",
+        ) as temporary_dir:
+            checkpoint_path = Path(temporary_dir) / "candidate.pth"
+            stats_path = Path(temporary_dir) / "candidate_stats.pth"
+            torch.save(policy.state_dict(), checkpoint_path)
+            torch.save(run_metadata, stats_path)
+            eval_args = _periodic_evaluation_args(
+                train_args,
+                checkpoint_path=checkpoint_path,
+                stats_path=stats_path,
+                epoch=epoch,
+                device=device,
+                observation_resolution=observation_resolution,
+            )
+            return evaluate_from_args(eval_args)
+    finally:
+        random.setstate(python_rng_state)
+        np.random.set_state(numpy_rng_state)
+        torch.random.set_rng_state(torch_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        policy.train(was_training)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def seed_everything(seed, deterministic=False):
@@ -201,6 +341,20 @@ def train_latent_bc(args):
         raise ValueError("num_workers must be non-negative")
     if args.latent_cache_batch_size is not None and args.latent_cache_batch_size < 1:
         raise ValueError("latent_cache_batch_size must be at least 1")
+    if args.eval_interval < 1:
+        raise ValueError("eval_interval must be at least 1")
+    if args.eval_episodes < 1:
+        raise ValueError("eval_episodes must be at least 1")
+    if args.eval_repeats < 1:
+        raise ValueError("eval_repeats must be at least 1")
+    if args.eval_seed_stride < 1:
+        raise ValueError("eval_seed_stride must be at least 1")
+    if args.eval_max_episode_steps < 1:
+        raise ValueError("eval_max_episode_steps must be at least 1")
+    if args.eval_replan_interval < 1:
+        raise ValueError("eval_replan_interval must be at least 1")
+    if args.eval_block_start_radius is not None and args.eval_block_start_radius < 0:
+        raise ValueError("eval_block_start_radius must be non-negative")
     seed_everything(args.seed, args.deterministic)
     print(f"Using seed: {args.seed} (deterministic={args.deterministic})")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -279,8 +433,12 @@ def train_latent_bc(args):
     criterion = nn.MSELoss()
     print("Starting Latent-Space Behavior Cloning training loop...")
     policy.train()
+    artifact_paths = checkpoint_artifact_paths(args.checkpoint_path)
     best_loss = float("inf")
     best_epoch = None
+    best_eval_success_rate = float("-inf")
+    best_eval_epoch = None
+    evaluation_history = []
     avg_loss = float("nan")
     for epoch in range(args.epochs):
         epoch_loss = 0.0
@@ -306,39 +464,121 @@ def train_latent_bc(args):
         if avg_loss < best_loss:
             best_loss = avg_loss
             best_epoch = epoch + 1
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "train/loss": avg_loss,
-                    "train/best_loss": best_loss,
-                    "train/epoch": epoch + 1,
-                    "train/lr": optimizer.param_groups[0]["lr"],
-                },
-                step=epoch + 1,
-            )
+        wandb_metrics = {
+            "train/loss": avg_loss,
+            "train/best_loss": best_loss,
+            "train/epoch": epoch + 1,
+            "train/lr": optimizer.param_groups[0]["lr"],
+        }
         if (epoch + 1) % args.log_interval == 0 or epoch == 0:
             print(f"Epoch [{epoch + 1}/{args.epochs}] - Average MSE Loss: {avg_loss:.6f}")
         if (epoch + 1) % args.save_interval == 0:
-            checkpoint_name = args.checkpoint_path.replace(".pth", f"_epoch{epoch + 1}.pth")
+            checkpoint_name = sidecar_path(
+                args.checkpoint_path, f"_epoch{epoch + 1}.pth"
+            )
             torch.save(policy.state_dict(), checkpoint_name)
 
-    torch.save(policy.state_dict(), args.checkpoint_path)
-    stats_path = args.checkpoint_path.replace(".pth", "_stats.pth")
-    torch.save(run_metadata, stats_path)
+        epoch_number = epoch + 1
+        if epoch_number % args.eval_interval == 0 or epoch_number == args.epochs:
+            print(
+                f"Running canonical PushT evaluation at epoch {epoch_number} "
+                f"({args.eval_repeats} x {args.eval_episodes} episodes)..."
+            )
+            eval_result = _run_periodic_evaluation(
+                args,
+                policy=policy,
+                run_metadata=run_metadata,
+                epoch=epoch_number,
+                device=device,
+                observation_resolution=dataset_stats["observation_resolution"],
+            )
+            success_rate = float(eval_result.summary["success_rate"])
+            if not np.isfinite(success_rate):
+                raise ValueError(
+                    f"evaluation returned a non-finite success rate: {success_rate}"
+                )
+            improved = success_rate > best_eval_success_rate
+            if improved:
+                best_eval_success_rate = success_rate
+                best_eval_epoch = epoch_number
+                torch.save(policy.state_dict(), artifact_paths["best"])
+                torch.save(
+                    {
+                        **run_metadata,
+                        "checkpoint_role": "best",
+                        "selection_metric": "success_rate",
+                        "selection_metric_value": success_rate,
+                        "selection_epoch": epoch_number,
+                    },
+                    artifact_paths["best_stats"],
+                )
+                print(
+                    f"New best evaluation success rate: {success_rate:.4f}; "
+                    f"saved to {artifact_paths['best']}"
+                )
+            evaluation_record = {
+                "epoch": epoch_number,
+                "summary": dict(eval_result.summary),
+                "improved": improved,
+                "best_success_rate": best_eval_success_rate,
+                "best_epoch": best_eval_epoch,
+                "run_dir": getattr(eval_result, "run_dir", None),
+                "metrics_path": getattr(eval_result, "metrics_path", None),
+            }
+            evaluation_history.append(evaluation_record)
+            _write_evaluation_history(
+                artifact_paths["eval_history"], evaluation_history
+            )
+            if wandb_run is not None:
+                wandb_metrics.update(
+                    {
+                        **{
+                            f"eval/{key}": value
+                            for key, value in eval_result.summary.items()
+                            if isinstance(value, (int, float))
+                        },
+                        "eval/epoch": epoch_number,
+                        "eval/best_success_rate": best_eval_success_rate,
+                    }
+                )
+            policy.train()
+        if wandb_run is not None:
+            wandb_run.log(wandb_metrics, step=epoch_number)
+
+    if best_eval_epoch is None:
+        raise RuntimeError("training completed without an evaluation checkpoint")
+    torch.save(policy.state_dict(), artifact_paths["final"])
+    torch.save(
+        {
+            **run_metadata,
+            "checkpoint_role": "final",
+            "training_epoch": args.epochs,
+            "best_eval_success_rate": best_eval_success_rate,
+            "best_eval_epoch": best_eval_epoch,
+        },
+        artifact_paths["final_stats"],
+    )
     completion_metadata = {
         "device": str(device),
         "dataset_size": len(dataset),
         "num_batches_per_epoch": len(dataloader),
         "status": "completed",
         "bc_contract": run_metadata,
-        "final_checkpoint_path": args.checkpoint_path,
-        "stats_path": stats_path,
+        "best_checkpoint_path": artifact_paths["best"],
+        "best_stats_path": artifact_paths["best_stats"],
+        "final_checkpoint_path": artifact_paths["final"],
+        "final_stats_path": artifact_paths["final_stats"],
+        "evaluation_history_path": artifact_paths["eval_history"],
+        "best_eval_success_rate": best_eval_success_rate,
+        "best_eval_success_rate_epoch": best_eval_epoch,
+        "evaluations": evaluation_history,
         "run_config_path": run_config_path,
         "final_train_loss": avg_loss,
         "best_train_loss": best_loss,
         "best_train_loss_epoch": best_epoch,
         "wandb_run_id": getattr(wandb_run, "id", None) if wandb_run is not None else None,
         "wandb_run_url": getattr(wandb_run, "url", None) if wandb_run is not None else None,
+        "hf_path_prefix": _hf_run_folder(args) if args.push_to_hf else None,
     }
     run_config_path = write_run_config(
         args,
@@ -347,15 +587,24 @@ def train_latent_bc(args):
     )
 
     hf_upload_result = None
+    uploaded_artifact_paths = [
+        artifact_paths["best"],
+        artifact_paths["best_stats"],
+        artifact_paths["final"],
+        artifact_paths["final_stats"],
+        artifact_paths["eval_history"],
+        run_config_path,
+    ]
+    hf_run_folder = _hf_run_folder(args)
     if args.push_to_hf:
         hf_upload_result = push_files_to_hub(
             repo_id=args.hf_repo_id,
-            file_paths=[args.checkpoint_path, stats_path, run_config_path],
+            file_paths=uploaded_artifact_paths,
             repo_type=args.hf_repo_type,
             private=args.hf_private,
             token=args.hf_token,
             revision=args.hf_revision,
-            path_prefix=args.hf_path_prefix,
+            path_prefix=hf_run_folder,
             commit_message=args.hf_commit_message,
         )
         completion_metadata["run_config_path"] = run_config_path
@@ -363,6 +612,7 @@ def train_latent_bc(args):
             "repo_id": hf_upload_result.repo_id,
             "repo_type": hf_upload_result.repo_type,
             "repo_url": hf_upload_result.repo_url,
+            "path_prefix": hf_run_folder,
             "uploaded_files": hf_upload_result.uploaded_files,
         }
         run_config_path = write_run_config(
@@ -377,7 +627,7 @@ def train_latent_bc(args):
             private=args.hf_private,
             token=args.hf_token,
             revision=args.hf_revision,
-            path_prefix=args.hf_path_prefix,
+            path_prefix=hf_run_folder,
             commit_message=args.hf_commit_message,
             create_repo=False,
         )
@@ -387,29 +637,43 @@ def train_latent_bc(args):
         wandb_run.summary["final_train_loss"] = avg_loss
         wandb_run.summary["best_train_loss"] = best_loss
         wandb_run.summary["best_train_loss_epoch"] = best_epoch
+        wandb_run.summary["best_eval_success_rate"] = best_eval_success_rate
+        wandb_run.summary["best_eval_success_rate_epoch"] = best_eval_epoch
         if hf_upload_result is not None:
             wandb_run.summary["hf/repo_url"] = hf_upload_result.repo_url
+            wandb_run.summary["hf/path_prefix"] = hf_run_folder
         log_wandb_artifact(
             wandb_run,
             artifact_name=f"latent-bc-policy-{getattr(wandb_run, 'id', 'local')}",
             artifact_type="model",
-            file_paths=[args.checkpoint_path, stats_path, run_config_path],
+            file_paths=uploaded_artifact_paths,
             metadata={
-                "checkpoint_path": args.checkpoint_path,
-                "stats_path": stats_path,
+                "best_checkpoint_path": artifact_paths["best"],
+                "best_stats_path": artifact_paths["best_stats"],
+                "final_checkpoint_path": artifact_paths["final"],
+                "final_stats_path": artifact_paths["final_stats"],
                 "run_config_path": run_config_path,
                 "best_train_loss": best_loss,
                 "best_train_loss_epoch": best_epoch,
+                "best_eval_success_rate": best_eval_success_rate,
+                "best_eval_success_rate_epoch": best_eval_epoch,
                 "bc_contract": run_metadata,
                 "hf_repo_url": hf_upload_result.repo_url if hf_upload_result is not None else None,
             },
         )
         wandb_run.finish()
-    print(f"Latent BC Training Complete! Saved to: {args.checkpoint_path}")
+    print(f"Best BC checkpoint saved to: {artifact_paths['best']}")
+    print(f"Final BC checkpoint saved to: {artifact_paths['final']}")
     print(f"Run config saved to: {run_config_path}")
     return {
-        "checkpoint_path": args.checkpoint_path,
-        "stats_path": stats_path,
+        "checkpoint_path": artifact_paths["final"],
+        "stats_path": artifact_paths["final_stats"],
+        "best_checkpoint_path": artifact_paths["best"],
+        "best_stats_path": artifact_paths["best_stats"],
+        "final_checkpoint_path": artifact_paths["final"],
+        "final_stats_path": artifact_paths["final_stats"],
+        "best_eval_success_rate": best_eval_success_rate,
+        "best_eval_epoch": best_eval_epoch,
         "final_train_loss": avg_loss,
         "best_train_loss": best_loss,
     }
@@ -419,7 +683,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Latent-Space Behavior Cloning (BC) Prior for LeWorldModel")
     parser.add_argument("--data_path", type=str, default="data/expert_trajectories/pusht_expert_224.npz", help="Path to the high-resolution expert dataset generated by scripts/regenerate_pusht_expert.py")
     parser.add_argument("--observation-resolution", "--observation_resolution", dest="observation_resolution", type=int, default=None, help="Native expert-image resolution. When omitted it is inferred from the dataset; an explicit mismatch is rejected")
-    parser.add_argument("--checkpoint_path", type=str, default="runs/bc/pusht_latent_bc.pth", help="Temporary local output path used before optional Hugging Face upload")
+    parser.add_argument("--checkpoint_path", type=str, default="runs/bc/pusht_latent_bc.pth", help="Base local output path; training writes sibling _best.pth and _final.pth artifacts")
     parser.add_argument("--latent-representation", "--latent_representation", dest="latent_representation", choices=LEWM_LATENT_REPRESENTATIONS, default=LEWM_LATENT_RAW_CLS, help="Frozen LeWM feature consumed by BC: historical encoder CLS or the learned JEPA-projected CLS")
     parser.add_argument("--latent_cache_path", type=str, default=None, help="Path for cached per-frame LeWM latents; the default filename is representation-specific")
     parser.add_argument("--rebuild_latent_cache", action="store_true", help="Recompute and overwrite the LeWM latent cache before training")
@@ -437,6 +701,16 @@ def build_parser():
     parser.add_argument("--action_chunk_size", type=int, default=5, help="Number of future actions to predict from one observation")
     parser.add_argument("--log_interval", type=int, default=10, help="Epochs to wait before logging loss metrics")
     parser.add_argument("--save_interval", type=int, default=10, help="Save policy checkpoint every N epochs")
+    parser.add_argument("--eval_interval", "--eval-interval", dest="eval_interval", type=int, default=50, help="Run canonical PushT evaluation every N epochs and at the final epoch")
+    parser.add_argument("--eval_episodes", "--eval-episodes", dest="eval_episodes", type=int, default=50, help="Episodes per periodic evaluation repeat")
+    parser.add_argument("--eval_repeats", "--eval-repeats", dest="eval_repeats", type=int, default=3, help="Number of periodic evaluation repeats")
+    parser.add_argument("--eval_seed", "--eval-seed", dest="eval_seed", type=int, default=None, help="First periodic evaluation seed; defaults to --seed")
+    parser.add_argument("--eval_seed_stride", "--eval-seed-stride", dest="eval_seed_stride", type=int, default=1, help="Gap between periodic evaluation episode seeds")
+    parser.add_argument("--eval_max_episode_steps", "--eval-max-episode-steps", dest="eval_max_episode_steps", type=int, default=300, help="Maximum steps per periodic evaluation episode")
+    parser.add_argument("--eval_execution_mode", "--eval-execution-mode", dest="eval_execution_mode", choices=["open-loop", "receding-horizon", "temporal-ensemble"], default="open-loop", help="Action-chunk execution mode used for periodic evaluation")
+    parser.add_argument("--eval_replan_interval", "--eval-replan-interval", dest="eval_replan_interval", type=int, default=1, help="Replanning interval for periodic receding-horizon evaluation")
+    parser.add_argument("--eval_block_start_radius", "--eval-block-start-radius", dest="eval_block_start_radius", type=float, default=None, help="Optional near-goal block-start radius for periodic evaluation")
+    parser.add_argument("--eval_output_root", "--eval-output-root", dest="eval_output_root", type=str, default="runs/evaluations", help="Root directory for periodic evaluation metrics")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases experiment tracking")
     parser.add_argument("--wandb_project", type=str, default="offline-rl-lewm", help="Weights & Biases project name")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity/team")
@@ -444,13 +718,13 @@ def build_parser():
     parser.add_argument("--wandb_group", type=str, default="pusht-latent-bc", help="Weights & Biases run group")
     parser.add_argument("--wandb_tags", nargs="*", default=None, help="Optional Weights & Biases tags")
     parser.add_argument("--wandb_mode", type=str, choices=["online", "offline", "disabled"], default=None, help="Weights & Biases mode; use offline on clusters without network access")
-    parser.add_argument("--push_to_hf", action="store_true", help="Push final checkpoint artifacts to the Hugging Face Hub")
+    parser.add_argument("--push_to_hf", action="store_true", help="Push best/final checkpoint artifacts to one run folder on the Hugging Face Hub")
     parser.add_argument("--hf_repo_id", type=str, default=None, help="Hugging Face repo id, for example username/repo-name")
     parser.add_argument("--hf_repo_type", type=str, choices=["model", "dataset", "space"], default="model", help="Hugging Face repository type")
     parser.add_argument("--hf_private", action=argparse.BooleanOptionalAction, default=False, help="Create or keep the Hugging Face repo private")
     parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face token; if omitted, huggingface_hub uses the cached login or environment token")
     parser.add_argument("--hf_revision", type=str, default=None, help="Optional Hugging Face branch or revision to upload to")
-    parser.add_argument("--hf_path_prefix", type=str, default=None, help="Optional folder inside the Hugging Face repo")
+    parser.add_argument("--hf_path_prefix", type=str, default=None, help="Folder inside the Hugging Face repo; defaults to the W&B run name or checkpoint stem")
     parser.add_argument("--hf_commit_message", type=str, default="Upload latent BC checkpoint artifacts", help="Commit message for Hugging Face uploads")
     return parser
 
