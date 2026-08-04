@@ -4,7 +4,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.representations.lewm import lewm_preprocessing_metadata
+from src.representations.lewm import (
+    LEWM_LATENT_PROJECTED,
+    LEWM_LATENT_RAW_CLS,
+    LEWM_LATENT_REPRESENTATIONS,
+    lewm_preprocessing_metadata,
+)
 
 
 def path_fingerprint(path):
@@ -17,9 +22,12 @@ def path_fingerprint(path):
     }
 
 
-def default_latent_cache_path(data_path):
+def default_latent_cache_path(data_path, latent_representation=LEWM_LATENT_RAW_CLS):
+    if latent_representation not in LEWM_LATENT_REPRESENTATIONS:
+        raise ValueError(f"unsupported LeWM latent representation: {latent_representation}")
     data_path = Path(data_path)
-    cache_name = f"{data_path.stem}_lewm_object_imagenet224_cls.pt"
+    suffix = "cls" if latent_representation == LEWM_LATENT_RAW_CLS else "projected"
+    cache_name = f"{data_path.stem}_lewm_object_imagenet224_{suffix}.pt"
     return str(Path("data", "latent_cache", cache_name))
 
 
@@ -34,9 +42,12 @@ def expected_latent_cache_metadata(
     num_samples,
     latent_dim,
     normalization="imagenet",
+    latent_representation=LEWM_LATENT_RAW_CLS,
 ):
+    if latent_representation not in LEWM_LATENT_REPRESENTATIONS:
+        raise ValueError(f"unsupported LeWM latent representation: {latent_representation}")
     preprocessing = lewm_preprocessing_metadata(normalization)
-    return {
+    metadata = {
         "format_version": 1,
         "cache_type": "lewm_cls_latents",
         "data_file": path_fingerprint(data_path),
@@ -48,6 +59,18 @@ def expected_latent_cache_metadata(
         "image_mean": list(preprocessing["image_mean"]),
         "image_std": list(preprocessing["image_std"]),
     }
+    # Preserve the byte-for-byte metadata contract of existing raw CLS caches.
+    # Projected caches are deliberately distinguishable and cannot be accepted
+    # accidentally by a raw policy (or vice versa).
+    if latent_representation == LEWM_LATENT_PROJECTED:
+        metadata.update(
+            {
+                "format_version": 2,
+                "cache_type": "lewm_projected_latents",
+                "latent_representation": LEWM_LATENT_PROJECTED,
+            }
+        )
+    return metadata
 
 
 def metadata_matches(actual, expected):
@@ -107,3 +130,48 @@ def build_latent_cache(source_dataset, extractor, cache_path, metadata, batch_si
         cache_path,
     )
     print(f"Saved LeWM latent cache with shape {tuple(cached_latents.shape)}")
+
+
+def build_projected_latent_cache(
+    raw_cache_path,
+    projector,
+    cache_path,
+    metadata,
+    batch_size,
+):
+    """Apply the frozen JEPA projector to a verified raw-CLS cache."""
+
+    if batch_size < 1:
+        raise ValueError("latent_cache_batch_size must be at least 1")
+    payload = torch.load(raw_cache_path, map_location="cpu")
+    if not isinstance(payload, dict) or not torch.is_tensor(payload.get("latents")):
+        raise ValueError("raw latent cache must contain a 'latents' tensor")
+    raw_latents = payload["latents"]
+    try:
+        device = next(projector.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+    projector.eval()
+    projected_batches = []
+    print(f"Building projected LeWM latent cache from: {raw_cache_path}")
+    with torch.inference_mode():
+        for start in range(0, len(raw_latents), batch_size):
+            end = min(start + batch_size, len(raw_latents))
+            projected_batches.append(
+                projector(raw_latents[start:end].to(device)).detach().cpu()
+            )
+    projected_latents = torch.cat(projected_batches, dim=0).contiguous()
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "latents": projected_latents,
+            "metadata": {
+                **metadata,
+                "source_raw_cache": path_fingerprint(raw_cache_path),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        },
+        cache_path,
+    )
+    print(f"Saved projected LeWM latent cache with shape {tuple(projected_latents.shape)}")

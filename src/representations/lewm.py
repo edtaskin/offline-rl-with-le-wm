@@ -17,6 +17,9 @@ LEWM_IMAGE_STD = [0.229, 0.224, 0.225]
 LEWM_IMAGE_NORMALIZATION = "imagenet"
 LEWM_LEGACY_IMAGE_NORMALIZATION = "legacy_div255"
 LEWM_DEFAULT_FEATURE_DIM = 192
+LEWM_LATENT_RAW_CLS = "raw_cls"
+LEWM_LATENT_PROJECTED = "projected"
+LEWM_LATENT_REPRESENTATIONS = (LEWM_LATENT_RAW_CLS, LEWM_LATENT_PROJECTED)
 
 
 def _ensure_lewm_source_path() -> None:
@@ -109,8 +112,31 @@ def load_lewm_encoder(device="cpu", checkpoint_path=None) -> nn.Module:
     return encoder
 
 
+def load_lewm_encoder_and_projector(device="cpu", checkpoint_path=None):
+    """Load the frozen encoder and JEPA projector from one object checkpoint."""
+
+    load_stable_worldmodel()
+    checkpoint_path = Path(checkpoint_path or default_lewm_checkpoint_path())
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"LeWM checkpoint not found at {checkpoint_path}. "
+            "Run `python -m scripts.download_lewm_checkpoint` or pass an explicit path."
+        )
+    model = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    encoder = model.encoder.to(device).eval()
+    projector = model.projector.to(device).eval()
+    encoder.requires_grad_(False)
+    projector.requires_grad_(False)
+    return encoder, projector
+
+
 class LeWMEncoder(nn.Module):
-    """Frozen LeWM preprocessing and CLS extraction behind one module."""
+    """Frozen LeWM preprocessing and selectable latent extraction.
+
+    ``raw_cls`` preserves the historical BC/PPO contract. ``projected`` applies
+    the learned JEPA projector used by LeWM's dynamics model to the same CLS
+    token. Both branches remain frozen.
+    """
 
     def __init__(
         self,
@@ -123,6 +149,8 @@ class LeWMEncoder(nn.Module):
         image_size=LEWM_IMAGE_SIZE,
         image_mean=LEWM_IMAGE_MEAN,
         image_std=LEWM_IMAGE_STD,
+        projector=None,
+        latent_representation=LEWM_LATENT_RAW_CLS,
     ):
         super().__init__()
         try:
@@ -141,8 +169,18 @@ class LeWMEncoder(nn.Module):
         self.image_size = tuple(image_size)
         self.image_mean = list(image_mean)
         self.image_std = list(image_std)
+        if latent_representation not in LEWM_LATENT_REPRESENTATIONS:
+            raise ValueError(
+                f"unsupported LeWM latent representation: {latent_representation}"
+            )
+        if latent_representation == LEWM_LATENT_PROJECTED and projector is None:
+            raise ValueError("the projected LeWM representation requires a projector")
+        self.latent_representation = latent_representation
         self.encoder = encoder.to(self.device).eval()
         self.encoder.requires_grad_(False)
+        self.projector = projector.to(self.device).eval() if projector is not None else None
+        if self.projector is not None:
+            self.projector.requires_grad_(False)
         self.resize = transforms.Resize(self.image_size, antialias=True)
         self.normalize = transforms.Normalize(mean=self.image_mean, std=self.image_std)
 
@@ -154,19 +192,29 @@ class LeWMEncoder(nn.Module):
         *,
         latent_dim=LEWM_DEFAULT_FEATURE_DIM,
         normalization=LEWM_IMAGE_NORMALIZATION,
+        latent_representation=LEWM_LATENT_RAW_CLS,
     ):
         checkpoint_path = Path(checkpoint_path or default_lewm_checkpoint_path())
         print("Loading official LeWM object checkpoint...")
         print(checkpoint_path)
-        encoder = load_lewm_encoder(device, checkpoint_path)
+        if latent_representation == LEWM_LATENT_PROJECTED:
+            encoder, projector = load_lewm_encoder_and_projector(device, checkpoint_path)
+        else:
+            encoder = load_lewm_encoder(device, checkpoint_path)
+            projector = None
         wrapper = cls(
             encoder=encoder,
+            projector=projector,
             device=device,
             checkpoint_path=checkpoint_path,
             latent_dim=latent_dim,
             normalization=normalization,
+            latent_representation=latent_representation,
         )
-        print("Successfully loaded and frozen the LeWM Encoder from the official checkpoint!")
+        print(
+            "Successfully loaded and frozen the LeWM "
+            f"{latent_representation} representation from the official checkpoint!"
+        )
         return wrapper
 
     @classmethod
@@ -176,12 +224,14 @@ class LeWMEncoder(nn.Module):
         checkpoint_path=None,
         feature_dim=LEWM_DEFAULT_FEATURE_DIM,
         normalization=LEWM_IMAGE_NORMALIZATION,
+        latent_representation=LEWM_LATENT_RAW_CLS,
     ):
         return cls.from_checkpoint(
             device=device,
             checkpoint_path=checkpoint_path,
             latent_dim=feature_dim,
             normalization=normalization,
+            latent_representation=latent_representation,
         )
 
     @property
@@ -206,10 +256,26 @@ class LeWMEncoder(nn.Module):
             raise ValueError(f"unsupported LeWM image normalization: {self.normalization}")
         return pixels
 
+    def train(self, mode: bool = True):
+        """Keep both frozen feature modules in inference mode.
+
+        This is especially important for the projector's BatchNorm running
+        statistics when this wrapper is nested under a policy that calls
+        ``train()`` recursively.
+        """
+
+        super().train(False)
+        self.encoder.eval()
+        if self.projector is not None:
+            self.projector.eval()
+        return self
+
     @torch.no_grad()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         outputs = self.encoder(self._preprocess(images))
         features = outputs.last_hidden_state[:, 0, :]
+        if self.latent_representation == LEWM_LATENT_PROJECTED:
+            features = self.projector(features)
         if features.shape[-1] != self.latent_dim:
             raise ValueError(
                 f"expected LeWM latent_dim={self.latent_dim}, got {features.shape[-1]}"

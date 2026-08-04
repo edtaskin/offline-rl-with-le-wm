@@ -16,6 +16,7 @@ from src.representations.history import LatentHistory, temporal_ensemble_action
 from src.representations.lewm import (
     LEWM_IMAGE_NORMALIZATION,
     LEWM_LEGACY_IMAGE_NORMALIZATION,
+    LEWM_LATENT_RAW_CLS,
     LeWMEncoder,
 )
 from src.utils.hf_hub import (
@@ -199,10 +200,14 @@ def load_bc_components(checkpoint, stats_path=None, device="auto"):
         "action_dim": int(stats.get("action_dim", 2)),
     }
     normalization = stats.get("image_normalization", LEWM_LEGACY_IMAGE_NORMALIZATION)
+    latent_representation = stats.get(
+        "latent_representation", LEWM_LATENT_RAW_CLS
+    )
     encoder = LeWMEncoder.from_checkpoint(
         device=device,
         latent_dim=contract["latent_dim"],
         normalization=normalization,
+        latent_representation=latent_representation,
     )
     policy = LatentBCPolicy(
         latent_dim=contract["latent_dim"],
@@ -299,6 +304,9 @@ def make_bc_evaluation_agent(
             else "in-memory",
             "training_observation_resolution": bc_training_observation_resolution(
                 components.stats
+            ),
+            "latent_representation": components.stats.get(
+                "latent_representation", LEWM_LATENT_RAW_CLS
             ),
         },
     )

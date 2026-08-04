@@ -23,6 +23,7 @@ from src.bc.dataset import (
 )
 from src.bc.latent_cache import (
     build_latent_cache,
+    build_projected_latent_cache,
     check_latent_cache,
     default_latent_cache_path,
     expected_latent_cache_metadata,
@@ -31,6 +32,9 @@ from src.bc.latent_cache import (
 from src.representations.lewm import (
     LEWM_DEFAULT_FEATURE_DIM,
     LEWM_IMAGE_NORMALIZATION,
+    LEWM_LATENT_PROJECTED,
+    LEWM_LATENT_RAW_CLS,
+    LEWM_LATENT_REPRESENTATIONS,
     LeWMEncoder,
     default_lewm_checkpoint_path,
     lewm_preprocessing_metadata,
@@ -73,8 +77,13 @@ def _prepare_dataset(args, device):
     )
     latent_dim = LEWM_DEFAULT_FEATURE_DIM
     checkpoint_path = default_lewm_checkpoint_path()
+    latent_representation = getattr(
+        args, "latent_representation", LEWM_LATENT_RAW_CLS
+    )
     use_latent_cache = not args.disable_latent_cache
-    cache_path = args.latent_cache_path or default_latent_cache_path(args.data_path)
+    cache_path = args.latent_cache_path or default_latent_cache_path(
+        args.data_path, latent_representation
+    )
     cache_rebuilt = False
     expected_metadata = None
     extractor = None
@@ -85,6 +94,7 @@ def _prepare_dataset(args, device):
             checkpoint_path,
             num_samples=num_samples_from_data(args.data_path),
             latent_dim=latent_dim,
+            latent_representation=latent_representation,
         )
         cache_ok, cache_messages = check_latent_cache(cache_path, expected_metadata)
         if args.rebuild_latent_cache:
@@ -96,24 +106,53 @@ def _prepare_dataset(args, device):
             print(f"LeWM latent cache will be built at: {cache_path}")
             for message in cache_messages[:5]:
                 print(f"  cache miss: {message}")
-            source_dataset = PushTImageDataset(
-                args.data_path,
-                frame_stack=1,
-                frame_stride=1,
-                action_chunk_size=1,
-            )
             extractor = LeWMEncoder.load(
                 device=device,
                 checkpoint_path=checkpoint_path,
                 feature_dim=latent_dim,
+                latent_representation=latent_representation,
             )
-            build_latent_cache(
-                source_dataset,
-                extractor,
-                cache_path,
-                expected_metadata,
-                batch_size=args.latent_cache_batch_size or args.batch_size,
+            cache_batch_size = args.latent_cache_batch_size or args.batch_size
+            raw_cache_path = default_latent_cache_path(
+                args.data_path, LEWM_LATENT_RAW_CLS
             )
+            if (
+                latent_representation == LEWM_LATENT_PROJECTED
+                and Path(cache_path).resolve() == Path(raw_cache_path).resolve()
+            ):
+                raise ValueError(
+                    "projected and raw CLS caches must use different paths"
+                )
+            raw_metadata = expected_latent_cache_metadata(
+                args.data_path,
+                checkpoint_path,
+                num_samples=num_samples_from_data(args.data_path),
+                latent_dim=latent_dim,
+                latent_representation=LEWM_LATENT_RAW_CLS,
+            )
+            raw_cache_ok, _ = check_latent_cache(raw_cache_path, raw_metadata)
+            if latent_representation == LEWM_LATENT_PROJECTED and raw_cache_ok:
+                build_projected_latent_cache(
+                    raw_cache_path,
+                    extractor.projector,
+                    cache_path,
+                    expected_metadata,
+                    batch_size=cache_batch_size,
+                )
+            else:
+                source_dataset = PushTImageDataset(
+                    args.data_path,
+                    frame_stack=1,
+                    frame_stride=1,
+                    action_chunk_size=1,
+                )
+                build_latent_cache(
+                    source_dataset,
+                    extractor,
+                    cache_path,
+                    expected_metadata,
+                    batch_size=cache_batch_size,
+                )
             cache_rebuilt = True
         dataset = PushTLatentDataset(
             args.data_path,
@@ -134,6 +173,7 @@ def _prepare_dataset(args, device):
             device=device,
             checkpoint_path=checkpoint_path,
             feature_dim=latent_dim,
+            latent_representation=latent_representation,
         )
 
     latent_dim = int(dataset.stats.get("latent_dim", latent_dim))
@@ -142,6 +182,7 @@ def _prepare_dataset(args, device):
         **lewm_preprocessing_metadata(LEWM_IMAGE_NORMALIZATION),
         "source_image_shape": [observation_resolution, observation_resolution],
         "observation_resolution": observation_resolution,
+        "latent_representation": latent_representation,
     }
     return {
         "dataset": dataset,
@@ -198,6 +239,7 @@ def train_latent_bc(args):
         "latent_cache_path": prepared["cache_path"] if use_latent_cache else None,
         "latent_cache_rebuilt": prepared["cache_rebuilt"],
         "latent_cache_expected_metadata": prepared["expected_metadata"],
+        "latent_representation": dataset_stats["latent_representation"],
         "seed": args.seed,
         "deterministic": args.deterministic,
         "num_workers": args.num_workers,
@@ -378,7 +420,8 @@ def build_parser():
     parser.add_argument("--data_path", type=str, default="data/expert_trajectories/pusht_expert_224.npz", help="Path to the high-resolution expert dataset generated by scripts/regenerate_pusht_expert.py")
     parser.add_argument("--observation-resolution", "--observation_resolution", dest="observation_resolution", type=int, default=None, help="Native expert-image resolution. When omitted it is inferred from the dataset; an explicit mismatch is rejected")
     parser.add_argument("--checkpoint_path", type=str, default="runs/bc/pusht_latent_bc.pth", help="Temporary local output path used before optional Hugging Face upload")
-    parser.add_argument("--latent_cache_path", type=str, default=None, help="Path for cached per-frame LeWM CLS latents; defaults to data/latent_cache/<dataset>_lewm_object_imagenet224_cls.pt")
+    parser.add_argument("--latent-representation", "--latent_representation", dest="latent_representation", choices=LEWM_LATENT_REPRESENTATIONS, default=LEWM_LATENT_RAW_CLS, help="Frozen LeWM feature consumed by BC: historical encoder CLS or the learned JEPA-projected CLS")
+    parser.add_argument("--latent_cache_path", type=str, default=None, help="Path for cached per-frame LeWM latents; the default filename is representation-specific")
     parser.add_argument("--rebuild_latent_cache", action="store_true", help="Recompute and overwrite the LeWM latent cache before training")
     parser.add_argument("--disable_latent_cache", action="store_true", help="Disable latent caching and encode image batches through LeWM during every epoch")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
