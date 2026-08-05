@@ -33,7 +33,7 @@ from scripts.deprojector.bridge_horizon import load_raw_cls_bc_policy  # noqa: E
 from scripts.deprojector.common import repo_path  # noqa: E402
 from src.ppo.env import LatentHistory  # noqa: E402
 from src.ppo.train_lewm import DreamConfig, LeWMDreamWorld  # noqa: E402
-from src.representations.deprojector import load_deprojector  # noqa: E402
+from src.representations.deprojector import DEPROJECTOR_CHECKPOINT_HF, load_deprojector  # noqa: E402
 
 DEFAULT_BC = "hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best.pth"
 DEFAULT_BC_STATS = "hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best_stats.pth"
@@ -44,7 +44,7 @@ class DeprojectorDreamWorld(LeWMDreamWorld):
 
     def __init__(self, cfg, device, deprojector_path):
         super().__init__(cfg, device)
-        self.deprojector = load_deprojector(repo_path(deprojector_path), device)
+        self.deprojector = load_deprojector(deprojector_path, device)
 
     def _observe(self, pred: torch.Tensor) -> torch.Tensor:
         return self.deprojector(pred)
@@ -53,7 +53,7 @@ class DeprojectorDreamWorld(LeWMDreamWorld):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bridge", choices=("deprojector", "decoder", "both"), default="both")
-    parser.add_argument("--deprojector", default="models/deprojector/pusht_lewm/deprojector.pt")
+    parser.add_argument("--deprojector", default=DEPROJECTOR_CHECKPOINT_HF)
     parser.add_argument("--bc-checkpoint", default=DEFAULT_BC)
     parser.add_argument("--bc-stats", default=DEFAULT_BC_STATS)
     parser.add_argument("--episodes", type=int, default=96, help="imagined episodes per bridge")

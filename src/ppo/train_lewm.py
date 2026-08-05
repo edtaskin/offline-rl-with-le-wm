@@ -83,6 +83,7 @@ from src.ppo.train import (
     _stats_contract,
 )
 from src.ppo.utils import RewardNormalizer, get_device, set_seed
+from src.representations.deprojector import DEPROJECTOR_CHECKPOINT_HF
 
 # The dataset stores absolute pointer targets; the env/BC/PPO action space is
 # SWM-relative: env target = agent_xy + action * PUSHT_ACTION_SCALE.
@@ -122,7 +123,7 @@ class DreamConfig(LatentConfig):
     # "deprojector" maps latent to latent directly (see scripts/deprojector/).
     # The decoder is still loaded on demand for frame diagnostics either way.
     bridge: str = "decoder"
-    deprojector_checkpoint: str = "models/deprojector/pusht_lewm/deprojector.pt"
+    deprojector_checkpoint: str = DEPROJECTOR_CHECKPOINT_HF
 
     # One predictor step covers this many env steps; must equal both
     # frame_stride and action_chunk_size so agent and WM tick together.
@@ -353,7 +354,7 @@ class LeWMDreamWorld:
         if cfg.bridge == "deprojector":
             from src.representations.deprojector import load_deprojector
 
-            self._deprojector = load_deprojector(repo_path(cfg.deprojector_checkpoint), device)
+            self._deprojector = load_deprojector(cfg.deprojector_checkpoint, device)
             logger.info("Dream bridge: de-projector %s", cfg.deprojector_checkpoint)
         else:
             logger.info("Dream bridge: decoder %s", cfg.decoder_checkpoint)

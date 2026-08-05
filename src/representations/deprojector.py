@@ -20,6 +20,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+DEPROJECTOR_CHECKPOINT_HF = (
+    "hf://offline-rl-with-le-wm/deprojector_lewm_pusht/deprojector.pt"
+)
 DEPROJECTOR_LATENT_DIM = 192
 DEPROJECTOR_HIDDEN_DIM = 2048
 DEPROJECTOR_DEPTH = 2
@@ -98,13 +101,32 @@ def save_deprojector(model: Deprojector, path, metadata: dict | None = None) -> 
     return path
 
 
+def resolve_deprojector_reference(reference) -> Path:
+    """Accept a Hub reference, an absolute path, or a repo-relative path."""
+    from src.utils.hf_hub import parse_hf_artifact_reference, resolve_artifact
+
+    text = str(reference)
+    if parse_hf_artifact_reference(text) is not None:
+        return resolve_artifact(text)
+    path = Path(reference)
+    if not path.is_absolute() and not path.is_file():
+        candidate = Path(__file__).resolve().parents[2] / path
+        if candidate.is_file():
+            return candidate
+    return path
+
+
 def load_deprojector(path, device: torch.device | str = "cpu") -> Deprojector:
-    """Load a frozen de-projector saved by :func:`save_deprojector`."""
-    path = Path(path)
+    """Load a frozen de-projector saved by :func:`save_deprojector`.
+
+    ``path`` may be a local path or an ``hf://owner/repo/file.pt`` reference.
+    """
+    path = resolve_deprojector_reference(path)
     if not path.exists():
         raise FileNotFoundError(
             f"Missing de-projector checkpoint: {path}. Train one with "
-            "scripts/deprojector/train_deprojector_pusht.py."
+            "scripts/deprojector/train_deprojector_pusht.py, or point at the "
+            f"published one ({DEPROJECTOR_CHECKPOINT_HF})."
         )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     model = Deprojector(**payload["config"])

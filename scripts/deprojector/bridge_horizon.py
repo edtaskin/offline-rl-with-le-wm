@@ -49,7 +49,7 @@ from scripts.deprojector.common import (  # noqa: E402
 )
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy  # noqa: E402
 from src.bc.dataset import PUSHT_ACTION_SCALE  # noqa: E402
-from src.representations.deprojector import load_deprojector  # noqa: E402
+from src.representations.deprojector import DEPROJECTOR_CHECKPOINT_HF, load_deprojector  # noqa: E402
 from src.representations.lewm import LeWMEncoder, load_lewm_world_model  # noqa: E402
 from src.utils.hf_hub import resolve_artifact  # noqa: E402
 
@@ -67,7 +67,7 @@ def parse_args(argv=None):
     parser.add_argument("--dataset-path", default="le-wm/models/datasets/pusht_expert_train.h5")
     parser.add_argument("--wm-checkpoint", default="hf_pusht/weights.pt")
     parser.add_argument("--wm-cache-dir", default="le-wm/models")
-    parser.add_argument("--deprojector", default="models/deprojector/pusht_lewm/deprojector.pt")
+    parser.add_argument("--deprojector", default=DEPROJECTOR_CHECKPOINT_HF)
     parser.add_argument(
         "--decoder-checkpoint", default="models/latent_decoder/pusht_lewm/decoder_lewm_pusht.pt"
     )
@@ -142,7 +142,7 @@ def main(argv=None):
     cls_encoder = LeWMEncoder(wm.encoder, device=device)
     history_size = int(getattr(wm.predictor, "num_frames", 3) or 3)
 
-    deprojector = load_deprojector(repo_path(args.deprojector), device)
+    deprojector = load_deprojector(args.deprojector, device)
     decoder = None
     if not args.skip_decoder:
         from src.ppo.train_lewm import _load_decoder
