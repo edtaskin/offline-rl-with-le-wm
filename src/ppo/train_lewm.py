@@ -278,6 +278,19 @@ def _load_world_model(cfg: DreamConfig, device: torch.device) -> nn.Module:
     )
 
 
+def _resolve_decoder_reference(reference: str | Path) -> Path:
+    """Accept either a Hub reference or a repo-relative path.
+
+    Runs configure ``decoder_checkpoint`` both ways, and ``repo_path`` would
+    silently turn ``hf://owner/repo/file.pt`` into a bogus relative path.
+    """
+    from src.utils.hf_hub import parse_hf_artifact_reference, resolve_artifact
+
+    if parse_hf_artifact_reference(str(reference)) is not None:
+        return resolve_artifact(str(reference))
+    return repo_path(reference)
+
+
 def _load_decoder(path: Path, device: torch.device) -> nn.Module:
     """Load the frozen latent image decoder (same payload as decode_rollouts)."""
     if not path.exists():
@@ -322,7 +335,7 @@ class LeWMDreamWorld:
         self.wm = _load_world_model(cfg, device)
         self.history_size = int(getattr(self.wm.predictor, "num_frames", 3))
 
-        self.decoder = _load_decoder(repo_path(cfg.decoder_checkpoint), device)
+        self.decoder = _load_decoder(_resolve_decoder_reference(cfg.decoder_checkpoint), device)
         # Shared frozen ViT: raw CLS latents for the agent (and real-env eval);
         # the WM's projector lifts the same CLS into the dynamics latent space.
         # Pass the device explicitly: LeWMEncoder defaults to CPU and moves the
