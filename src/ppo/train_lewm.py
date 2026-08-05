@@ -79,7 +79,7 @@ from src.ppo.train import (
     _NULLABLE_STR_FIELDS,
     SMOKE_OVERRIDES,
     _flag_names,
-    _push_checkpoint_to_hf,
+    _push_run_artifacts,
     _stats_contract,
 )
 from src.ppo.utils import RewardNormalizer, get_device, set_seed
@@ -1265,7 +1265,7 @@ def main() -> None:
     try:
         trainer.train()
         if cfg.push_to_hf:
-            _push_checkpoint_to_hf(cfg, trainer.run_dir / "best.pt")
+            _push_run_artifacts(cfg, trainer.run_dir)
     finally:
         if cfg.track:
             import wandb

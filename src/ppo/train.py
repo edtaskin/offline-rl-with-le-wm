@@ -166,12 +166,52 @@ def main() -> None:
     try:
         trainer.train()
         if cfg.push_to_hf:
-            _push_checkpoint_to_hf(cfg, trainer.run_dir / "best.pt")
+            _push_run_artifacts(cfg, trainer.run_dir)
     finally:
         if cfg.track:
             import wandb
 
             wandb.finish()
+
+
+def _push_run_artifacts(cfg: LatentConfig, run_dir: Path) -> None:
+    """Publish what a run needs to be re-analysed, not only ``best.pt``.
+
+    ``final.pt`` is the no-selection control, and a dream run's
+    ``selection_log.jsonl`` carries the paired imagined/real measurements the
+    optimism analysis reads. Without them a published run can only be re-scored,
+    not re-examined.
+
+    Everything lands under ``cfg.hf_path_prefix``. With no prefix the files go to
+    the repository root, where ``best.pt``/``final.pt`` already exist from
+    earlier runs and would be overwritten -- campaigns should always set one.
+    """
+    from src.utils.hf_hub import push_files_to_hub
+
+    if not cfg.hf_repo_id:
+        raise ValueError("--push_to_hf requires --hf_repo_id (e.g. your-username/pusht-latent-ppo)")
+    candidates = ["best.pt", "final.pt", "selection_log.jsonl"]
+    paths = [str(run_dir / name) for name in candidates if (run_dir / name).is_file()]
+    if not paths:
+        raise FileNotFoundError(f"No publishable artifacts in {run_dir}")
+    if not cfg.hf_path_prefix:
+        print(
+            "warning: --push_to_hf without --hf_path_prefix writes to the repository "
+            "root and can overwrite artifacts from earlier runs"
+        )
+    result = push_files_to_hub(
+        repo_id=cfg.hf_repo_id,
+        file_paths=paths,
+        repo_type=cfg.hf_repo_type,
+        private=cfg.hf_private,
+        token=cfg.hf_token,
+        revision=cfg.hf_revision,
+        path_prefix=cfg.hf_path_prefix,
+        commit_message=cfg.hf_commit_message,
+    )
+    destination = f"{cfg.hf_path_prefix.rstrip('/')}/" if cfg.hf_path_prefix else ""
+    for path in paths:
+        print(f"Pushed {destination}{Path(path).name} to {result.repo_url}")
 
 
 def _push_checkpoint_to_hf(cfg: LatentConfig, checkpoint_path: Path) -> None:

@@ -124,6 +124,10 @@ def build_world_and_agent(args):
 
     device = resolve_device(args.device)
     world = LeWMDreamWorld(cfg, device)
+    # This script exists to look at the imagined frames, so it always needs them
+    # decoded -- including for a de-projector run, whose policy path never
+    # renders anything.
+    world.capture_frames = True
     # The policy must consume exactly the latents the dream world produces, from
     # the same frozen ViT, as it did during training.
     components = load_ppo_components(checkpoint, device, encoder=world.cls_encoder)
@@ -437,6 +441,17 @@ def main() -> None:
         "wm_frameskip": cfg.wm_frameskip,
         "rollout_seed": args.rollout_seed,
         "verification": verification,
+        # Per-episode records, so the hallucination rate can be read against the
+        # step the probe fired at. A pooled rate cannot say whether shortening
+        # dream_episode_steps would remove the false successes or leave them.
+        "records": [
+            {
+                "steps_to_declared_success": int(episode["steps"]),
+                "declared_probability": float(episode["success_prob"][-1]),
+                "real_success": episode.get("real_success"),
+            }
+            for episode in declared
+        ],
     }
     path = output_root / "summary.json"
     path.parent.mkdir(parents=True, exist_ok=True)
