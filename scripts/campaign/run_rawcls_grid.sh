@@ -35,11 +35,21 @@
 # under rawcls_bc_best/<arm>/seed<N>/ in the Hub repo. Destinations are checked
 # for collisions before any training starts, so nothing existing is overwritten.
 #
+# Prerequisites on a fresh machine: the LeWM object checkpoint
+# (python -m scripts.download_lewm_checkpoint) and .env with WANDB_API_KEY and
+# HF_TOKEN. BC priors are pulled from the Hub automatically. The real-env arms need
+# nothing else; the dream arms additionally need the expert h5 and the probes.
+#
 # Usage:
 #   bash scripts/campaign/run_rawcls_grid.sh                      # 4 arms x seeds 1 2 3
 #   bash scripts/campaign/run_rawcls_grid.sh --seeds "1"          # one seed
 #   bash scripts/campaign/run_rawcls_grid.sh --only dream_sparse
+#   bash scripts/campaign/run_rawcls_grid.sh --only "real_sparse real_dense"
 #   bash scripts/campaign/run_rawcls_grid.sh --dry-run            # print commands only
+#
+# --exp-prefix names the run dirs, the W&B runs and (by default) the Hub folder, so
+# a second prior can reuse this script without colliding with the first campaign.
+# See scripts/campaign/run_legacy_prior_control.sh for that case.
 #
 # Runs are sequential: every arm wants the GPU and the frozen ViT.
 
@@ -55,7 +65,8 @@ DREAM_EPISODE_STEPS=20
 DREAM_EVAL_STEPS=20          # pinned, so the selection metric stays comparable
 EVAL_EPISODES=50             # in-training held-out eval; 20 is too noisy to rank with
 HF_REPO="offline-rl-with-le-wm/ppo"
-HF_NAMESPACE="rawcls_bc_best"
+EXP_PREFIX="rawcls"
+HF_NAMESPACE=""
 WANDB_PROJECT="offline-rl-lewm"
 BC_CKPT="hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best.pth"
 BC_STATS="hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best_stats.pth"
@@ -71,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     --bridge) BRIDGE="$2"; shift 2 ;;
     --hf-repo) HF_REPO="$2"; shift 2 ;;
     --hf-namespace) HF_NAMESPACE="$2"; shift 2 ;;
+    --exp-prefix) EXP_PREFIX="$2"; shift 2 ;;
     --bc-checkpoint) BC_CKPT="$2"; shift 2 ;;
     --bc-stats) BC_STATS="$2"; shift 2 ;;
     --no-push) NO_PUSH=1; shift ;;
@@ -84,8 +96,27 @@ done
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Namespace defaults to the experiment prefix, so two priors never share a
+# Hub folder or a runs/ directory.
+HF_NAMESPACE="${HF_NAMESPACE:-${EXP_PREFIX}_bc_best}"
+
 ARMS="real_sparse real_dense dream_sparse dream_dense"
 if [[ "$ONLY" != "all" ]]; then ARMS="$ONLY"; fi
+
+# ---- preflight: the LeWM encoder is not downloaded on demand -----------------
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  python - <<'PYCHECK' || { echo "aborting: LeWM encoder checkpoint missing" >&2; exit 1; }
+import sys
+sys.path.insert(0, ".")
+from src.representations.lewm import default_lewm_checkpoint_path
+path = default_lewm_checkpoint_path()
+if not path.exists():
+    print(f"missing LeWM object checkpoint: {path}", file=sys.stderr)
+    print("run: python -m scripts.download_lewm_checkpoint", file=sys.stderr)
+    raise SystemExit(1)
+print(f"== LeWM encoder ok: {path}")
+PYCHECK
+fi
 
 # ---- preflight: refuse to start if any destination is already taken ----------
 if [[ "$NO_PUSH" -eq 0 ]]; then
@@ -119,7 +150,7 @@ COMMON=(
 
 for seed in $SEEDS; do
   for arm in $ARMS; do
-    exp="rawcls_${arm}"
+    exp="${EXP_PREFIX}_${arm}"
     prefix="${HF_NAMESPACE}/${arm}/seed${seed}"
     push=()
     if [[ "$NO_PUSH" -eq 0 ]]; then
@@ -171,9 +202,9 @@ for seed in $SEEDS; do
         --block-start-radius 200 \
         --episodes 50 --repeats 3 --seed 42 --max-episode-steps 300 \
         --execution-mode open-loop \
-        --run-name "${arm}-seed${seed}-${variant}" \
+        --run-name "${EXP_PREFIX}-${arm}-seed${seed}-${variant}" \
         --wandb --wandb-project "$WANDB_PROJECT" \
-        --wandb-run-name "${arm}-seed${seed}-${variant}-eval"
+        --wandb-run-name "${EXP_PREFIX}-${arm}-seed${seed}-${variant}-eval"
     done
   done
 done
