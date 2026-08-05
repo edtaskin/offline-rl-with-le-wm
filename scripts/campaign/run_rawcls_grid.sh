@@ -66,11 +66,13 @@ DREAM_EVAL_STEPS=20          # pinned, so the selection metric stays comparable
 EVAL_EPISODES=50             # in-training held-out eval; 20 is too noisy to rank with
 HF_REPO="offline-rl-with-le-wm/ppo"
 EXP_PREFIX="rawcls"
+ARM_SUFFIX=""
 HF_NAMESPACE=""
 WANDB_PROJECT="offline-rl-lewm"
 BC_CKPT="hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best.pth"
 BC_STATS="hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best_stats.pth"
 BRIDGE="deprojector"
+DECODER_CHECKPOINT=""      # empty -> DreamConfig default (repo-local path)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,9 +82,11 @@ while [[ $# -gt 0 ]]; do
     --dream-episode-steps) DREAM_EPISODE_STEPS="$2"; shift 2 ;;
     --dream-eval-steps) DREAM_EVAL_STEPS="$2"; shift 2 ;;
     --bridge) BRIDGE="$2"; shift 2 ;;
+    --decoder-checkpoint) DECODER_CHECKPOINT="$2"; shift 2 ;;
     --hf-repo) HF_REPO="$2"; shift 2 ;;
     --hf-namespace) HF_NAMESPACE="$2"; shift 2 ;;
     --exp-prefix) EXP_PREFIX="$2"; shift 2 ;;
+    --arm-suffix) ARM_SUFFIX="$2"; shift 2 ;;
     --bc-checkpoint) BC_CKPT="$2"; shift 2 ;;
     --bc-stats) BC_STATS="$2"; shift 2 ;;
     --no-push) NO_PUSH=1; shift ;;
@@ -118,12 +122,37 @@ print(f"== LeWM encoder ok: {path}")
 PYCHECK
 fi
 
+# ---- preflight: dream arms need the expert h5 and the success probe -----------
+if [[ "$DRY_RUN" -eq 0 && "$ARMS" == *dream* ]]; then
+  python - <<'PYCHECK' || { echo "aborting: dream prerequisites missing" >&2; exit 1; }
+import sys
+from pathlib import Path
+sys.path.insert(0, ".")
+from src.ppo.train_lewm import DreamConfig, repo_path
+cfg = DreamConfig()
+missing = []
+dataset = repo_path(cfg.dataset_path)
+if not dataset.is_file():
+    missing.append(f"expert dataset {dataset} (~46 GB; copy it or re-export it)")
+probe_dir = repo_path(cfg.probe_dir)
+if not any((probe_dir / name).is_file() for name in
+           ("objective_met/mlp_probe.pt", "is_objective_met_probe_baseline.pt")):
+    missing.append(
+        f"objective_met classifier under {probe_dir} "
+        "(hf.co/offline-rl-with-le-wm/probes/is_objective_met_probe_baseline.pt)"
+    )
+for item in missing:
+    print(f"missing: {item}", file=sys.stderr)
+raise SystemExit(1 if missing else 0)
+PYCHECK
+fi
+
 # ---- preflight: refuse to start if any destination is already taken ----------
 if [[ "$NO_PUSH" -eq 0 ]]; then
   PREFIXES=()
   for arm in $ARMS; do
     for seed in $SEEDS; do
-      PREFIXES+=("${HF_NAMESPACE}/${arm}/seed${seed}")
+      PREFIXES+=("${HF_NAMESPACE}/${arm}${ARM_SUFFIX}/seed${seed}")
     done
   done
   echo "== checking ${#PREFIXES[@]} Hub destination(s) in ${HF_REPO}"
@@ -150,8 +179,8 @@ COMMON=(
 
 for seed in $SEEDS; do
   for arm in $ARMS; do
-    exp="${EXP_PREFIX}_${arm}"
-    prefix="${HF_NAMESPACE}/${arm}/seed${seed}"
+    exp="${EXP_PREFIX}_${arm}${ARM_SUFFIX}"
+    prefix="${HF_NAMESPACE}/${arm}${ARM_SUFFIX}/seed${seed}"
     push=()
     if [[ "$NO_PUSH" -eq 0 ]]; then
       push=(--push_to_hf --hf_repo_id "$HF_REPO" --hf_path_prefix "$prefix")
@@ -173,6 +202,10 @@ for seed in $SEEDS; do
         ;;
       dream_sparse|dream_dense)
         reward="${arm#dream_}"
+        decoder_arg=()
+        if [[ -n "$DECODER_CHECKPOINT" ]]; then
+          decoder_arg=(--decoder_checkpoint "$DECODER_CHECKPOINT")
+        fi
         run python -m src.ppo.train_lewm \
           --exp_name "$exp" --seed "$seed" \
           --bridge "$BRIDGE" \
@@ -181,6 +214,7 @@ for seed in $SEEDS; do
           --dream_eval_steps "$DREAM_EVAL_STEPS" \
           --selection dream --dream_eval_interval 10 --dream_eval_episodes 96 \
           --record_real_eval --eval_interval 10 --eval_episodes "$EVAL_EPISODES" \
+          ${decoder_arg[@]+"${decoder_arg[@]}"} \
           "${COMMON[@]}" ${push[@]+"${push[@]}"}
         ;;
       *) echo "unknown arm: $arm" >&2; exit 2 ;;
@@ -202,9 +236,9 @@ for seed in $SEEDS; do
         --block-start-radius 200 \
         --episodes 50 --repeats 3 --seed 42 --max-episode-steps 300 \
         --execution-mode open-loop \
-        --run-name "${EXP_PREFIX}-${arm}-seed${seed}-${variant}" \
+        --run-name "${EXP_PREFIX}-${arm}${ARM_SUFFIX}-seed${seed}-${variant}" \
         --wandb --wandb-project "$WANDB_PROJECT" \
-        --wandb-run-name "${EXP_PREFIX}-${arm}-seed${seed}-${variant}-eval"
+        --wandb-run-name "${EXP_PREFIX}-${arm}${ARM_SUFFIX}-seed${seed}-${variant}-eval"
     done
   done
 done
