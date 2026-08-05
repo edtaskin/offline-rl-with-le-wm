@@ -307,6 +307,13 @@ class LeWMDreamWorld:
     """
 
     def __init__(self, cfg: DreamConfig, device: torch.device):
+        # The expert h5 stores pixels Blosc/Zstd-compressed. Without the
+        # hdf5plugin filters registered, the first pixel read fails with a bare
+        # "can't open directory /usr/local/lib/plugin" OSError.
+        try:
+            import hdf5plugin  # noqa: F401
+        except ImportError:
+            pass
         import h5py
 
         self.cfg = cfg
@@ -652,6 +659,20 @@ class LeWMDreamWorld:
         self._steps[i] = 0
         return cls
 
+    # ----------------------------------------------------------------- bridge
+    def _observe(self, pred: torch.Tensor) -> torch.Tensor:
+        """Imagined dynamics latent -> the raw CLS latent the policy consumes.
+
+        LeWM's predictor works in the projected space; the BC-initialized policy
+        reads raw CLS. This bridges the two by rendering the imagined latent and
+        re-encoding the frame. Subclasses can override it with a cheaper map (see
+        ``scripts/deprojector/``); ``last_frames`` is inspection-only state read
+        by ``scripts/rq2/dream_success_gallery.py`` and never by training.
+        """
+        frames = self.decoder(pred).clamp(0.0, 1.0)  # [n, 3, 224, 224]
+        self.last_frames = frames
+        return self.cls_encoder(frames)
+
     # ------------------------------------------------------------------ step
     @torch.no_grad()
     def step(self, actions: torch.Tensor):
@@ -691,13 +712,7 @@ class LeWMDreamWorld:
         for i in range(n):
             self._emb_hist[i].append(pred[i])
 
-        # Decoder bridge: imagined dynamics latent -> RGB frame -> the raw CLS
-        # latent the (BC-initialized) policy actually consumes.
-        frames = self.decoder(pred).clamp(0.0, 1.0)  # [n, 3, 224, 224]
-        cls = self.cls_encoder(frames)
-        # Kept for inspection only (scripts/rq2/dream_success_gallery.py renders
-        # the frames PPO believed were successes); training never reads these.
-        self.last_frames = frames
+        cls = self._observe(pred)
         self.last_latent = pred
 
         # Reward/success are read from the imagined projected latent. The
