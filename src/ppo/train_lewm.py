@@ -117,6 +117,13 @@ class DreamConfig(LatentConfig):
     probe_dir: str = "models/probes/pusht_lewm"
     dataset_path: str = "le-wm/models/datasets/pusht_expert_train.h5"
 
+    # How an imagined (projected) latent is returned to the policy's raw-CLS
+    # input space. "decoder" renders a frame and re-encodes it with the ViT;
+    # "deprojector" maps latent to latent directly (see scripts/deprojector/).
+    # The decoder is still loaded on demand for frame diagnostics either way.
+    bridge: str = "decoder"
+    deprojector_checkpoint: str = "models/deprojector/pusht_lewm/deprojector.pt"
+
     # One predictor step covers this many env steps; must equal both
     # frame_stride and action_chunk_size so agent and WM tick together.
     wm_frameskip: int = 5
@@ -184,6 +191,8 @@ class DreamConfig(LatentConfig):
             )
         if self.action_dim != 2:
             raise ValueError("PushT dream rollouts require action_dim == 2")
+        if self.bridge not in ("decoder", "deprojector"):
+            raise ValueError(f"bridge must be 'decoder' or 'deprojector', got {self.bridge!r}")
         if self.selection not in ("dream", "real", "rolling"):
             raise ValueError(
                 f"selection must be 'dream', 'real' or 'rolling', got {self.selection!r}"
@@ -335,7 +344,19 @@ class LeWMDreamWorld:
         self.wm = _load_world_model(cfg, device)
         self.history_size = int(getattr(self.wm.predictor, "num_frames", 3))
 
-        self.decoder = _load_decoder(_resolve_decoder_reference(cfg.decoder_checkpoint), device)
+        # The decoder is loaded on first use, so a de-projector run needs no
+        # decoder checkpoint at all -- but frame diagnostics
+        # (scripts/rq2/dream_success_gallery.py) can still ask for one.
+        self._decoder = None
+        self._deprojector = None
+        self.capture_frames = cfg.bridge == "decoder"
+        if cfg.bridge == "deprojector":
+            from src.representations.deprojector import load_deprojector
+
+            self._deprojector = load_deprojector(repo_path(cfg.deprojector_checkpoint), device)
+            logger.info("Dream bridge: de-projector %s", cfg.deprojector_checkpoint)
+        else:
+            logger.info("Dream bridge: decoder %s", cfg.decoder_checkpoint)
         # Shared frozen ViT: raw CLS latents for the agent (and real-env eval);
         # the WM's projector lifts the same CLS into the dynamics latent space.
         # Pass the device explicitly: LeWMEncoder defaults to CPU and moves the
@@ -673,15 +694,32 @@ class LeWMDreamWorld:
         return cls
 
     # ----------------------------------------------------------------- bridge
+    @property
+    def decoder(self) -> nn.Module:
+        """Frozen latent image decoder, loaded on first use."""
+        if self._decoder is None:
+            self._decoder = _load_decoder(
+                _resolve_decoder_reference(self.cfg.decoder_checkpoint), self.device
+            )
+        return self._decoder
+
+    @decoder.setter
+    def decoder(self, module: nn.Module) -> None:
+        self._decoder = module
+
     def _observe(self, pred: torch.Tensor) -> torch.Tensor:
         """Imagined dynamics latent -> the raw CLS latent the policy consumes.
 
         LeWM's predictor works in the projected space; the BC-initialized policy
-        reads raw CLS. This bridges the two by rendering the imagined latent and
-        re-encoding the frame. Subclasses can override it with a cheaper map (see
-        ``scripts/deprojector/``); ``last_frames`` is inspection-only state read
-        by ``scripts/rq2/dream_success_gallery.py`` and never by training.
+        reads raw CLS. ``bridge="decoder"`` crosses that gap through pixels;
+        ``bridge="deprojector"`` maps latent to latent. ``last_frames`` is
+        inspection-only state read by ``scripts/rq2/dream_success_gallery.py``
+        and never by training, so the de-projector path only pays for it when
+        ``capture_frames`` is set.
         """
+        if self._deprojector is not None:
+            self.last_frames = self.decoder(pred).clamp(0.0, 1.0) if self.capture_frames else None
+            return self._deprojector(pred)
         frames = self.decoder(pred).clamp(0.0, 1.0)  # [n, 3, 224, 224]
         self.last_frames = frames
         return self.cls_encoder(frames)
