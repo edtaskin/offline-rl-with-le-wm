@@ -15,7 +15,6 @@ LEWM_IMAGE_SIZE = (224, 224)
 LEWM_IMAGE_MEAN = [0.485, 0.456, 0.406]
 LEWM_IMAGE_STD = [0.229, 0.224, 0.225]
 LEWM_IMAGE_NORMALIZATION = "imagenet"
-LEWM_LEGACY_IMAGE_NORMALIZATION = "legacy_div255"
 LEWM_DEFAULT_FEATURE_DIM = 192
 
 
@@ -132,6 +131,12 @@ class LeWMEncoder(nn.Module):
                 "torchvision is required for LeWM image preprocessing. "
                 "Install torchvision or use the intended project environment."
             ) from exc
+        if normalization != LEWM_IMAGE_NORMALIZATION:
+            raise ValueError(
+                f"unsupported LeWM image normalization: {normalization!r}. The frozen "
+                "encoder was trained under ImageNet statistics and only "
+                f"{LEWM_IMAGE_NORMALIZATION!r} reproduces its training distribution."
+            )
         resolved_dim = latent_dim if latent_dim is not None else feature_dim
         self.latent_dim = int(resolved_dim or LEWM_DEFAULT_FEATURE_DIM)
         self.feature_dim = self.latent_dim
@@ -194,21 +199,26 @@ class LeWMEncoder(nn.Module):
         }
 
     def _preprocess(self, images: torch.Tensor) -> torch.Tensor:
+        """Scale, resize and ImageNet-normalize, matching how LeWM was trained.
+
+        Upstream normalizes before resizing (``le-wm/eval.py`` composes
+        ``ToDtype(scale=True) -> Normalize(ImageNet) -> Resize``); the two orders
+        are numerically identical because antialiased resize weights sum to one.
+        Unlike ``ToDtype(scale=True)``, which only rescales integer dtypes, float
+        batches still in 0-255 are scaled here as well.
+        """
         if images.ndim != 4:
             raise ValueError(f"expected NCHW image batch, got shape {tuple(images.shape)}")
         pixels = images.to(device=self.device, dtype=torch.float32)
         if images.dtype == torch.uint8 or pixels.max() > 1.5:
             pixels = pixels / 255.0
-        pixels = self.resize(pixels)
-        if self.normalization == LEWM_IMAGE_NORMALIZATION:
-            pixels = self.normalize(pixels)
-        elif self.normalization != LEWM_LEGACY_IMAGE_NORMALIZATION:
-            raise ValueError(f"unsupported LeWM image normalization: {self.normalization}")
-        return pixels
+        return self.normalize(self.resize(pixels))
 
     @torch.no_grad()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        outputs = self.encoder(self._preprocess(images))
+        # interpolate_pos_encoding mirrors JEPA.encode; a no-op at the native 224
+        # but required for any other image_size.
+        outputs = self.encoder(self._preprocess(images), interpolate_pos_encoding=True)
         features = outputs.last_hidden_state[:, 0, :]
         if features.shape[-1] != self.latent_dim:
             raise ValueError(

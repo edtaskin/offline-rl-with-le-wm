@@ -15,7 +15,6 @@ from src.ppo.agent import build_latent_agent
 from src.representations.history import LatentHistory, temporal_ensemble_action
 from src.representations.lewm import (
     LEWM_IMAGE_NORMALIZATION,
-    LEWM_LEGACY_IMAGE_NORMALIZATION,
     LeWMEncoder,
 )
 from src.utils.hf_hub import (
@@ -198,7 +197,7 @@ def load_bc_components(checkpoint, stats_path=None, device="auto"):
         "hidden_dim": int(stats.get("hidden_dim", 256)),
         "action_dim": int(stats.get("action_dim", 2)),
     }
-    normalization = stats.get("image_normalization", LEWM_LEGACY_IMAGE_NORMALIZATION)
+    normalization = stats.get("image_normalization", LEWM_IMAGE_NORMALIZATION)
     encoder = LeWMEncoder.from_checkpoint(
         device=device,
         latent_dim=contract["latent_dim"],

@@ -20,7 +20,11 @@ from src.bc.history import (
     temporal_ensemble_action,
 )
 from src.bc.latent_cache import check_latent_cache, metadata_matches
-from src.representations.lewm import LeWMEncoder
+from src.representations.lewm import (
+    LEWM_IMAGE_MEAN,
+    LEWM_IMAGE_STD,
+    LeWMEncoder,
+)
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 
 
@@ -161,7 +165,7 @@ class CacheAndPolicyTests(unittest.TestCase):
 
     def test_frozen_extractor_outputs_can_train_policy_head(self):
         class FakeEncoder(torch.nn.Module):
-            def forward(self, images):
+            def forward(self, images, interpolate_pos_encoding=False):
                 pooled = images.mean(dim=(1, 2, 3))
                 tokens = pooled[:, None, None].repeat(1, 1, 3)
                 return SimpleNamespace(last_hidden_state=tokens)
@@ -180,6 +184,38 @@ class CacheAndPolicyTests(unittest.TestCase):
         policy(features).sum().backward()
         self.assertTrue(any(parameter.grad is not None for parameter in policy.parameters()))
         self.assertTrue(all(parameter.grad is None for parameter in encoder.parameters()))
+
+
+class LeWMPreprocessingTests(unittest.TestCase):
+    """The frozen encoder only sees the distribution LeWM was trained on."""
+
+    def _extractor(self, **kwargs):
+        class FakeEncoder(torch.nn.Module):
+            def forward(self, images, interpolate_pos_encoding=False):
+                return SimpleNamespace(last_hidden_state=images.new_zeros(len(images), 1, 3))
+
+        return LeWMEncoder(
+            encoder=FakeEncoder(), device="cpu", checkpoint_path="unused.ckpt", feature_dim=3, **kwargs
+        )
+
+    def test_preprocess_applies_imagenet_statistics(self):
+        extractor = self._extractor()
+        images = torch.randint(0, 256, (2, 3, 224, 224), dtype=torch.uint8)
+        mean = torch.tensor(LEWM_IMAGE_MEAN).view(1, 3, 1, 1)
+        std = torch.tensor(LEWM_IMAGE_STD).view(1, 3, 1, 1)
+        expected = (images.float() / 255.0 - mean) / std
+        self.assertTrue(torch.allclose(extractor._preprocess(images), expected, atol=1e-6))
+
+    def test_float_batches_still_in_0_255_are_scaled(self):
+        extractor = self._extractor()
+        images = torch.randint(0, 256, (2, 3, 224, 224), dtype=torch.uint8)
+        self.assertTrue(
+            torch.equal(extractor._preprocess(images), extractor._preprocess(images.float()))
+        )
+
+    def test_non_imagenet_normalization_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._extractor(normalization="legacy_div255")
 
 
 if __name__ == "__main__":
