@@ -619,8 +619,8 @@ def test_trainer_end_to_end_fake_env(monkeypatch=None):
         assert not torch.equal(trainer.agent.actor.log_std.detach(), logstd_before)
 
         # Saved checkpoint excludes the (large, frozen) encoder weights.
-        # weights_only=False matches src/ppo/evaluate.py (checkpoints carry a
-        # config dict + normalizer numpy state).
+        # weights_only=False matches the canonical evaluation loader (checkpoints
+        # carry a config dict + normalizer numpy state).
         ckpt = torch.load(trainer.run_dir / "final.pt", map_location="cpu", weights_only=False)
         assert not any(k.startswith(("actor.encoder.", "critic.encoder.")) for k in ckpt["agent"])
     finally:

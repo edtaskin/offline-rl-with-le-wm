@@ -105,8 +105,8 @@ class LatentConfig:
     # Honest best-checkpoint selection: every ``eval_interval`` iterations, run
     # ``eval_episodes`` deterministic (mean-action, open-loop) episodes on seeds
     # ``[eval_seed, eval_seed + N)`` and select ``best.pt`` by that success --
-    # matching src/ppo/evaluate.py. ``0`` disables it and falls back to
-    # the rolling-window (deque) selection.
+    # matching the canonical evaluator in ``src/evaluation/evaluate_pusht.py``.
+    # ``0`` disables it and falls back to the rolling-window (deque) selection.
     eval_interval: int = 0
     eval_episodes: int = 20
     eval_seed: int = 0

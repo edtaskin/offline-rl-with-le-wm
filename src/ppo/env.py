@@ -7,8 +7,8 @@ latents, exactly like the BC policy at train/eval time. This module provides:
   returning RGB frames (via :func:`src.envs.make_pusht_env`) plus episode-stat
   recording, matching the manual parallel-env style of the trainer in
   :mod:`src.ppo.ppo`.
-* :class:`LatentHistory` -- a per-env ring buffer of step latents that reproduces
-  the dilated frame selection from ``src/bc/run_eval.py`` (``build_stacked_latents``).
+* :class:`LatentHistory` -- a per-env ring buffer of step latents shared with
+  BC training and canonical evaluation.
 """
 
 from __future__ import annotations

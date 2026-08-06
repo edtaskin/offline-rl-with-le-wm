@@ -6,8 +6,8 @@ agent contract (frame_stack=3, frame_stride=5, action_chunk_size=5) maps 1:1
 onto the world model (history=3, frameskip=5). Per imagined step:
 
 1. the agent picks an action chunk ``[k, 2]`` from its dilated stack of raw
-   CLS latents (same interface as :mod:`src.ppo.ppo`, so BC init and
-   ``src/ppo/evaluate.py`` keep working);
+   CLS latents (same interface as :mod:`src.ppo.ppo`, so BC initialization and
+   the canonical evaluation adapter keep working);
 2. the chunk is converted to the dataset action space, z-scored with dataset
    stats, and fed to ``wm.action_encoder`` + ``wm.predict`` to imagine the next
    *projected* latent (the space LeWM dynamics run in);
