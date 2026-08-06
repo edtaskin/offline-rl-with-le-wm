@@ -234,7 +234,7 @@ for seed in $SEEDS; do
         --checkpoint "${run_dir}${variant}.pt" \
         --observation-resolution 224 --training-observation-resolution 224 \
         --block-start-radius 200 \
-        --episodes 50 --repeats 3 --seed 42 --max-episode-steps 300 \
+        --episodes 150 --seed 42 --max-episode-steps 300 \
         --execution-mode open-loop \
         --run-name "${EXP_PREFIX}-${arm}${ARM_SUFFIX}-seed${seed}-${variant}" \
         --wandb --wandb-project "$WANDB_PROJECT" \

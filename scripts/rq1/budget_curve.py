@@ -7,11 +7,9 @@ on. The budget on that axis is what the checkpoint actually cost: rollout steps
 plus any steps spent evaluating in the simulator to pick it.
 
 Snapshots are evaluated with the same loop as the headline table -- the same
-:class:`PushTEvalConfig`, the same non-overlapping repeat seeds, a fresh env per
-repeat -- but with one frozen ViT amortized across every snapshot in a run, since
-rebuilding the encoder dozens of times would dominate the runtime. Curve points
-default to fewer episodes than the headline table (one repeat instead of three):
-a curve needs many cheap points, the table needs few precise ones.
+:class:`PushTEvalConfig` and the same episode seeds sampled from one master seed
+-- but with one frozen ViT amortized across every snapshot in a run, since
+rebuilding the encoder dozens of times would dominate the runtime.
 
 The dream-PPO reference level is *not* computed here; it comes from
 ``results.jsonl`` and is drawn by ``scripts/rq1/report.py`` as a horizontal line
@@ -20,7 +18,7 @@ at x = 0.
 Usage::
 
     python -m scripts.rq1.budget_curve --seeds 1 2 3
-    python -m scripts.rq1.budget_curve --seeds 1 2 3 --every 1 --repeats 2
+    python -m scripts.rq1.budget_curve --seeds 1 2 3 --every 1
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.rq_common import (
     CANONICAL_EVAL,
     checkpoint_budget,
-    evaluate_agent_repeats,
+    evaluate_agent,
     find_run_dir,
     read_jsonl,
     repo_path,
@@ -70,12 +68,6 @@ def parse_args() -> argparse.Namespace:
         help="evaluate every Nth snapshot (the first and last are always kept)",
     )
     parser.add_argument("--episodes", type=int, default=CANONICAL_EVAL["episodes"])
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=1,
-        help="repeats per curve point (default 1; the headline table uses 3)",
-    )
     parser.add_argument("--eval-seed", type=int, default=CANONICAL_EVAL["seed"])
     parser.add_argument(
         "--block-start-radius", type=float, default=CANONICAL_EVAL["block_start_radius"]
@@ -140,10 +132,9 @@ def main() -> None:
                 agent = make_ppo_evaluation_agent(
                     components=components, deterministic=True, execution_mode="open-loop"
                 )
-                result = evaluate_agent_repeats(
+                result = evaluate_agent(
                     agent,
                     episodes=args.episodes,
-                    repeats=args.repeats,
                     seed=args.eval_seed,
                     block_start_radius=args.block_start_radius,
                 )

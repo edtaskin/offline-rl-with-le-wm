@@ -36,6 +36,10 @@ class PushTEvalConfig:
     env_id: str = "swm/PushT-v1"
     episodes: int = 20
     seed: int = 42
+    # Canonical evaluation supplies an explicit, reproducible set of
+    # well-separated episode seeds derived from ``seed``. Other callers may omit
+    # it and retain the legacy arithmetic ``seed + i * seed_stride`` schedule.
+    episode_seeds: tuple[int, ...] | None = None
     # Gap between consecutive episode seeds. Consecutive integer seeds collide in
     # the underlying PushT reset roughly 17% of the time, which silently turns
     # some evaluation episodes into duplicates of their neighbour. The near-goal
@@ -60,8 +64,20 @@ class PushTEvalConfig:
     def validate(self):
         if self.episodes < 1:
             raise ValueError("episodes must be at least 1")
+        if self.seed < 0:
+            raise ValueError("seed must be non-negative")
         if self.seed_stride < 1:
             raise ValueError("seed_stride must be at least 1")
+        if self.episode_seeds is not None:
+            if len(self.episode_seeds) != self.episodes:
+                raise ValueError(
+                    "episode_seeds must contain exactly one seed per episode"
+                )
+            seeds = [int(seed) for seed in self.episode_seeds]
+            if any(seed < 0 for seed in seeds):
+                raise ValueError("episode seeds must be non-negative")
+            if len(set(seeds)) != len(seeds):
+                raise ValueError("episode seeds must be unique")
         if self.max_episode_steps < 1:
             raise ValueError("max_episode_steps must be at least 1")
         if self.observation_resolution < 1:
@@ -194,7 +210,10 @@ def make_evaluation_env(config: PushTEvalConfig):
 
 
 def run_episode(env, agent: EvaluationAgent, config: PushTEvalConfig, episode_index: int):
-    episode_seed = config.seed + episode_index * config.seed_stride
+    if config.episode_seeds is None:
+        episode_seed = config.seed + episode_index * config.seed_stride
+    else:
+        episode_seed = int(config.episode_seeds[episode_index])
     observation, info = env.reset(seed=episode_seed)
     agent.reset(episode_seed)
     frames = [np.asarray(observation).copy()] if config.record_video else None

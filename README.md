@@ -65,10 +65,11 @@ policy consumes raw CLS tokens (192-d) stacked over a dilated history.
 
 ## Results
 
-Canonical protocol for every row: 3 repeats × 50 episodes (seeds 42 / 92 / 142), fixed target,
-block-start radius 200, 224 px observations, 300 max env steps, open-loop chunk execution. PPO rows
-are `final.pt` (no checkpoint selection at all), mean ± std over seeds 1–3, all started from the same
-BC prior.
+The canonical protocol for new runs is one 150-episode suite sampled from master seed 42, fixed
+target, block-start radius 200, 224 px observations, 300 max env steps, and open-loop chunk
+execution. The results below predate that seed-sampling correction and should be regenerated before
+being compared with new runs. PPO rows are `final.pt` (no checkpoint selection at all), mean ± std
+over training seeds 1–3, all started from the same BC prior.
 
 <div align="center">
 
@@ -214,22 +215,22 @@ python -m src.evaluation.evaluate_pusht \
   --stats hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best_stats.pth \
   --training-observation-resolution 224 \
   --block-start-radius 200 \
-  --episodes 50 \
+  --episodes 150 \
   --max-episode-steps 300 \
   --video \
-  --seed 42 \
-  --repeats 3
+  --seed 42
 ```
 
 ### The evaluation protocol
 
 Every agent in this repo is scored by one environment-owned evaluator, and the numbers above are
 only comparable because of it. Each evaluation creates a timestamped directory under
-`runs/evaluations/`. By default it runs 3 repeats of 50 episodes: `--seed` sets the first repeat's
-seed, later repeats use deterministic, non-overlapping seed ranges. The pooled summary and each
-repeat's summary land in `metrics.json`; with `--video`, episode videos are saved in repeat-specific
-directories under `videos/`. Use `--output-root` to change the parent directory and `--run-name` to
-append a readable label, and `--repeats 1` for a single evaluation.
+`runs/evaluations/`. By default it runs 150 episodes in one evaluation. `--seed` is a single master
+seed from which the evaluator samples a reproducible set of unique episode seeds across the 32-bit
+range; sampled values are at least seven apart to avoid the underlying PushT reset's adjacent-seed
+collisions. The complete episode-seed list and summary land in `metrics.json`; with `--video`,
+episode videos are saved under `videos/`. Use `--output-root` to change the parent directory and
+`--run-name` to append a readable label.
 
 Policy observations render at 224×224 by default, stored in `metrics.json` as
 `config.observation_resolution`; pass `--observation-resolution 96` to reproduce the earlier
@@ -267,10 +268,9 @@ python -m src.evaluation.evaluate_pusht \
   --agent-type ppo \
   --checkpoint hf://offline-rl-with-le-wm/ppo/best.pt \
   --block-start-radius 200 \
-  --episodes 50 \
+  --episodes 150 \
   --max-episode-steps 300 \
   --seed 42 \
-  --repeats 3 \
   --video
 ```
 
@@ -334,7 +334,7 @@ The older three-seed RQ1 harness still works and additionally draws the interact
 
 ```bash
 bash scripts/rq1/run_campaign.sh --seeds "1 2 3"   # trains real-env PPO and dream PPO
-python -m scripts.rq1.evaluate_grid --seeds 1 2 3  # canonical eval, 3 repeats x 50 episodes
+python -m scripts.rq1.evaluate_grid --seeds 1 2 3  # canonical 150-episode evaluation
 python -m scripts.rq1.budget_curve  --seeds 1 2 3  # real-PPO snapshots vs env steps
 python -m scripts.rq1.report                       # table.md + figures + summary.json
 ```

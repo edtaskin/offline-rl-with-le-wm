@@ -124,7 +124,7 @@ def write_table(grouped, path: Path, args) -> dict:
         "# RQ1 — policy improvement inside the world model",
         "",
         "Canonical evaluator (`src.evaluation.evaluate_pusht`), "
-        f"{args.repeats_note}, block starts within 200 px of the goal.",
+        f"{args.evaluation_note}, block starts within 200 px of the goal.",
         "",
         "| Agent | Checkpoint | Interaction-free | Success | 95% CI | Across-seed std | Episodes | Env steps required (median) |",
         "|---|---|---|---|---|---|---|---|",
@@ -395,10 +395,17 @@ def main() -> None:
     grouped = group_rows(rows)
 
     any_row = rows[0]
-    args.repeats_note = (
-        f"{any_row['eval']['repeats']} repeats x {any_row['eval']['episodes_per_repeat']} "
-        f"episodes per checkpoint"
-    )
+    eval_config = any_row["eval"]
+    evaluation_episodes = eval_config.get("episodes")
+    if evaluation_episodes is None:
+        args.evaluation_note = (
+            f"{eval_config['repeats']} legacy repeats x "
+            f"{eval_config['episodes_per_repeat']} episodes per checkpoint"
+        )
+    else:
+        args.evaluation_note = (
+            f"{evaluation_episodes} episodes sampled from one master seed per checkpoint"
+        )
 
     summary = write_table(grouped, output_root / "table.md", args)
     plot_success(grouped, args, output_root)

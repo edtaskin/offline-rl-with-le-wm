@@ -1,11 +1,9 @@
 """RQ1 headline table: BC vs real-env PPO vs dream PPO, over training seeds.
 
-Every number is produced by the canonical evaluator,
-``python -m src.evaluation.evaluate_pusht --repeats 3 --episodes 50``, on the
-start-state distribution the agents were trained on
-(``--block-start-radius 200``). Three repeats with non-overlapping seed ranges
-give 150 episodes per checkpoint; the spread across *training* seeds is reported
-separately by ``scripts/rq1/report.py``.
+Every number is produced by the canonical evaluator over 150 episodes sampled
+reproducibly from one master seed, on the start-state distribution the agents
+were trained on (``--block-start-radius 200``). The spread across *training*
+seeds is reported separately by ``scripts/rq1/report.py``.
 
 The point of RQ1 is not only "how good", it is "bought with how much environment
 interaction", so each row also carries the interaction budget recorded inside the
@@ -68,7 +66,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs-root", default="runs")
     parser.add_argument("--output-root", default="runs/rq1")
     parser.add_argument("--episodes", type=int, default=CANONICAL_EVAL["episodes"])
-    parser.add_argument("--repeats", type=int, default=CANONICAL_EVAL["repeats"])
     parser.add_argument("--eval-seed", type=int, default=CANONICAL_EVAL["seed"])
     parser.add_argument(
         "--block-start-radius", type=float, default=CANONICAL_EVAL["block_start_radius"]
@@ -124,7 +121,6 @@ def evaluate_one(args, *, method, variant, seed, agent_type, checkpoint, stats=N
         stats=stats,
         device=args.device,
         episodes=args.episodes,
-        repeats=args.repeats,
         seed=args.eval_seed,
         block_start_radius=args.block_start_radius,
     )
@@ -139,12 +135,10 @@ def evaluate_one(args, *, method, variant, seed, agent_type, checkpoint, stats=N
         "mean_length": summary["mean_length"],
         "mean_return": summary["mean_return"],
         "episodes": summary["episodes"],
-        "repeats": summary["repeats"],
-        "repeat_success_rates": [r.summary["success_rate"] for r in result.results],
         "eval": {
-            "episodes_per_repeat": args.episodes,
-            "repeats": args.repeats,
+            "episodes": args.episodes,
             "seed": args.eval_seed,
+            "episode_seed_sampling": "random-well-separated",
             "block_start_radius": args.block_start_radius,
         },
         "metrics_path": getattr(result, "metrics_path", None),

@@ -19,7 +19,7 @@ from src.evaluation.evaluate_pusht import (
     build_parser,
     create_run_directory,
     evaluate_from_args,
-    make_repeat_seeds,
+    sample_episode_seeds,
 )
 from src.evaluation.pusht import (
     PushTEvalConfig,
@@ -79,26 +79,29 @@ class DummyEncoder(torch.nn.Module):
 
 
 class EvaluationRunnerTests(unittest.TestCase):
-    def test_cli_defaults_to_three_repeats_of_fifty_episodes(self):
+    def test_cli_defaults_to_one_master_seed_and_150_episodes(self):
         parser = build_parser()
-        episodes = parser.get_default("episodes")
-        repeats = parser.get_default("repeats")
-        self.assertEqual(episodes, 50)
-        self.assertEqual(repeats, 3)
+        self.assertEqual(parser.get_default("episodes"), 150)
+        self.assertEqual(parser.get_default("seed"), 42)
+        self.assertNotIn("repeats", {action.dest for action in parser._actions})
+        self.assertNotIn("seed_stride", {action.dest for action in parser._actions})
         self.assertEqual(
             parser.get_default("observation_resolution"), PUSHT_RENDER_SHAPE[0]
         )
-        self.assertEqual(make_repeat_seeds(42, repeats, episodes), [42, 92, 142])
 
-    def test_repeat_seed_ranges_do_not_overlap(self):
-        seeds = make_repeat_seeds(7, repeats=3, episodes=2)
-        episode_seeds = [
-            seed + episode for seed in seeds for episode in range(2)
-        ]
-        self.assertEqual(seeds, [7, 9, 11])
-        self.assertEqual(len(episode_seeds), len(set(episode_seeds)))
+    def test_sampled_episode_seeds_are_reproducible_unique_and_well_separated(self):
+        seeds = sample_episode_seeds(42, 150)
+        self.assertEqual(seeds, sample_episode_seeds(42, 150))
+        self.assertNotEqual(seeds, sample_episode_seeds(43, 150))
+        self.assertEqual(len(seeds), 150)
+        self.assertEqual(len(seeds), len(set(seeds)))
+        ordered = sorted(seeds)
+        self.assertGreaterEqual(
+            min(right - left for left, right in zip(ordered, ordered[1:])),
+            7,
+        )
 
-    def test_each_repeat_uses_its_seed_once(self):
+    def test_cli_samples_episode_seeds_from_one_master_seed(self):
         with TemporaryDirectory() as temporary_dir:
             args = build_parser().parse_args(
                 [
@@ -107,8 +110,6 @@ class EvaluationRunnerTests(unittest.TestCase):
                     "--checkpoint",
                     "test.pt",
                     "--episodes",
-                    "1",
-                    "--repeats",
                     "2",
                     "--seed",
                     "7",
@@ -134,7 +135,7 @@ class EvaluationRunnerTests(unittest.TestCase):
             ):
                 evaluate_from_args(args)
 
-        self.assertEqual(agent.reset_seeds, [7, 8])
+        self.assertEqual(agent.reset_seeds, sample_episode_seeds(7, 2))
 
     def test_cli_rejects_unknown_legacy_training_resolution(self):
         args = build_parser().parse_args(
@@ -312,6 +313,23 @@ class EvaluationRunnerTests(unittest.TestCase):
         config = PushTEvalConfig(episodes=3, seed=41)
         run_evaluation(agent, config, env=FakePushTEnv())
         self.assertEqual(agent.reset_seeds, [41, 42, 43])
+
+    def test_explicit_episode_seed_schedule_overrides_legacy_sequence(self):
+        agent = ConstantAgent([0.0, 0.0])
+        config = PushTEvalConfig(
+            episodes=3,
+            seed=41,
+            episode_seeds=(700, 70, 7000),
+        )
+        result = run_evaluation(agent, config, env=FakePushTEnv())
+        self.assertEqual(agent.reset_seeds, [700, 70, 7000])
+        self.assertEqual([episode.seed for episode in result.episodes], [700, 70, 7000])
+
+    def test_explicit_episode_seed_schedule_must_be_unique_and_complete(self):
+        with self.assertRaisesRegex(ValueError, "one seed per episode"):
+            PushTEvalConfig(episodes=2, episode_seeds=(7,)).validate()
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            PushTEvalConfig(episodes=2, episode_seeds=(7, 7)).validate()
 
     def test_repeated_results_are_pooled_and_keep_per_repeat_summaries(self):
         first = run_evaluation(

@@ -8,13 +8,18 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 from src.envs import PUSHT_FIXED_TARGET_POSE, PUSHT_RENDER_SHAPE
 from src.evaluation.agents import make_bc_evaluation_agent, make_ppo_evaluation_agent
 from src.evaluation.pusht import (
     PushTEvalConfig,
-    aggregate_evaluation_results,
     run_evaluation,
 )
+
+
+MIN_EPISODE_SEED_GAP = 7
+MAX_EPISODE_SEED = np.iinfo(np.int32).max
 
 
 def build_parser():
@@ -44,22 +49,14 @@ def build_parser():
     parser.add_argument(
         "--episodes",
         type=int,
-        default=50,
-        help="number of episodes per evaluation repeat (default: 50)",
+        default=150,
+        help="total number of evaluation episodes (default: 150)",
     )
     parser.add_argument(
-        "--repeats",
+        "--seed",
         type=int,
-        default=3,
-        help="number of evaluation repeats with non-overlapping seed ranges (default: 3)",
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--seed-stride",
-        type=int,
-        default=1,
-        help="gap between consecutive episode seeds; use >=7 with unrestricted "
-        "block starts, where consecutive seeds collide (see PushTEvalConfig)",
+        default=42,
+        help="master seed used to sample reproducible, well-separated episode seeds",
     )
     parser.add_argument("--max-episode-steps", type=int, default=300)
     parser.add_argument(
@@ -118,16 +115,44 @@ def _slug(value):
     return slug or "eval"
 
 
-def make_repeat_seeds(seed, repeats, episodes, stride=1):
-    """Derive deterministic, non-overlapping episode-seed ranges."""
+def sample_episode_seeds(
+    seed,
+    episodes,
+    min_gap=MIN_EPISODE_SEED_GAP,
+    max_seed=MAX_EPISODE_SEED,
+):
+    """Sample reproducible, unique episode seeds from one master seed.
 
-    if repeats < 1:
-        raise ValueError("repeats must be at least 1")
+    Seeds are sampled in a large integer space rather than taken consecutively.
+    Sampling unique slots on a ``min_gap`` grid guarantees that every pair of
+    returned seed values differs by at least ``min_gap``. This avoids the known
+    adjacent-seed collisions in the underlying PushT reset while preserving an
+    exactly reproducible evaluation suite.
+    """
+
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
     if episodes < 1:
         raise ValueError("episodes must be at least 1")
-    if stride < 1:
-        raise ValueError("stride must be at least 1")
-    return [seed + repeat * episodes * stride for repeat in range(repeats)]
+    if min_gap < 1:
+        raise ValueError("min_gap must be at least 1")
+    if max_seed < 0:
+        raise ValueError("max_seed must be non-negative")
+
+    slot_count = max_seed // min_gap + 1
+    if episodes > slot_count:
+        raise ValueError("episodes exceed the available well-separated seed space")
+
+    rng = np.random.default_rng(seed)
+    slots = set()
+    episode_seeds = []
+    while len(episode_seeds) < episodes:
+        slot = int(rng.integers(0, slot_count))
+        if slot in slots:
+            continue
+        slots.add(slot)
+        episode_seeds.append(slot * min_gap)
+    return episode_seeds
 
 
 def create_run_directory(
@@ -177,7 +202,7 @@ def evaluate_from_args(args):
         raise ValueError("BC evaluation is deterministic; --stochastic is only valid for PPO")
     if args.stochastic and args.execution_mode == "temporal-ensemble":
         raise ValueError("temporal ensembling requires deterministic chunk predictions")
-    repeat_seeds = make_repeat_seeds(args.seed, args.repeats, args.episodes, args.seed_stride)
+    episode_seeds = sample_episode_seeds(args.seed, args.episodes)
     agent_kwargs = {
         "checkpoint": args.checkpoint,
         "device": args.device,
@@ -229,38 +254,33 @@ def evaluate_from_args(args):
         run_name=args.run_name,
     )
     print(f"Evaluation run directory: {run_dir}")
-    results = []
-    for repeat, repeat_seed in enumerate(repeat_seeds):
-        video_dir = run_dir / "videos" / f"repeat_{repeat:02d}_seed_{repeat_seed}"
-        config = PushTEvalConfig(
-            env_id=args.env_id,
-            episodes=args.episodes,
-            seed=repeat_seed,
-            seed_stride=args.seed_stride,
-            max_episode_steps=args.max_episode_steps,
-            observation_resolution=args.observation_resolution,
-            fixed_target_pose=tuple(args.fixed_target_pose),
-            fixed_target_block_success=args.fixed_target_block_success,
-            fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
-            agent_block_coef=args.agent_block_coef,
-            block_start_radius=args.block_start_radius,
-            record_video=args.video,
-            video_dir=str(video_dir),
-            video_fps=args.video_fps,
-            video_resolution=args.video_resolution,
-            capture_traces=args.capture_traces,
-            allow_resolution_mismatch=args.allow_resolution_mismatch,
-        )
-        print(
-            f"Repeat {repeat + 1}/{args.repeats} | agent={args.agent_type} | "
-            f"fixed-target episodes={config.episodes} | "
-            f"seeds={config.seed}..{config.seed + (config.episodes - 1) * config.seed_stride}"
-        )
-        results.append(run_evaluation(agent, config))
-    result = aggregate_evaluation_results(results)
-    print("Aggregate evaluation summary:")
-    for key, value in result.summary.items():
-        print(f"  {key}: {value}")
+    config = PushTEvalConfig(
+        env_id=args.env_id,
+        episodes=args.episodes,
+        seed=args.seed,
+        episode_seeds=tuple(episode_seeds),
+        max_episode_steps=args.max_episode_steps,
+        observation_resolution=args.observation_resolution,
+        fixed_target_pose=tuple(args.fixed_target_pose),
+        fixed_target_block_success=args.fixed_target_block_success,
+        fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
+        agent_block_coef=args.agent_block_coef,
+        block_start_radius=args.block_start_radius,
+        record_video=args.video,
+        video_dir=str(run_dir / "videos"),
+        video_fps=args.video_fps,
+        video_resolution=args.video_resolution,
+        capture_traces=args.capture_traces,
+        allow_resolution_mismatch=args.allow_resolution_mismatch,
+    )
+    preview = ", ".join(str(seed) for seed in episode_seeds[:5])
+    if len(episode_seeds) > 5:
+        preview += ", ..."
+    print(
+        f"Single evaluation | agent={args.agent_type} | episodes={config.episodes} | "
+        f"master_seed={config.seed} | episode_seeds=[{preview}]"
+    )
+    result = run_evaluation(agent, config)
     return _save_and_track_result(args, result, run_dir)
 
 

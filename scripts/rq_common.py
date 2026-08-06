@@ -250,8 +250,7 @@ def read_selection_log(run_dir: Path) -> list[dict]:
 
 # ------------------------------------------------------------------- evaluation
 CANONICAL_EVAL = {
-    "episodes": 50,
-    "repeats": 3,
+    "episodes": 150,
     "seed": 42,
     "max_episode_steps": 300,
     # Training used --block_start_near_goal --block_start_radius 200, so
@@ -269,7 +268,6 @@ def canonical_eval_argv(
     stats: str | None = None,
     device: str = "auto",
     episodes: int = CANONICAL_EVAL["episodes"],
-    repeats: int = CANONICAL_EVAL["repeats"],
     seed: int = CANONICAL_EVAL["seed"],
     block_start_radius: float = CANONICAL_EVAL["block_start_radius"],
     max_episode_steps: int = CANONICAL_EVAL["max_episode_steps"],
@@ -284,7 +282,6 @@ def canonical_eval_argv(
         "--agent-type", agent_type,
         "--checkpoint", str(checkpoint),
         "--episodes", str(episodes),
-        "--repeats", str(repeats),
         "--seed", str(seed),
         "--max-episode-steps", str(max_episode_steps),
         "--block-start-radius", str(block_start_radius),
@@ -298,7 +295,7 @@ def canonical_eval_argv(
 
 
 def run_canonical_eval(*args, **kwargs):
-    """Run the canonical evaluator end to end and return its aggregate result."""
+    """Run the canonical evaluator end to end and return its result."""
     from src.evaluation.evaluate_pusht import build_parser, evaluate_from_args
 
     argv = canonical_eval_argv(*args, **kwargs)
@@ -306,42 +303,32 @@ def run_canonical_eval(*args, **kwargs):
     return evaluate_from_args(build_parser().parse_args(argv))
 
 
-def evaluate_agent_repeats(
+def evaluate_agent(
     agent,
     *,
     episodes: int = CANONICAL_EVAL["episodes"],
-    repeats: int = CANONICAL_EVAL["repeats"],
     seed: int = CANONICAL_EVAL["seed"],
-    seed_stride: int = 1,
     block_start_radius: float = CANONICAL_EVAL["block_start_radius"],
     max_episode_steps: int = CANONICAL_EVAL["max_episode_steps"],
 ):
-    """The canonical repeat loop for an already-constructed evaluation agent.
+    """Canonical evaluation for an already-constructed evaluation agent.
 
-    Identical to what :func:`run_canonical_eval` does -- same
-    :class:`PushTEvalConfig`, same non-overlapping seed ranges, a fresh env per
-    repeat -- minus the argparse and run-directory shell. Used where one encoder
-    is amortized over many checkpoints (the budget curve), which is the only
-    thing that makes evaluating every snapshot affordable.
+    Identical to what :func:`run_canonical_eval` does -- one master seed, the
+    same sampled episode-seed suite, and the same :class:`PushTEvalConfig` --
+    minus argparse and the run-directory shell. Used where one encoder is
+    amortized over many checkpoints (the budget curve).
     """
-    from src.evaluation.evaluate_pusht import make_repeat_seeds
-    from src.evaluation.pusht import (
-        PushTEvalConfig,
-        aggregate_evaluation_results,
-        run_evaluation,
-    )
+    from src.evaluation.evaluate_pusht import sample_episode_seeds
+    from src.evaluation.pusht import PushTEvalConfig, run_evaluation
 
-    results = []
-    for repeat_seed in make_repeat_seeds(seed, repeats, episodes, seed_stride):
-        config = PushTEvalConfig(
-            episodes=episodes,
-            seed=repeat_seed,
-            seed_stride=seed_stride,
-            max_episode_steps=max_episode_steps,
-            block_start_radius=block_start_radius,
-        )
-        results.append(run_evaluation(agent, config))
-    return aggregate_evaluation_results(results)
+    config = PushTEvalConfig(
+        episodes=episodes,
+        seed=seed,
+        episode_seeds=tuple(sample_episode_seeds(seed, episodes)),
+        max_episode_steps=max_episode_steps,
+        block_start_radius=block_start_radius,
+    )
+    return run_evaluation(agent, config)
 
 
 # ------------------------------------------------------------------ statistics
