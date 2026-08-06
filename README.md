@@ -201,7 +201,7 @@ python -m src.bc.train_bc_latent \
   --log_interval 10 \
   --save_interval 100 \
   --push_to_hf \
-  --hf_repo_id offline-rl-with-le-wm/behavioral-cloning
+  --hf_repo_id offline-rl-with-le-wm/bc/pusht_latent_bc
 ```
 
 Evaluate on the fixed-target task. Passing `--block-start-radius 200` matches the PPO training start
