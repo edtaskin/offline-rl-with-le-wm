@@ -17,6 +17,12 @@ LEWM_IMAGE_STD = [0.229, 0.224, 0.225]
 LEWM_IMAGE_NORMALIZATION = "imagenet"
 LEWM_DEFAULT_FEATURE_DIM = 192
 
+# The only latent this branch produces. Policies trained on ``projected``
+# latents (``projector(cls)``, the space LeWM's dynamics run in) need the
+# encoder switch that lives on the ``projected-bc`` branch; both latents are
+# 192-d, so loaders must check this key rather than rely on a shape mismatch.
+LEWM_LATENT_RAW_CLS = "raw_cls"
+
 
 def _ensure_lewm_source_path() -> None:
     try:

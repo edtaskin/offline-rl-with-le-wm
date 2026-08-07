@@ -15,6 +15,7 @@ from src.ppo.agent import build_latent_agent
 from src.representations.history import LatentHistory, temporal_ensemble_action
 from src.representations.lewm import (
     LEWM_IMAGE_NORMALIZATION,
+    LEWM_LATENT_RAW_CLS,
     LeWMEncoder,
 )
 from src.utils.hf_hub import (
@@ -197,6 +198,14 @@ def load_bc_components(checkpoint, stats_path=None, device="auto"):
         "hidden_dim": int(stats.get("hidden_dim", 256)),
         "action_dim": int(stats.get("action_dim", 2)),
     }
+    representation = stats.get("latent_representation", LEWM_LATENT_RAW_CLS)
+    if representation != LEWM_LATENT_RAW_CLS:
+        raise ValueError(
+            f"{resolved_stats_path} was trained on {representation!r} latents, but this "
+            f"branch only builds {LEWM_LATENT_RAW_CLS!r} ones. Both are 192-d, so loading "
+            "it here would silently feed the policy the wrong features; evaluate it from "
+            "the `projected-bc` branch instead."
+        )
     normalization = stats.get("image_normalization", LEWM_IMAGE_NORMALIZATION)
     encoder = LeWMEncoder.from_checkpoint(
         device=device,

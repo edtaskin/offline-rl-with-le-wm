@@ -413,7 +413,14 @@ class LatentChunkAgentTests(unittest.TestCase):
             agent.act(observation, {})
         self.assertEqual(len(calls), 3)
 
-    def test_bc_loader_restores_projected_latent_contract(self):
+    def test_bc_loader_rejects_projected_latent_contract(self):
+        """Projected-latent policies must not silently load against raw CLS.
+
+        The encoder switch they need lives on the ``projected-bc`` branch
+        (commit 7bd32d9). Porting it should turn this back into the original
+        assertion that ``latent_representation`` reaches ``from_checkpoint``,
+        which is preserved in git at 331a05a.
+        """
         with TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             checkpoint = root / "policy.pth"
@@ -443,14 +450,47 @@ class LatentChunkAgentTests(unittest.TestCase):
                 "src.evaluation.agents.LeWMEncoder.from_checkpoint",
                 return_value=frozen_encoder,
             ) as load_encoder:
+                with self.assertRaises(ValueError) as raised:
+                    load_bc_components(str(checkpoint), str(stats_path), device="cpu")
+
+            self.assertIn("projected", str(raised.exception))
+            load_encoder.assert_not_called()
+
+    def test_bc_loader_defaults_to_raw_cls_latents(self):
+        with TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            checkpoint = root / "policy.pth"
+            stats_path = root / "policy_stats.pth"
+            policy = LatentBCPolicy(
+                latent_dim=3,
+                frame_stack=1,
+                action_dim=2,
+                hidden_dim=4,
+                action_chunk_size=1,
+            )
+            torch.save(policy.state_dict(), checkpoint)
+            torch.save(
+                {
+                    "latent_dim": 3,
+                    "frame_stack": 1,
+                    "action_dim": 2,
+                    "hidden_dim": 4,
+                    "action_chunk_size": 1,
+                    "image_normalization": "imagenet",
+                },
+                stats_path,
+            )
+            frozen_encoder = MagicMock(spec=torch.nn.Module)
+            with patch(
+                "src.evaluation.agents.LeWMEncoder.from_checkpoint",
+                return_value=frozen_encoder,
+            ):
                 components = load_bc_components(
                     str(checkpoint), str(stats_path), device="cpu"
                 )
 
             self.assertIs(components.encoder, frozen_encoder)
-            self.assertEqual(
-                load_encoder.call_args.kwargs["latent_representation"], "projected"
-            )
+
 
 if __name__ == "__main__":
     unittest.main()
