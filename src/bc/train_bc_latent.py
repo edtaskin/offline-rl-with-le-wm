@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from dotenv import load_dotenv
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 load_dotenv()
 
@@ -65,6 +65,68 @@ def seed_dataloader_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def split_episode_indices(dataset, val_fraction, split_seed):
+    """Partition sample indices into train / validation pools by *episode*.
+
+    Consecutive frames inside one PushT episode are near-duplicates, so a
+    frame-level split would put almost-identical samples on both sides and
+    report a "validation" loss that is really a training loss. Splitting whole
+    episodes is the same rule the dream trainer applies to its evaluation
+    anchors (``_split_anchors`` in ``src/ppo/train_lewm.py``).
+
+    Returns ``(train_indices, val_indices, num_val_episodes)``.
+    """
+    indices = np.arange(len(dataset))
+    episode_of = np.searchsorted(dataset.episode_ends, indices, side="right")
+    episodes = np.unique(episode_of)
+    n_val = int(round(len(episodes) * val_fraction))
+    if n_val < 1 or n_val >= len(episodes):
+        raise ValueError(
+            f"val_fraction={val_fraction} holds out {n_val} of {len(episodes)} episodes; "
+            "both pools must be non-empty (use --val_fraction 0 to disable validation)"
+        )
+    rng = np.random.default_rng(split_seed)
+    val_episodes = rng.permutation(episodes)[:n_val]
+    is_val = np.isin(episode_of, val_episodes)
+    return indices[~is_val], indices[is_val], int(n_val)
+
+
+def stacked_latents_from_batch(batch_inputs, extractor, use_latent_cache, latent_dim):
+    """Policy input for one batch: cached latents pass through, images are encoded."""
+    if use_latent_cache:
+        return batch_inputs
+    batch_size, frames, channels, height, width = batch_inputs.shape
+    flat_images = batch_inputs.reshape(batch_size * frames, channels, height, width)
+    flat_latents = extractor.encode(flat_images)
+    return flat_latents.reshape(batch_size, frames, latent_dim)
+
+
+@torch.no_grad()
+def evaluate_validation_loss(
+    policy, dataloader, criterion, device, extractor, use_latent_cache, latent_dim
+):
+    """Mean MSE over the held-out pool, in eval mode."""
+    was_training = policy.training
+    policy.eval()
+    total = 0.0
+    count = 0
+    for batch_inputs, batch_actions in dataloader:
+        batch_inputs = batch_inputs.to(device)
+        batch_actions = batch_actions.to(device)
+        stacked_latents = stacked_latents_from_batch(
+            batch_inputs, extractor, use_latent_cache, latent_dim
+        )
+        predicted_action_chunks = policy(stacked_latents)
+        # Weight by sample count rather than averaging per-batch means: the
+        # validation loader keeps its short final batch (drop_last is off), and
+        # an unweighted mean would overweight those few samples.
+        total += criterion(predicted_action_chunks, batch_actions).item() * len(batch_actions)
+        count += len(batch_actions)
+    if was_training:
+        policy.train()
+    return total / count if count else float("nan")
 
 
 def _prepare_dataset(args, device):
@@ -177,8 +239,23 @@ def train_latent_bc(args):
 
     dataloader_generator = torch.Generator()
     dataloader_generator.manual_seed(args.seed)
+    if args.val_fraction > 0:
+        train_indices, val_indices, num_val_episodes = split_episode_indices(
+            dataset, args.val_fraction, args.val_split_seed
+        )
+        train_dataset = Subset(dataset, train_indices.tolist())
+        val_dataset = Subset(dataset, val_indices.tolist())
+        print(
+            f"Episode-level split: {len(train_indices)} train / {len(val_indices)} val samples "
+            f"({num_val_episodes} held-out episodes, split seed {args.val_split_seed})"
+        )
+    else:
+        # Reproduces pre-split runs exactly: every sample stays in training.
+        train_dataset, val_dataset, num_val_episodes = dataset, None, 0
+        print("Validation disabled (--val_fraction 0); training on every sample.")
+
     dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=True,
@@ -186,6 +263,16 @@ def train_latent_bc(args):
         worker_init_fn=seed_dataloader_worker,
         generator=dataloader_generator,
     )
+    val_dataloader = None
+    if val_dataset is not None:
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=args.num_workers,
+            worker_init_fn=seed_dataloader_worker,
+        )
     run_metadata = {
         **dataset_stats,
         "frame_stack": args.frame_stack,
@@ -201,6 +288,14 @@ def train_latent_bc(args):
         "seed": args.seed,
         "deterministic": args.deterministic,
         "num_workers": args.num_workers,
+        # Carried in the stats sidecar so a checkpoint records which samples it
+        # was allowed to see: two runs differing only in the split are not
+        # comparable, and without this the difference is invisible after the
+        # fact. _stats_contract() reads only the agent-contract keys, so these
+        # are inert on the PPO side.
+        "val_fraction": args.val_fraction,
+        "val_split_seed": args.val_split_seed,
+        "num_val_episodes": num_val_episodes,
     }
     run_config_path = write_run_config(
         args,
@@ -208,6 +303,8 @@ def train_latent_bc(args):
         extra={
             "device": str(device),
             "dataset_size": len(dataset),
+            "train_size": len(train_dataset),
+            "val_size": len(val_dataset) if val_dataset is not None else 0,
             "num_batches_per_epoch": len(dataloader),
             "status": "running",
             "bc_contract": run_metadata,
@@ -219,6 +316,8 @@ def train_latent_bc(args):
             **args_for_config(args),
             "device": str(device),
             "dataset_size": len(dataset),
+            "train_size": len(train_dataset),
+            "val_size": len(val_dataset) if val_dataset is not None else 0,
             "num_batches_per_epoch": len(dataloader),
             "bc_contract": run_metadata,
         },
@@ -240,20 +339,17 @@ def train_latent_bc(args):
     best_loss = float("inf")
     best_epoch = None
     avg_loss = float("nan")
+    val_loss = float("nan")
+    best_val_loss = float("inf")
+    best_val_epoch = None
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         for batch_inputs, batch_actions in dataloader:
             batch_inputs = batch_inputs.to(device)
             batch_actions = batch_actions.to(device)
-            if use_latent_cache:
-                stacked_latents = batch_inputs
-            else:
-                batch_size, frames, channels, height, width = batch_inputs.shape
-                flat_images = batch_inputs.reshape(
-                    batch_size * frames, channels, height, width
-                )
-                flat_latents = extractor.encode(flat_images)
-                stacked_latents = flat_latents.reshape(batch_size, frames, latent_dim)
+            stacked_latents = stacked_latents_from_batch(
+                batch_inputs, extractor, use_latent_cache, latent_dim
+            )
             predicted_action_chunks = policy(stacked_latents)
             loss = criterion(predicted_action_chunks, batch_actions)
             optimizer.zero_grad()
@@ -264,18 +360,39 @@ def train_latent_bc(args):
         if avg_loss < best_loss:
             best_loss = avg_loss
             best_epoch = epoch + 1
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "train/loss": avg_loss,
-                    "train/best_loss": best_loss,
-                    "train/epoch": epoch + 1,
-                    "train/lr": optimizer.param_groups[0]["lr"],
-                },
-                step=epoch + 1,
+
+        # The first and last epochs always get a measurement so the curve has
+        # both endpoints, whatever --val_interval is set to.
+        if val_dataloader is not None and (
+            (epoch + 1) % args.val_interval == 0 or epoch == 0 or epoch + 1 == args.epochs
+        ):
+            val_loss = evaluate_validation_loss(
+                policy, val_dataloader, criterion, device, extractor, use_latent_cache, latent_dim
             )
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_val_epoch = epoch + 1
+
+        if wandb_run is not None:
+            metrics = {
+                "train/loss": avg_loss,
+                "train/best_loss": best_loss,
+                "train/epoch": epoch + 1,
+                "train/lr": optimizer.param_groups[0]["lr"],
+            }
+            if val_dataloader is not None and np.isfinite(val_loss):
+                metrics["val/loss"] = val_loss
+                metrics["val/best_loss"] = best_val_loss
+                # The gap is the quantity that says whether a checkpoint is
+                # underfit or overfit, which is what the epoch number alone
+                # cannot tell you when comparing BC checkpoints downstream.
+                metrics["val/train_gap"] = val_loss - avg_loss
+            wandb_run.log(metrics, step=epoch + 1)
         if (epoch + 1) % args.log_interval == 0 or epoch == 0:
-            print(f"Epoch [{epoch + 1}/{args.epochs}] - Average MSE Loss: {avg_loss:.6f}")
+            message = f"Epoch [{epoch + 1}/{args.epochs}] - Average MSE Loss: {avg_loss:.6f}"
+            if val_dataloader is not None and np.isfinite(val_loss):
+                message += f" | Val MSE: {val_loss:.6f}"
+            print(message)
         if (epoch + 1) % args.save_interval == 0:
             checkpoint_name = args.checkpoint_path.replace(".pth", f"_epoch{epoch + 1}.pth")
             torch.save(policy.state_dict(), checkpoint_name)
@@ -286,6 +403,8 @@ def train_latent_bc(args):
     completion_metadata = {
         "device": str(device),
         "dataset_size": len(dataset),
+        "train_size": len(train_dataset),
+        "val_size": len(val_dataset) if val_dataset is not None else 0,
         "num_batches_per_epoch": len(dataloader),
         "status": "completed",
         "bc_contract": run_metadata,
@@ -295,6 +414,9 @@ def train_latent_bc(args):
         "final_train_loss": avg_loss,
         "best_train_loss": best_loss,
         "best_train_loss_epoch": best_epoch,
+        "final_val_loss": val_loss if val_dataloader is not None else None,
+        "best_val_loss": best_val_loss if best_val_epoch is not None else None,
+        "best_val_loss_epoch": best_val_epoch,
         "wandb_run_id": getattr(wandb_run, "id", None) if wandb_run is not None else None,
         "wandb_run_url": getattr(wandb_run, "url", None) if wandb_run is not None else None,
     }
@@ -345,6 +467,10 @@ def train_latent_bc(args):
         wandb_run.summary["final_train_loss"] = avg_loss
         wandb_run.summary["best_train_loss"] = best_loss
         wandb_run.summary["best_train_loss_epoch"] = best_epoch
+        if best_val_epoch is not None:
+            wandb_run.summary["final_val_loss"] = val_loss
+            wandb_run.summary["best_val_loss"] = best_val_loss
+            wandb_run.summary["best_val_loss_epoch"] = best_val_epoch
         if hf_upload_result is not None:
             wandb_run.summary["hf/repo_url"] = hf_upload_result.repo_url
         log_wandb_artifact(
@@ -358,18 +484,28 @@ def train_latent_bc(args):
                 "run_config_path": run_config_path,
                 "best_train_loss": best_loss,
                 "best_train_loss_epoch": best_epoch,
+                "best_val_loss": best_val_loss if best_val_epoch is not None else None,
+                "best_val_loss_epoch": best_val_epoch,
                 "bc_contract": run_metadata,
                 "hf_repo_url": hf_upload_result.repo_url if hf_upload_result is not None else None,
             },
         )
         wandb_run.finish()
     print(f"Latent BC Training Complete! Saved to: {args.checkpoint_path}")
+    if best_val_epoch is not None:
+        print(
+            f"Validation: final {val_loss:.6f} | best {best_val_loss:.6f} @ epoch {best_val_epoch}"
+            f" of {args.epochs}"
+        )
     print(f"Run config saved to: {run_config_path}")
     return {
         "checkpoint_path": args.checkpoint_path,
         "stats_path": stats_path,
         "final_train_loss": avg_loss,
         "best_train_loss": best_loss,
+        "final_val_loss": val_loss if val_dataloader is not None else None,
+        "best_val_loss": best_val_loss if best_val_epoch is not None else None,
+        "best_val_loss_epoch": best_val_epoch,
     }
 
 
@@ -394,6 +530,9 @@ def build_parser():
     parser.add_argument("--action_chunk_size", type=int, default=5, help="Number of future actions to predict from one observation")
     parser.add_argument("--log_interval", type=int, default=10, help="Epochs to wait before logging loss metrics")
     parser.add_argument("--save_interval", type=int, default=10, help="Save policy checkpoint every N epochs")
+    parser.add_argument("--val_fraction", type=float, default=0.1, help="Fraction of expert EPISODES held out for validation; 0 disables validation and trains on every sample (the pre-split behavior)")
+    parser.add_argument("--val_split_seed", type=int, default=0, help="Seed for the episode-level train/validation split; independent of --seed so the split is stable across training seeds")
+    parser.add_argument("--val_interval", type=int, default=1, help="Evaluate validation loss every N epochs; the first and last epoch are always measured")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases experiment tracking")
     parser.add_argument("--wandb_project", type=str, default="offline-rl-lewm", help="Weights & Biases project name")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity/team")
