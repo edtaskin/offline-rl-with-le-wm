@@ -506,6 +506,11 @@ def test_dream_dense_reward_adds_sparse_success():
     world.action_mean = torch.zeros(2)
     world.action_std = torch.ones(2)
     world.absolute_actions = False
+    # Set by __init__, which this fixture bypasses: _observe reads both to pick
+    # the latent->CLS bridge. None selects the decoder path, matching the
+    # nn.Identity decoder/cls_encoder stubbed above.
+    world._deprojector = None
+    world.capture_frames = False
     world._agent_pos = torch.zeros((2, 2))
     world._emb_hist = [deque([torch.zeros(192)], maxlen=1) for _ in range(2)]
     world._act_hist = [deque([torch.zeros(10)], maxlen=1) for _ in range(2)]
