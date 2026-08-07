@@ -83,7 +83,10 @@ class LatentConfig:
     ent_coef: float = 0.0
     vf_coef: float = 0.5
     bc_penalty: bool = False
-    bc_penalty_coef: float = 0
+    # 0.0, not 0: _add_args in train_lewm.py types each flag from type(default),
+    # so an int default here makes argparse reject --bc-penalty-coef 0.05 -- the
+    # only values worth passing.
+    bc_penalty_coef: float = 0.0
     max_grad_norm: float = 0.5
     target_kl: float | None = 0.03
 
