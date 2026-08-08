@@ -88,7 +88,10 @@ class LatentChunkAgent:
         self._step = 0
 
     @torch.no_grad()
-    def _encode_observation(self, observation):
+    def _encode_observation(self, observation, info=None):
+        # ``info`` is unused for pixel encoders; it is threaded through so that a
+        # subclass reading a non-visual observation (the state oracle) can reuse
+        # the chunk queue, history and execution modes unchanged.
         image = torch.as_tensor(np.asarray(observation), device=self.device)
         if image.ndim != 3:
             raise ValueError(f"expected HWC observation, got shape {tuple(image.shape)}")
@@ -112,7 +115,7 @@ class LatentChunkAgent:
         return torch.clamp(chunk, -1.0, 1.0)
 
     def act(self, observation, info):
-        self.history.append(self._encode_observation(observation))
+        self.history.append(self._encode_observation(observation, info))
         if self.execution_mode == "temporal-ensemble":
             chunk = self._new_chunk(deterministic=True)
             for offset, action in enumerate(chunk):

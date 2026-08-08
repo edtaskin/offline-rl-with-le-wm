@@ -3,7 +3,9 @@ data/**/*
 !data/**/.gitkeep
 
 le-wm/
-models/
+# Anchored to the repo root: a bare "models/" also matches src/bc/models/, which
+# silently excludes policy source files from commits.
+/models/
 # training artifacts
 runs/
 checkpoints/

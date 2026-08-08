@@ -12,6 +12,11 @@ PUSHT_ACTION_LOW = torch.tensor([-1.0, -1.0], dtype=torch.float32)
 PUSHT_ACTION_HIGH = torch.tensor([1.0, 1.0], dtype=torch.float32)
 PUSHT_ACTION_SCALE = 100.0
 
+# Recorded PushT states are (agent_x, agent_y, block_x, block_y, block_angle).
+PUSHT_STATE_DIM = 5
+PUSHT_STATE_FEATURE_DIM = 6
+PUSHT_STATE_FEATURE_LAYOUT = "agent_xy_block_xy_block_angle_sin_cos"
+
 
 def npz_array_shape(data_path, key):
     """Read an array shape from an NPZ member without loading its payload."""
@@ -67,6 +72,31 @@ def resolve_pusht_observation_resolution(data_path, requested=None):
             "requested resolution."
         )
     return requested
+
+
+def pusht_state_features(states):
+    """Map recorded PushT states to the features the state-oracle policy reads.
+
+    The block angle enters as ``(sin, cos)`` rather than as a raw radian value:
+    the raw angle wraps, which would place a discontinuity in the middle of the
+    observation space, and nothing downstream could smooth it back out.
+    """
+
+    states = torch.as_tensor(states, dtype=torch.float32)
+    if states.shape[-1] < PUSHT_STATE_DIM:
+        raise ValueError(
+            f"expected PushT states with at least {PUSHT_STATE_DIM} columns, "
+            f"got shape {tuple(states.shape)}"
+        )
+    angle = states[..., 4]
+    return torch.cat(
+        [
+            states[..., :4],
+            torch.sin(angle).unsqueeze(-1),
+            torch.cos(angle).unsqueeze(-1),
+        ],
+        dim=-1,
+    )
 
 
 def absolute_to_relative_action(action, agent_position, action_scale=PUSHT_ACTION_SCALE):
@@ -227,3 +257,52 @@ class PushTLatentDataset(_PushTTemporalDataset):
     def __getitem__(self, index):
         frame_indices, action_indices = self._sample_indices(index)
         return self.latents[frame_indices], self.actions[action_indices]
+
+
+class PushTStateDataset(_PushTTemporalDataset):
+    """Ground-truth simulator states under the same temporal contract as the latents.
+
+    This is the oracle arm of the encoder baseline: it bounds what the chunked BC
+    head can reach when the representation is perfect, which separates
+    representation loss from what the expert data and open-loop chunking cost.
+    """
+
+    def __init__(self, data_path, frame_stack=5, frame_stride=1, action_chunk_size=5):
+        super().__init__()
+        with np.load(data_path, allow_pickle=True) as data:
+            raw_actions = torch.tensor(data["actions"], dtype=torch.float32)
+            raw_states = torch.tensor(data["states"], dtype=torch.float32)
+            episode_ends = np.asarray(data["episode_ends"])
+        self.features = pusht_state_features(raw_states)
+        if len(self.features) != len(raw_actions):
+            raise ValueError(
+                f"states/actions length mismatch: {len(self.features)} vs {len(raw_actions)}"
+            )
+        self._initialize_temporal_contract(
+            raw_actions,
+            raw_states,
+            episode_ends,
+            frame_stack,
+            frame_stride,
+            action_chunk_size,
+        )
+        self.stats.update(
+            {
+                "observation_space": "state",
+                "state_dim": PUSHT_STATE_DIM,
+                "state_feature_layout": PUSHT_STATE_FEATURE_LAYOUT,
+                "latent_dim": int(self.features.shape[-1]),
+            }
+        )
+
+    def feature_normalization(self):
+        """Per-feature mean/std for the policy's input normalization buffers."""
+
+        return self.features.mean(dim=0), self.features.std(dim=0)
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+        frame_indices, action_indices = self._sample_indices(index)
+        return self.features[frame_indices], self.actions[action_indices]
