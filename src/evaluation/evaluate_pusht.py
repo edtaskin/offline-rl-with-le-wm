@@ -12,7 +12,10 @@ import numpy as np
 
 from src.envs import PUSHT_FIXED_TARGET_POSE, PUSHT_RENDER_SHAPE
 from src.evaluation.agents import make_bc_evaluation_agent, make_ppo_evaluation_agent
-from src.evaluation.baseline_agents import make_state_bc_evaluation_agent
+from src.evaluation.baseline_agents import (
+    make_cnn_bc_evaluation_agent,
+    make_state_bc_evaluation_agent,
+)
 from src.evaluation.pusht import (
     PushTEvalConfig,
     run_evaluation,
@@ -27,9 +30,9 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Evaluate an agent on the canonical PushT env")
     parser.add_argument(
         "--agent-type",
-        choices=["bc", "ppo", "bc-state"],
+        choices=["bc", "ppo", "bc-state", "bc-cnn"],
         required=True,
-        help="bc/ppo read frozen LeWM latents; bc-state is the encoder-baseline oracle",
+        help="bc/ppo read frozen LeWM latents; bc-state and bc-cnn are the encoder baselines",
     )
     parser.add_argument(
         "--checkpoint",
@@ -220,6 +223,8 @@ def evaluate_from_args(args):
         agent = make_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
     elif args.agent_type == "bc-state":
         agent = make_state_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
+    elif args.agent_type == "bc-cnn":
+        agent = make_cnn_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
     else:
         agent = make_ppo_evaluation_agent(
             deterministic=not args.stochastic,

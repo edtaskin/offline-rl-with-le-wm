@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader
 
@@ -27,9 +28,11 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from src.bc.dataset import (
+    PushTImageDataset,
     PushTStateDataset,
     resolve_pusht_observation_resolution,
 )
+from src.bc.models.policy.cnn_bc_policy import CNN_DEFAULT_FEATURE_DIM, CNNBCPolicy
 from src.bc.models.policy.state_bc_policy import StateBCPolicy
 from src.bc.tracking import (
     args_for_config,
@@ -42,6 +45,37 @@ from src.utils.hf_hub import push_files_to_hub
 
 
 SCRIPT_NAME = "src/bc/train_bc_baseline.py"
+
+
+def random_shift(images, pad):
+    """DrQ-style random shift, one offset per sample shared across its frames.
+
+    Frames in one sample are different timesteps of the same episode, so a
+    per-frame offset would inject apparent camera motion the environment never
+    produces. The shift is drawn once per sample and applied to the whole stack.
+    """
+
+    batch, frames = images.shape[:2]
+    flat = images.reshape(batch * frames, *images.shape[2:]).float()
+    _, _, height, width = flat.shape
+    if height != width:
+        raise ValueError(f"random_shift expects square frames, got {height}x{width}")
+    padded = F.pad(flat, (pad,) * 4, mode="replicate")
+
+    padded_size = height + 2 * pad
+    eps = 1.0 / padded_size
+    axis = torch.linspace(
+        -1.0 + eps, 1.0 - eps, padded_size, device=flat.device, dtype=flat.dtype
+    )[:height]
+    grid = torch.stack(torch.meshgrid(axis, axis, indexing="xy"), dim=-1)
+    grid = grid.unsqueeze(0).expand(batch * frames, -1, -1, -1)
+
+    offsets = torch.randint(
+        0, 2 * pad + 1, size=(batch, 1, 1, 2), device=flat.device, dtype=flat.dtype
+    )
+    offsets = offsets.repeat_interleave(frames, dim=0) * (2.0 / padded_size)
+    shifted = F.grid_sample(padded, grid + offsets, padding_mode="zeros", align_corners=False)
+    return shifted.reshape(batch, frames, *images.shape[2:])
 
 
 def build_state_baseline(args):
@@ -63,11 +97,52 @@ def build_state_baseline(args):
         feature_mean=feature_mean,
         feature_std=feature_std,
     )
-    return dataset, policy
+    # No augmentation or schedule: this arm is a plain match for the latent BC
+    # recipe, and its published numbers were produced without either.
+    return {"dataset": dataset, "policy": policy, "augment": False, "cosine": False}
+
+
+def build_cnn_baseline(args):
+    """From-scratch pixel encoder trained end to end with the BC head."""
+
+    dataset = PushTImageDataset(
+        args.data_path,
+        frame_stack=args.frame_stack,
+        frame_stride=args.frame_stride,
+        action_chunk_size=args.action_chunk_size,
+    )
+    resolution = int(dataset.stats["source_image_shape"][0])
+    policy = CNNBCPolicy(
+        feature_dim=CNN_DEFAULT_FEATURE_DIM,
+        frame_stack=args.frame_stack,
+        action_dim=2,
+        hidden_dim=args.hidden_dim,
+        action_chunk_size=args.action_chunk_size,
+        input_resolution=resolution,
+        num_keypoints=args.cnn_keypoints,
+    )
+    dataset.stats.update(
+        {
+            "observation_space": "pixels",
+            "latent_dim": CNN_DEFAULT_FEATURE_DIM,
+            "cnn_keypoints": args.cnn_keypoints,
+        }
+    )
+    # Augmentation and cosine decay apply to this arm only. Training a trunk from
+    # scratch on 25k frames overfits without them, and an undertrained baseline
+    # would flatter the frozen encoder for the wrong reason. Both are recorded in
+    # the run config so the handicap-removal is visible rather than implicit.
+    return {
+        "dataset": dataset,
+        "policy": policy,
+        "augment": args.augment_shift > 0,
+        "cosine": True,
+    }
 
 
 ENCODER_BASELINES = {
     "state": build_state_baseline,
+    "cnn": build_cnn_baseline,
 }
 
 
@@ -89,8 +164,11 @@ def train_baseline_bc(args):
     observation_resolution = resolve_pusht_observation_resolution(
         args.data_path, args.observation_resolution
     )
-    dataset, policy = ENCODER_BASELINES[args.encoder](args)
-    policy = policy.to(device)
+    spec = ENCODER_BASELINES[args.encoder](args)
+    dataset = spec["dataset"]
+    policy = spec["policy"].to(device)
+    use_augmentation = bool(spec["augment"])
+    use_cosine = bool(spec["cosine"])
 
     dataloader_generator = torch.Generator()
     dataloader_generator.manual_seed(args.seed)
@@ -118,6 +196,8 @@ def train_baseline_bc(args):
         "deterministic": args.deterministic,
         "num_workers": args.num_workers,
         "parameter_count": int(sum(p.numel() for p in policy.parameters())),
+        "augment_shift": args.augment_shift if use_augmentation else 0,
+        "lr_schedule": "cosine" if use_cosine else "constant",
     }
     run_config_path = write_run_config(
         args,
@@ -145,6 +225,11 @@ def train_baseline_bc(args):
         print(f"Logging run to wandb: {getattr(wandb_run, 'url', None) or 'enabled'}")
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        if use_cosine
+        else None
+    )
     criterion = nn.MSELoss()
     print(f"Starting {args.encoder} baseline BC training loop...")
     policy.train()
@@ -154,14 +239,22 @@ def train_baseline_bc(args):
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         for batch_features, batch_actions in dataloader:
-            batch_features = batch_features.to(device)
-            batch_actions = batch_actions.to(device)
+            batch_features = batch_features.to(device, non_blocking=True)
+            batch_actions = batch_actions.to(device, non_blocking=True)
+            if use_augmentation:
+                # Convert to the encoder's float [0, 1] convention before
+                # shifting: grid_sample needs float, and doing it here keeps the
+                # augmented and un-augmented paths on one scale.
+                batch_features = batch_features.float() / 255.0
+                batch_features = random_shift(batch_features, args.augment_shift)
             predicted_action_chunks = policy(batch_features)
             loss = criterion(predicted_action_chunks, batch_actions)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+        if scheduler is not None:
+            scheduler.step()
         avg_loss = epoch_loss / len(dataloader)
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -291,6 +384,8 @@ def build_parser():
     parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader workers")
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True, help="Enable deterministic PyTorch/CuDNN behavior where available")
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension size of the BC MLP head")
+    parser.add_argument("--cnn_keypoints", type=int, default=32, help="Spatial-softmax keypoints in the from-scratch CNN encoder")
+    parser.add_argument("--augment_shift", type=int, default=4, help="Random-shift padding in pixels for the CNN arm; 0 disables augmentation")
     parser.add_argument("--frame_stack", type=int, default=3, help="Number of observations to stack for temporal context")
     parser.add_argument("--frame_stride", type=int, default=5, help="Environment steps between stacked history frames")
     parser.add_argument("--action_chunk_size", type=int, default=5, help="Number of future actions to predict from one observation")

@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from src.bc.dataset import PUSHT_STATE_DIM, pusht_state_features
+from src.bc.models.policy.cnn_bc_policy import CNNBCPolicy
 from src.bc.models.policy.state_bc_policy import StateBCPolicy
 from src.evaluation.agents import (
     LatentChunkAgent,
@@ -49,6 +50,13 @@ def pusht_state_from_info(info):
 @dataclass
 class StateBCComponents:
     policy: StateBCPolicy
+    contract: dict
+    stats: dict
+
+
+@dataclass
+class CNNBCComponents:
+    policy: CNNBCPolicy
     contract: dict
     stats: dict
 
@@ -93,6 +101,84 @@ def load_state_bc_components(checkpoint, stats_path=None, device="auto"):
     policy.load_state_dict(torch.load(checkpoint_path, map_location=device))
     policy.eval()
     return StateBCComponents(policy=policy, contract=contract, stats=stats)
+
+
+def load_cnn_bc_components(checkpoint, stats_path=None, device="auto"):
+    device = resolve_device(device)
+    stats_reference = stats_path or infer_bc_stats_path(checkpoint)
+    checkpoint_path, resolved_stats_path = resolve_artifacts([checkpoint, stats_reference])
+    stats = torch.load(resolved_stats_path, map_location="cpu")
+    observation_space = stats.get("observation_space")
+    if observation_space != "pixels":
+        raise ValueError(
+            f"{resolved_stats_path} records observation_space={observation_space!r}; "
+            "the CNN baseline only loads checkpoints trained end to end on pixels"
+        )
+    resolution = bc_training_observation_resolution(stats)
+    if resolution is None:
+        raise ValueError(
+            f"{resolved_stats_path} does not record its training observation resolution"
+        )
+    contract = {
+        "frame_stack": int(stats["frame_stack"]),
+        "frame_stride": int(stats["frame_stride"]),
+        "action_chunk_size": int(stats["action_chunk_size"]),
+        "latent_dim": int(stats["latent_dim"]),
+        "hidden_dim": int(stats["hidden_dim"]),
+        "action_dim": int(stats.get("action_dim", 2)),
+    }
+    policy = CNNBCPolicy(
+        feature_dim=contract["latent_dim"],
+        frame_stack=contract["frame_stack"],
+        action_dim=contract["action_dim"],
+        hidden_dim=contract["hidden_dim"],
+        action_chunk_size=contract["action_chunk_size"],
+        input_resolution=resolution,
+        num_keypoints=int(stats.get("cnn_keypoints", 32)),
+    ).to(device)
+    policy.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    policy.eval()
+    return CNNBCComponents(policy=policy, contract=contract, stats=stats)
+
+
+def make_cnn_bc_evaluation_agent(
+    checkpoint=None,
+    stats_path=None,
+    components=None,
+    device="auto",
+    execution_mode="open-loop",
+    replan_interval=1,
+    temporal_ensemble_decay=0.01,
+):
+    components = components or load_cnn_bc_components(checkpoint, stats_path, device)
+    resolved_device = next(components.policy.parameters()).device
+
+    def predict_chunk(stacked, deterministic):
+        return components.policy.head(stacked)[0]
+
+    # CNNEncoder already matches LatentChunkAgent's image -> feature contract, so
+    # the pixel arm needs no subclass: only the encoder differs from the LeWM arm.
+    return LatentChunkAgent(
+        agent_type="bc-cnn",
+        encoder=components.policy.encoder,
+        predict_chunk=predict_chunk,
+        contract=components.contract,
+        device=resolved_device,
+        deterministic=True,
+        execution_mode=execution_mode,
+        replan_interval=replan_interval,
+        temporal_ensemble_decay=temporal_ensemble_decay,
+        metadata={
+            "checkpoint": str(checkpoint) if checkpoint is not None else "in-memory",
+            "stats": str(stats_path or infer_bc_stats_path(checkpoint))
+            if checkpoint is not None
+            else "in-memory",
+            "observation_space": "pixels",
+            "training_observation_resolution": bc_training_observation_resolution(
+                components.stats
+            ),
+        },
+    )
 
 
 def make_state_bc_evaluation_agent(

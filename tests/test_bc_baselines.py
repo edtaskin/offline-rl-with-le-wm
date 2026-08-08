@@ -11,10 +11,14 @@ from src.bc.dataset import (
     PushTStateDataset,
     pusht_state_features,
 )
+from src.bc.models.policy.cnn_bc_policy import CNNBCPolicy, CNNEncoder, SpatialSoftmax
 from src.bc.models.policy.state_bc_policy import StateBCPolicy
+from src.bc.train_bc_baseline import random_shift
 from src.evaluation.baseline_agents import (
     StateChunkAgent,
+    load_cnn_bc_components,
     load_state_bc_components,
+    make_cnn_bc_evaluation_agent,
     make_state_bc_evaluation_agent,
     pusht_state_from_info,
 )
@@ -208,6 +212,147 @@ class StateAgentTests(unittest.TestCase):
         agent.reset(0)
         with self.assertRaisesRegex(ValueError, "info dict"):
             agent.act(None, None)
+
+
+class SpatialSoftmaxTests(unittest.TestCase):
+    def test_keypoint_tracks_the_activation_peak(self):
+        layer = SpatialSoftmax(1, 8, 8)
+        for row, col, expected in [(0, 0, (-1.0, -1.0)), (7, 7, (1.0, 1.0))]:
+            features = torch.full((1, 1, 8, 8), -20.0)
+            features[0, 0, row, col] = 20.0
+            keypoint = layer(features)[0]
+            self.assertAlmostEqual(float(keypoint[0]), expected[0], places=2)
+            self.assertAlmostEqual(float(keypoint[1]), expected[1], places=2)
+
+    def test_output_width_is_two_per_channel(self):
+        layer = SpatialSoftmax(5, 4, 4)
+        self.assertEqual(layer(torch.randn(3, 5, 4, 4)).shape, (3, 10))
+
+
+class CNNEncoderTests(unittest.TestCase):
+    def test_normalization_is_dtype_driven_not_value_driven(self):
+        encoder = CNNEncoder(feature_dim=16, input_resolution=32, num_keypoints=4).eval()
+        # A dark frame is where a `max() > 1.5` heuristic would have diverged.
+        dark = torch.zeros(1, 3, 32, 32, dtype=torch.uint8)
+        with torch.no_grad():
+            from_uint8 = encoder(dark)
+            from_float = encoder(dark.float() / 255.0)
+        self.assertTrue(torch.allclose(from_uint8, from_float, atol=1e-6))
+
+    def test_uint8_and_scaled_float_inputs_agree(self):
+        encoder = CNNEncoder(feature_dim=16, input_resolution=32, num_keypoints=4).eval()
+        images = torch.randint(0, 256, (2, 3, 32, 32), dtype=torch.uint8)
+        with torch.no_grad():
+            self.assertTrue(
+                torch.allclose(encoder(images), encoder(images.float() / 255.0), atol=1e-5)
+            )
+
+    def test_rank_3_input_is_rejected(self):
+        encoder = CNNEncoder(feature_dim=16, input_resolution=32, num_keypoints=4)
+        with self.assertRaisesRegex(ValueError, r"\(B, C, H, W\)"):
+            encoder(torch.zeros(3, 32, 32))
+
+
+class RandomShiftTests(unittest.TestCase):
+    def test_one_offset_per_sample_shared_across_frames(self):
+        torch.manual_seed(0)
+        images = torch.zeros(6, 3, 3, 32, 32)
+        images[:, :, :, 16, 16] = 1.0
+        shifted = random_shift(images, 4)
+        self.assertEqual(shifted.shape, images.shape)
+        for sample in range(6):
+            locations = [
+                (shifted[sample, frame, 0] > 0.5).nonzero().tolist() for frame in range(3)
+            ]
+            self.assertEqual(locations[0], locations[1])
+            self.assertEqual(locations[1], locations[2])
+
+    def test_offsets_differ_across_samples(self):
+        torch.manual_seed(0)
+        images = torch.zeros(16, 1, 3, 32, 32)
+        images[:, :, :, 16, 16] = 1.0
+        shifted = random_shift(images, 4)
+        offsets = {
+            tuple((shifted[sample, 0, 0] > 0.5).nonzero()[0].tolist()) for sample in range(16)
+        }
+        self.assertGreater(len(offsets), 1)
+
+    def test_non_square_frames_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "square"):
+            random_shift(torch.zeros(1, 1, 3, 16, 32), 2)
+
+
+class CNNAgentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.checkpoint_path = self.root / "cnn_bc.pth"
+        self.stats_path = self.root / "cnn_bc_stats.pth"
+        self.contract = {
+            "frame_stack": 3,
+            "frame_stride": 5,
+            "action_chunk_size": 5,
+            "latent_dim": 16,
+            "hidden_dim": 8,
+            "action_dim": 2,
+        }
+        policy = CNNBCPolicy(
+            feature_dim=16,
+            frame_stack=3,
+            hidden_dim=8,
+            action_chunk_size=5,
+            input_resolution=32,
+            num_keypoints=4,
+        )
+        torch.save(policy.state_dict(), self.checkpoint_path)
+        torch.save(
+            {
+                **self.contract,
+                "observation_space": "pixels",
+                "observation_resolution": 32,
+                "cnn_keypoints": 4,
+            },
+            self.stats_path,
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_loader_rejects_a_state_checkpoint(self):
+        stats_path = self.root / "state_stats.pth"
+        torch.save({**self.contract, "observation_space": "state"}, stats_path)
+        with self.assertRaisesRegex(ValueError, "observation_space"):
+            load_cnn_bc_components(str(self.checkpoint_path), str(stats_path), device="cpu")
+
+    def test_agent_acts_from_pixels(self):
+        agent = make_cnn_bc_evaluation_agent(
+            checkpoint=str(self.checkpoint_path),
+            stats_path=str(self.stats_path),
+            device="cpu",
+        )
+        self.assertEqual(agent.agent_type, "bc-cnn")
+        self.assertEqual(agent.metadata["training_observation_resolution"], 32)
+        agent.reset(0)
+        observation = np.random.randint(0, 256, (32, 32, 3), dtype=np.uint8)
+        for _ in range(6):
+            action = agent.act(observation, {})
+            self.assertEqual(action.shape, (2,))
+            self.assertTrue(np.all(np.abs(action) <= 1.0))
+
+    def test_training_and_evaluation_encoders_agree(self):
+        components = load_cnn_bc_components(
+            str(self.checkpoint_path), str(self.stats_path), device="cpu"
+        )
+        policy = components.policy
+        frames = torch.randint(0, 256, (3, 3, 32, 32), dtype=torch.uint8)
+        with torch.no_grad():
+            # Training path: the trainer scales uint8 to float [0, 1] first.
+            train_features = policy.encode_stack(frames.unsqueeze(0).float() / 255.0)[0]
+            # Evaluation path: the agent hands the encoder uint8 frames directly.
+            eval_features = torch.stack(
+                [policy.encoder(frames[index].unsqueeze(0))[0] for index in range(3)]
+            )
+        self.assertTrue(torch.allclose(train_features, eval_features, atol=1e-5))
 
 
 if __name__ == "__main__":
