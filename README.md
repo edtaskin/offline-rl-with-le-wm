@@ -25,29 +25,27 @@ the same action chunks were replayed in the simulator.
 
 ## Pipeline
 
-Everything downstream of the encoder is frozen-encoder work: LeWM's ViT is never fine-tuned, and the
-policy consumes raw CLS tokens (192-d) stacked over a dilated history.
+Everything downstream of the encoder is frozen-encoder work: LeWM's ViT and projector are never
+fine-tuned. A policy can consume either raw CLS tokens or projected LeWM dynamics latents (both
+192-d), stacked over a dilated history. The published campaign below uses raw CLS unless stated
+otherwise.
 
 ```
-                        expert PushT demonstrations (224 px)
-                                        |
-              +-------------------------+-------------------------+
-              |                                                   |
-      frozen LeWM ViT                                     frozen LeWM predictor
-              |                                                   |
-      raw CLS latent (192-d)                        projected latent (dynamics space)
-              |                                                   |
-         BC prior (MLP)                       decoder / de-projector    probes
-              |                                (bridge back to CLS)   (reward, success)
-              |                                                   |
-              +--> PPO in the real env  (1M env steps)             |
-              |                                                    |
-              +--> PPO in imagination ("dream")  <-----------------+
-                                        (0 env steps)
+expert frames -> frozen ViT -> raw CLS -----> raw-CLS BC/PPO
+                                  |
+                                  +-> frozen projector -> projected BC/PPO
+
+expert context + actions -> frozen predictor -> imagined projected latent -> probes
+                                                    |
+                         +--------------------------+-----------------------+
+                         |                                                  |
+              direct to projected PPO                      decoder / de-projector
+                                                                    |
+                                                               raw-CLS PPO
 ```
 
-* **Encoder** ([`src/representations/lewm.py`](src/representations/lewm.py)) — the frozen LeWM ViT
-  shared by BC, PPO and evaluation, so every agent sees exactly the same observation space.
+* **Encoder** ([`src/representations/lewm.py`](src/representations/lewm.py)) — the frozen LeWM ViT,
+  optionally followed by its frozen projector, shared by BC, PPO and evaluation.
 * **BC prior** ([`src/bc/train_bc_latent.py`](src/bc/train_bc_latent.py)) — action-chunked latent
   behavioural cloning; it initialises every PPO run so the arms differ only in where experience
   comes from.
@@ -56,9 +54,9 @@ policy consumes raw CLS tokens (192-d) stacked over a dilated history.
 * **Dream PPO** ([`src/ppo/train_lewm.py`](src/ppo/train_lewm.py)) — the same PPO, rolled out
   through LeWM's predictor. One PPO transition = one predictor step = 5 env steps. `env.step` is
   never called.
-* **Bridge** ([`src/representations/deprojector.py`](src/representations/deprojector.py)) — LeWM
-  predicts in *projected* latent space; the policy reads raw CLS. Either decode the imagined latent
-  to a frame and re-encode it, or learn the inverse map directly.
+* **Bridge** ([`src/representations/deprojector.py`](src/representations/deprojector.py)) — a raw-CLS
+  policy needs either the pixel decoder or de-projector to consume imagined projected latents. A
+  projected policy consumes LeWM's predictor output directly and bypasses both bridges.
 * **Probes** ([`scripts/probes/`](scripts/probes/)) — frozen classifiers on the imagined latent
   supply reward and episode termination. They are the only thing standing in for the simulator's
   reward function, and RQ2 is about how far that can be trusted.
@@ -205,6 +203,17 @@ python -m src.bc.train_bc_latent \
   --hf_repo_id offline-rl-with-le-wm/bc/pusht_latent_bc
 ```
 
+The default representation is `raw_cls`, matching the published checkpoints and results. To train
+directly in LeWM's projected dynamics space, give the run a distinct checkpoint name and add:
+
+```bash
+--latent-representation projected
+```
+
+The representation is written into the BC stats artifact. Real and dream PPO restore it from
+`--bc_stats`; a conflicting PPO CLI override is rejected because raw CLS and projected latents have
+the same dimensionality but are not interchangeable.
+
 Evaluate on the fixed-target task. Passing `--block-start-radius 200` matches the PPO training start
 distribution; omit it for unrestricted block starts around the same fixed target.
 
@@ -261,7 +270,8 @@ python src/ppo/train.py \
 ```
 
 PPO uses the same environment-owned, fixed-target evaluator as BC; the checkpoint and agent type
-select the PPO adapter.
+select the PPO adapter. For a projected BC prior, point `--bc_checkpoint` and `--bc_stats` at its
+matching artifacts; no separate representation flag is needed.
 
 ```bash
 python -m src.evaluation.evaluate_pusht \
@@ -278,8 +288,8 @@ python -m src.evaluation.evaluate_pusht \
 
 [`src/ppo/train_lewm.py`](src/ppo/train_lewm.py) runs the same chunk-level latent PPO as
 [`src/ppo/ppo.py`](src/ppo/ppo.py), but rolls out inside LeWM instead of the simulator: expert data
-supplies episode starts, the frozen world model supplies dynamics, the bridge maps back to the
-policy's latent space, and a frozen probe supplies reward and success. No `env.step` is called.
+supplies episode starts, the frozen world model supplies dynamics, an optional bridge maps back to a
+raw-CLS policy, and a frozen probe supplies reward and success. No `env.step` is called.
 
 Two things make "zero environment interaction" a checkable claim rather than a description:
 
@@ -305,8 +315,9 @@ python -m src.ppo.train_lewm \
   --snapshot_interval 25
 ```
 
-Add `--bridge deprojector` to imagine in latent space instead of through pixels (the default is
-`decoder`).
+For a raw-CLS prior, add `--bridge deprojector` to bridge in latent space instead of through pixels
+(the default is `decoder`). A projected prior bypasses this option and feeds each predicted LeWM
+latent directly to PPO.
 
 `--snapshot_interval` keeps permanent `snapshot_step<env_steps>_it<iteration>.pt` checkpoints;
 unlike `latest.pt` they are never overwritten, which is what makes an interaction-budget curve
@@ -391,12 +402,11 @@ python -m scripts.rq2.dream_success_gallery --seed 1 --episodes 96 --verify-in-s
 
 ## Bridging LeWM's latent space back to the policy
 
-LeWM's predictor emits latents in the *projected* space (`projector(cls)`), while the BC and PPO
-policies consume the raw ViT CLS token. Imagination has to close that gap. The original route goes
-through pixels: decode the imagined latent to a frame, re-encode the frame with the ViT. The
-de-projector does the same job directly in latent space — no image reconstruction, no ViT pass over
-synthetic frames — and like the decoder and the probes it is trained offline from expert data at
-zero environment cost.
+LeWM's predictor emits latents in the *projected* space (`projector(cls)`). A projected BC/PPO policy
+already consumes that representation, so imagined predictions go straight to the policy. A raw-CLS
+policy must close the gap: either decode the imagined latent to a frame and re-encode it with the
+ViT, or use the de-projector to approximate raw CLS directly. Like the decoder and probes, the
+de-projector is trained offline from expert data at zero environment cost.
 
 ```bash
 python -m scripts.deprojector.train_deprojector_pusht      # train the latent-space bridge

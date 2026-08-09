@@ -144,6 +144,56 @@ def test_training_observation_resolution_is_validated():
         raise AssertionError("expected a non-positive observation resolution to fail")
 
 
+def test_projected_representation_is_a_valid_agent_contract():
+    cfg = LatentConfig(
+        latent_representation="projected",
+        num_envs=1,
+        num_chunks=1,
+    )
+    assert cfg.latent_representation == "projected"
+
+    try:
+        LatentConfig(
+            latent_representation="unknown",
+            num_envs=1,
+            num_chunks=1,
+        )
+    except ValueError as exc:
+        assert "latent representation" in str(exc)
+    else:
+        raise AssertionError("unknown latent representation was accepted")
+
+
+def test_bc_stats_are_authoritative_for_ppo_representation():
+    import src.ppo.train as train
+
+    with TemporaryDirectory() as temporary_dir:
+        root = Path(temporary_dir)
+        projected_stats = root / "projected_stats.pth"
+        legacy_stats = root / "legacy_stats.pth"
+        torch.save({"latent_representation": "projected"}, projected_stats)
+        torch.save({}, legacy_stats)
+
+        projected = train._stats_contract(str(projected_stats))
+        legacy = train._stats_contract(str(legacy_stats))
+
+    assert projected["latent_representation"] == "projected"
+    assert legacy["latent_representation"] == "raw_cls"
+
+    parser = argparse.ArgumentParser()
+    train._validate_latent_representation_contract(
+        parser, {"latent_representation": "projected"}, projected
+    )
+    try:
+        train._validate_latent_representation_contract(
+            parser, {"latent_representation": "raw_cls"}, projected
+        )
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("PPO accepted a representation that conflicts with BC stats")
+
+
 def test_gradient_contract():
     """BC policy / log_std / critic receive grads; the frozen encoder does not."""
     b, f, adim, k, ld = 4, 3, 2, 5, 192
@@ -450,6 +500,26 @@ def test_dense_reward_checkpoint_config():
         assert "dense_reward_checkpoint" in str(exc)
     else:
         raise AssertionError("dense reward accepted an empty checkpoint")
+
+
+def test_projected_dream_observation_bypasses_decoder_and_deprojector():
+    import src.ppo.train_lewm as train_lewm
+
+    class MustNotRun(nn.Module):
+        def forward(self, value):
+            raise AssertionError("a projected policy must not use a bridge")
+
+    world = object.__new__(train_lewm.LeWMDreamWorld)
+    world.policy_uses_projected = True
+    world.capture_frames = False
+    world._decoder = MustNotRun()
+    world._deprojector = MustNotRun()
+    pred = torch.randn(3, 192)
+
+    observed = world._observe(pred)
+
+    assert observed is pred
+    assert world.last_frames is None
 
 
 def test_dream_dense_reward_adds_sparse_success():

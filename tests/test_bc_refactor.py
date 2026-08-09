@@ -19,10 +19,18 @@ from src.bc.history import (
     history_indices,
     temporal_ensemble_action,
 )
-from src.bc.latent_cache import check_latent_cache, metadata_matches
+from src.bc.latent_cache import (
+    build_projected_latent_cache,
+    check_latent_cache,
+    default_latent_cache_path,
+    expected_latent_cache_metadata,
+    metadata_matches,
+)
 from src.representations.lewm import (
     LEWM_IMAGE_MEAN,
     LEWM_IMAGE_STD,
+    LEWM_LATENT_PROJECTED,
+    LEWM_LATENT_RAW_CLS,
     LeWMEncoder,
 )
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
@@ -130,6 +138,41 @@ class HistoryTests(unittest.TestCase):
 
 
 class CacheAndPolicyTests(unittest.TestCase):
+    def test_raw_cache_contract_is_unchanged_and_projected_cache_is_distinct(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_path = root / "expert.npz"
+            checkpoint_path = root / "lewm.ckpt"
+            np.savez(data_path, actions=np.zeros((4, 2), dtype=np.float32))
+            checkpoint_path.write_bytes(b"checkpoint")
+
+            raw = expected_latent_cache_metadata(data_path, checkpoint_path, 4, 3)
+            explicit_raw = expected_latent_cache_metadata(
+                data_path,
+                checkpoint_path,
+                4,
+                3,
+                latent_representation=LEWM_LATENT_RAW_CLS,
+            )
+            projected = expected_latent_cache_metadata(
+                data_path,
+                checkpoint_path,
+                4,
+                3,
+                latent_representation=LEWM_LATENT_PROJECTED,
+            )
+
+            self.assertEqual(raw, explicit_raw)
+            self.assertNotIn("latent_representation", raw)
+            self.assertEqual(projected["latent_representation"], "projected")
+            self.assertNotEqual(projected["cache_type"], raw["cache_type"])
+            self.assertTrue(default_latent_cache_path(data_path).endswith("_cls.pt"))
+            self.assertTrue(
+                default_latent_cache_path(data_path, LEWM_LATENT_PROJECTED).endswith(
+                    "_projected.pt"
+                )
+            )
+
     def test_cache_validation_accepts_existing_format(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "cache.pt"
@@ -184,6 +227,59 @@ class CacheAndPolicyTests(unittest.TestCase):
         policy(features).sum().backward()
         self.assertTrue(any(parameter.grad is not None for parameter in policy.parameters()))
         self.assertTrue(all(parameter.grad is None for parameter in encoder.parameters()))
+
+    def test_projected_extractor_applies_and_freezes_projector(self):
+        class FakeEncoder(torch.nn.Module):
+            def forward(self, images, interpolate_pos_encoding=False):
+                tokens = images.new_ones(len(images), 1, 3)
+                return SimpleNamespace(last_hidden_state=tokens)
+
+        projector = torch.nn.Linear(3, 3, bias=False)
+        with torch.no_grad():
+            projector.weight.copy_(2.0 * torch.eye(3))
+        extractor = LeWMEncoder(
+            encoder=FakeEncoder(),
+            projector=projector,
+            device="cpu",
+            feature_dim=3,
+            latent_representation=LEWM_LATENT_PROJECTED,
+        )
+
+        self.assertTrue(
+            torch.equal(extractor.encode(torch.ones(2, 3, 8, 8)), torch.full((2, 3), 2.0))
+        )
+        self.assertTrue(all(not parameter.requires_grad for parameter in projector.parameters()))
+        extractor.train()
+        self.assertFalse(extractor.encoder.training)
+        self.assertFalse(extractor.projector.training)
+
+    def test_projected_cache_is_built_from_raw_latents(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw_path = root / "raw.pt"
+            projected_path = root / "projected.pt"
+            raw_latents = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+            torch.save({"latents": raw_latents, "metadata": {}}, raw_path)
+            projector = torch.nn.Linear(3, 3, bias=False)
+            with torch.no_grad():
+                projector.weight.copy_(3.0 * torch.eye(3))
+            metadata = {
+                "num_samples": 4,
+                "latent_dim": 3,
+                "latent_representation": LEWM_LATENT_PROJECTED,
+            }
+
+            build_projected_latent_cache(
+                raw_path,
+                projector,
+                projected_path,
+                metadata,
+                batch_size=2,
+            )
+            payload = torch.load(projected_path, map_location="cpu")
+            self.assertTrue(torch.equal(payload["latents"], 3.0 * raw_latents))
+            self.assertEqual(payload["metadata"]["latent_representation"], "projected")
+            self.assertIn("source_raw_cache", payload["metadata"])
 
 
 class LeWMPreprocessingTests(unittest.TestCase):

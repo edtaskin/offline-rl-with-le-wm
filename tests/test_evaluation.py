@@ -12,6 +12,7 @@ from src.evaluation.agents import (
     LatentChunkAgent,
     bc_training_observation_resolution,
     load_bc_components,
+    load_ppo_components,
 )
 from src.envs import PUSHT_RENDER_SHAPE
 from src.evaluation.evaluate_pusht import (
@@ -413,14 +414,7 @@ class LatentChunkAgentTests(unittest.TestCase):
             agent.act(observation, {})
         self.assertEqual(len(calls), 3)
 
-    def test_bc_loader_rejects_projected_latent_contract(self):
-        """Projected-latent policies must not silently load against raw CLS.
-
-        The encoder switch they need lives on the ``projected-bc`` branch
-        (commit 7bd32d9). Porting it should turn this back into the original
-        assertion that ``latent_representation`` reaches ``from_checkpoint``,
-        which is preserved in git at 331a05a.
-        """
+    def test_bc_loader_restores_projected_latent_contract(self):
         with TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             checkpoint = root / "policy.pth"
@@ -450,11 +444,15 @@ class LatentChunkAgentTests(unittest.TestCase):
                 "src.evaluation.agents.LeWMEncoder.from_checkpoint",
                 return_value=frozen_encoder,
             ) as load_encoder:
-                with self.assertRaises(ValueError) as raised:
-                    load_bc_components(str(checkpoint), str(stats_path), device="cpu")
+                components = load_bc_components(
+                    str(checkpoint), str(stats_path), device="cpu"
+                )
 
-            self.assertIn("projected", str(raised.exception))
-            load_encoder.assert_not_called()
+            self.assertIs(components.encoder, frozen_encoder)
+            self.assertEqual(components.contract["latent_representation"], "projected")
+            self.assertEqual(
+                load_encoder.call_args.kwargs["latent_representation"], "projected"
+            )
 
     def test_bc_loader_defaults_to_raw_cls_latents(self):
         with TemporaryDirectory() as temporary_dir:
@@ -490,6 +488,47 @@ class LatentChunkAgentTests(unittest.TestCase):
                 )
 
             self.assertIs(components.encoder, frozen_encoder)
+
+    def test_ppo_loader_restores_projected_latent_contract(self):
+        with TemporaryDirectory() as temporary_dir:
+            checkpoint = Path(temporary_dir) / "ppo.pt"
+            contract = {
+                "frame_stack": 1,
+                "frame_stride": 1,
+                "action_chunk_size": 1,
+                "latent_dim": 3,
+                "hidden_dim": 4,
+                "action_dim": 2,
+                "latent_representation": "projected",
+            }
+            torch.save(
+                {
+                    "agent": {},
+                    "config": {**contract, "init_log_std": -2.0},
+                    "contract": contract,
+                },
+                checkpoint,
+            )
+            frozen_encoder = MagicMock(spec=torch.nn.Module)
+            fake_agent = MagicMock(spec=torch.nn.Module)
+            fake_agent.load_state_dict.return_value = ([], [])
+            with (
+                patch(
+                    "src.evaluation.agents.LeWMEncoder.from_checkpoint",
+                    return_value=frozen_encoder,
+                ) as load_encoder,
+                patch(
+                    "src.evaluation.agents.build_latent_agent",
+                    return_value=fake_agent,
+                ),
+            ):
+                components = load_ppo_components(str(checkpoint), device="cpu")
+
+            self.assertIs(components.encoder, frozen_encoder)
+            self.assertEqual(components.contract["latent_representation"], "projected")
+            self.assertEqual(
+                load_encoder.call_args.kwargs["latent_representation"], "projected"
+            )
 
 
 if __name__ == "__main__":

@@ -110,6 +110,7 @@ class LatentPPOTrainer:
                 self.device,
                 cfg.encoder_checkpoint,
                 latent_dim=cfg.latent_dim,
+                latent_representation=cfg.latent_representation,
             )
         self.encoder = encoder
         self.agent = build_latent_agent(
@@ -440,6 +441,7 @@ class LatentPPOTrainer:
                 "latent_dim": self.cfg.latent_dim,
                 "hidden_dim": self.cfg.hidden_dim,
                 "action_dim": self.cfg.action_dim,
+                "latent_representation": self.cfg.latent_representation,
             },
         }
         if self.reward_norm is not None:

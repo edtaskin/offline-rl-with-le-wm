@@ -38,6 +38,7 @@ except Exception:  # noqa: BLE001 - dotenv is optional
 import torch
 
 from src.ppo.config import LatentConfig
+from src.representations.lewm import LEWM_LATENT_RAW_CLS
 from src.utils.hf_hub import resolve_artifact
 
 CONTRACT_FIELDS = (
@@ -48,6 +49,7 @@ CONTRACT_FIELDS = (
     "hidden_dim",
     "action_dim",
 )
+STR_CONTRACT_FIELDS = ("latent_representation",)
 
 # Tiny overrides for --smoke: a couple of quick iterations end-to-end.
 SMOKE_OVERRIDES = dict(
@@ -114,9 +116,25 @@ def _stats_contract(stats_path: str) -> dict:
     resolved_stats_path = resolve_artifact(stats_path)
     stats = torch.load(resolved_stats_path, map_location="cpu")
     overrides = {k: int(stats[k]) for k in CONTRACT_FIELDS if k in stats}
+    overrides.update({k: str(stats[k]) for k in STR_CONTRACT_FIELDS if k in stats})
+    # Stats predating projected policies are raw CLS by definition.
+    overrides.setdefault("latent_representation", LEWM_LATENT_RAW_CLS)
     if overrides:
         print(f"Contract from {stats_path} ({resolved_stats_path}): {overrides}")
     return overrides
+
+
+def _validate_latent_representation_contract(parser, args, stats_overrides) -> None:
+    """Reject a CLI representation that disagrees with the loaded BC prior."""
+
+    cli_representation = args.get("latent_representation")
+    stats_representation = stats_overrides["latent_representation"]
+    if cli_representation is not None and cli_representation != stats_representation:
+        parser.error(
+            "--latent-representation conflicts with the BC stats: "
+            f"CLI={cli_representation!r}, stats={stats_representation!r}. "
+            "Use the representation recorded by the BC checkpoint."
+        )
 
 
 def parse_config() -> LatentConfig:
@@ -129,6 +147,7 @@ def parse_config() -> LatentConfig:
     defaults = {f.name: getattr(LatentConfig(), f.name) for f in fields(LatentConfig) if f.init}
     stats_path = args.get("bc_stats", defaults["bc_stats"])
     stats_overrides = _stats_contract(stats_path)
+    _validate_latent_representation_contract(parser, args, stats_overrides)
 
     # Precedence: CLI (args) > smoke > stats > defaults.
     merged = {**defaults, **stats_overrides}

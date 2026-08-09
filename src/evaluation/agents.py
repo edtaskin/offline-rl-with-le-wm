@@ -59,7 +59,10 @@ class LatentChunkAgent:
         self.agent_type = agent_type
         self.encoder = encoder
         self.predict_chunk = predict_chunk
-        self.contract = {key: int(value) for key, value in contract.items()}
+        self.contract = {
+            key: int(value) if isinstance(value, (int, float, bool)) else value
+            for key, value in contract.items()
+        }
         self.device = torch.device(device)
         self.deterministic = bool(deterministic)
         self.execution_mode = execution_mode
@@ -199,18 +202,13 @@ def load_bc_components(checkpoint, stats_path=None, device="auto"):
         "action_dim": int(stats.get("action_dim", 2)),
     }
     representation = stats.get("latent_representation", LEWM_LATENT_RAW_CLS)
-    if representation != LEWM_LATENT_RAW_CLS:
-        raise ValueError(
-            f"{resolved_stats_path} was trained on {representation!r} latents, but this "
-            f"branch only builds {LEWM_LATENT_RAW_CLS!r} ones. Both are 192-d, so loading "
-            "it here would silently feed the policy the wrong features; evaluate it from "
-            "the `projected-bc` branch instead."
-        )
+    contract["latent_representation"] = representation
     normalization = stats.get("image_normalization", LEWM_IMAGE_NORMALIZATION)
     encoder = LeWMEncoder.from_checkpoint(
         device=device,
         latent_dim=contract["latent_dim"],
         normalization=normalization,
+        latent_representation=representation,
     )
     policy = LatentBCPolicy(
         latent_dim=contract["latent_dim"],
@@ -249,12 +247,24 @@ def load_ppo_components(checkpoint, device="auto", encoder=None):
             "action_dim",
         }
     }
+    representation = payload.get("contract", {}).get(
+        "latent_representation",
+        config.get("latent_representation", LEWM_LATENT_RAW_CLS),
+    )
+    contract["latent_representation"] = representation
     if encoder is None:
         encoder = LeWMEncoder.from_checkpoint(
             device=device,
             checkpoint_path=config.get("encoder_checkpoint"),
             latent_dim=contract["latent_dim"],
             normalization=config.get("image_normalization", LEWM_IMAGE_NORMALIZATION),
+            latent_representation=representation,
+        )
+    elif getattr(encoder, "latent_representation", LEWM_LATENT_RAW_CLS) != representation:
+        raise ValueError(
+            f"provided encoder is "
+            f"{getattr(encoder, 'latent_representation', None)!r}, but checkpoint "
+            f"{checkpoint} expects {representation!r}"
         )
     agent = build_latent_agent(
         encoder=encoder,
@@ -307,6 +317,9 @@ def make_bc_evaluation_agent(
             else "in-memory",
             "training_observation_resolution": bc_training_observation_resolution(
                 components.stats
+            ),
+            "latent_representation": components.stats.get(
+                "latent_representation", LEWM_LATENT_RAW_CLS
             ),
         },
     )
