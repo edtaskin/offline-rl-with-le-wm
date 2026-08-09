@@ -199,9 +199,26 @@ python -m src.bc.train_bc_latent \
   --deterministic \
   --log_interval 10 \
   --save_interval 100 \
+  --eval_interval 10 \
+  --eval_episodes 20 \
+  --eval_seed 42 \
+  --eval_block_start_radius 200 \
+  --wandb \
+  --wandb_project offline-rl-lewm \
+  --wandb_run_name pusht-bc-raw-cls \
   --push_to_hf \
-  --hf_repo_id offline-rl-with-le-wm/bc/pusht_latent_bc
+  --hf_repo_id offline-rl-with-le-wm/bc \
+  --hf_path_prefix pusht-bc-raw-cls
 ```
+
+`--checkpoint_path` is a base name. The final epoch is always written to
+`pusht_latent_bc_final.pth`; `pusht_latent_bc_best.pth` is selected by deterministic real-environment
+success on the fixed evaluation suite every `--eval_interval` epochs (and once at the final epoch).
+Ties retain the earlier checkpoint. Matching `_stats.pth` files persist the selected epoch and
+success, while `pusht_latent_bc_eval_history.json` records every selection evaluation and its real
+environment-step cost. Aggregate train/evaluation metrics and the best epoch go to W&B with
+`--wandb`. With `--push_to_hf`, both model variants, both stats files, the evaluation history, and
+the run config are uploaded under `--hf_path_prefix`.
 
 The default representation is `raw_cls`, matching the published checkpoints and results. To train
 directly in LeWM's projected dynamics space, give the run a distinct checkpoint name and add:
@@ -341,6 +358,25 @@ starts so nothing existing is overwritten. `--exp-prefix` renames run dirs, W&B 
 folder so a second prior can reuse the script;
 [`run_legacy_prior_control.sh`](scripts/campaign/run_legacy_prior_control.sh) is that case.
 
+For a projected LeWM-latent BC prior, use the bridge-free latent campaign. It verifies the BC stats
+declare `latent_representation=projected`, tracks every training in W&B, and publishes `best.pt` and
+`final.pt` below `ppo/lewm-latent/<arm>/seed<N>/`:
+
+```bash
+bash scripts/campaign/run_lewm_latent_grid.sh \
+  --bc-checkpoint hf://OWNER/REPO/path/to/projected_bc_best.pth \
+  --bc-stats hf://OWNER/REPO/path/to/projected_bc_best_stats.pth
+
+# Run one of seeds 1, 2, or 3 on this host:
+bash scripts/campaign/run_lewm_latent_grid.sh --seed 2 \
+  --bc-checkpoint hf://OWNER/REPO/path/to/projected_bc_best.pth \
+  --bc-stats hf://OWNER/REPO/path/to/projected_bc_best_stats.pth
+```
+
+Its arm names are `real-dense`, `real-sparse`, `dream-dense`, and `dream-sparse`. A projected dream
+policy consumes the predictor output directly, so this campaign neither accepts nor loads a decoder
+or de-projector bridge.
+
 The older three-seed RQ1 harness still works and additionally draws the interaction-budget curve:
 
 ```bash
@@ -426,7 +462,7 @@ and are referenced from the CLI as `hf://offline-rl-with-le-wm/<repo>/<file>`.
 |:---|:---|:---|
 | BC prior (campaign) | `bc/pusht-bc-raw-cls/` | 512-wide raw CLS, 1000 epochs; the prior for every arm in the results table |
 | BC prior (legacy) | `bc/pusht-bc-raw-cls-256-legacy/` | 256-wide, 100 epochs; the prior behind the 92% real-env PPO. Its stats file predates `observation_resolution` — evaluate with `--training-observation-resolution 224` |
-| PPO agents | `ppo/` | `rawcls_bc_best/<arm>/seed<N>/` for the campaign, `rawcls256_legacy/` for the prior control |
+| PPO agents | `ppo/` | `rawcls_bc_best/<arm>/seed<N>/` for the raw-CLS campaign, `lewm-latent/<arm>/seed<N>/` for the projected campaign, `rawcls256_legacy/` for the prior control |
 | Latent decoder | `decoder_lewm_pusht/` | pixel bridge for imagination |
 | De-projector | `deprojector_lewm_pusht/` | latent-space bridge |
 | Success probe | `probes/is_objective_met_probe_baseline.pt` | declares success and termination in the dream |
