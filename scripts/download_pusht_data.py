@@ -28,7 +28,7 @@ def obtain_expert_trajectories():
         os.remove(zip_path)
 
     if os.path.exists(zarr_dir) and not os.path.exists(npz_path):
-        dataset_root = zarr.open(zarr_dir, 'r')
+        dataset_root = zarr.open(zarr_dir, mode="r")
         
         # Existing extractions
         states = dataset_root['data']['state'][:]
