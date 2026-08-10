@@ -65,6 +65,7 @@ SMOKE_OVERRIDES = dict(
 
 # str fields whose dataclass default is None (so type can't be inferred).
 _NULLABLE_STR_FIELDS = {
+    "checkpoint_path",
     "encoder_checkpoint",
     "wandb_entity",
     "hf_repo_id",
@@ -194,23 +195,34 @@ def main() -> None:
 
 
 def _push_run_artifacts(cfg: LatentConfig, run_dir: Path) -> None:
-    """Publish what a run needs to be re-analysed, not only ``best.pt``.
+    """Publish what a run needs to be re-analysed, not only its best checkpoint.
 
-    ``final.pt`` is the no-selection control, and a dream run's
-    ``selection_log.jsonl`` carries the paired imagined/real measurements the
-    optimism analysis reads. Without them a published run can only be re-scored,
-    not re-examined.
+    The final checkpoint is the no-selection control, and a dream run's
+    selection log carries the paired imagined/real measurements the optimism
+    analysis reads. Without them a published run can only be re-scored, not
+    re-examined. Explicit checkpoint bases use their prefixed artifact names;
+    legacy timestamped runs retain ``best.pt``/``final.pt``.
 
     Everything lands under ``cfg.hf_path_prefix``. With no prefix the files go to
     the repository root, where ``best.pt``/``final.pt`` already exist from
     earlier runs and would be overwritten -- campaigns should always set one.
     """
+    from src.ppo.ppo import ppo_artifact_path
     from src.utils.hf_hub import push_files_to_hub
 
     if not cfg.hf_repo_id:
         raise ValueError("--push_to_hf requires --hf_repo_id (e.g. your-username/pusht-latent-ppo)")
-    candidates = ["best.pt", "final.pt", "selection_log.jsonl"]
-    paths = [str(run_dir / name) for name in candidates if (run_dir / name).is_file()]
+    candidates = (
+        ppo_artifact_path(run_dir, cfg.checkpoint_path, "best"),
+        ppo_artifact_path(run_dir, cfg.checkpoint_path, "final"),
+        ppo_artifact_path(
+            run_dir,
+            cfg.checkpoint_path,
+            "selection_log",
+            suffix=".jsonl",
+        ),
+    )
+    paths = [str(path) for path in candidates if path.is_file()]
     if not paths:
         raise FileNotFoundError(f"No publishable artifacts in {run_dir}")
     if not cfg.hf_path_prefix:

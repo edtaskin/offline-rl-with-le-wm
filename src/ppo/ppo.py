@@ -57,6 +57,49 @@ from src.ppo.utils import RewardNormalizer, get_device, set_seed
 from src.utils.hf_hub import resolve_artifact
 
 
+def ppo_output_paths(
+    cfg: LatentConfig,
+    *,
+    run_stamp: str | None = None,
+) -> tuple[Path, Path | None]:
+    """Resolve the run directory and optional explicit checkpoint base.
+
+    ``checkpoint_path`` deliberately follows the BC trainer's base-file
+    convention. For example, ``runs/ppo/agent.pt`` produces sibling
+    ``agent_best.pt`` and ``agent_final.pt`` artifacts. With no explicit base,
+    retain the historical timestamped run directory and canonical names such as
+    ``best.pt`` and ``final.pt``.
+    """
+
+    if cfg.checkpoint_path:
+        checkpoint_base = Path(cfg.checkpoint_path)
+        if checkpoint_base.exists() and checkpoint_base.is_dir():
+            raise ValueError(
+                "checkpoint_path must be a checkpoint base file, not a directory"
+            )
+        return checkpoint_base.parent, checkpoint_base
+
+    stamp = run_stamp or datetime.now().strftime("%d%m%Y-%H%M%S")
+    run_dir = Path(cfg.save_dir) / f"{cfg.exp_name}__seed{cfg.seed}" / stamp
+    return run_dir, None
+
+
+def ppo_artifact_path(
+    run_dir: str | Path,
+    checkpoint_base: str | Path | None,
+    name: str,
+    *,
+    suffix: str = ".pt",
+) -> Path:
+    """Return an artifact path under explicit or legacy output semantics."""
+
+    if checkpoint_base is None:
+        return Path(run_dir) / f"{name}{suffix}"
+    base = Path(checkpoint_base)
+    stem = base.stem if base.suffix else base.name
+    return base.with_name(f"{stem}_{name}{suffix}")
+
+
 def build_bc_ref_policy(cfg: LatentConfig, device: torch.device) -> LatentBCPolicy | None:
     """Load the frozen BC policy used by the BC penalty."""
     if not cfg.bc_penalty:
@@ -162,8 +205,7 @@ class LatentPPOTrainer:
         self._second_best_success = -float("inf")
         self._eval_env = None  # dedicated held-out env, built lazily on first eval
 
-        run_stamp = datetime.now().strftime("%d%m%Y-%H%M%S")
-        self.run_dir = Path(cfg.save_dir) / f"{cfg.exp_name}__seed{cfg.seed}" / run_stamp
+        self.run_dir, self.checkpoint_base = ppo_output_paths(cfg)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.writer = None  # optional wandb run, set in train.py
 
@@ -419,7 +461,7 @@ class LatentPPOTrainer:
         return self.train_env_steps() + self._eval_env_steps
 
     def save_checkpoint(self, name: str = "latest", success_rate: float | None = None) -> Path:
-        path = self.run_dir / f"{name}.pt"
+        path = ppo_artifact_path(self.run_dir, self.checkpoint_base, name)
         # Drop the (frozen, large) encoder weights; it is reloaded separately.
         agent_state = {
             key: value
@@ -560,13 +602,13 @@ class LatentPPOTrainer:
             )
 
     def _update_best_checkpoints(self, success_rate: float | None = None) -> None:
-        """Save ``best.pt`` / ``second_best.pt`` ranked by success rate.
+        """Save the best and second-best artifacts ranked by success rate.
 
         ``success_rate`` defaults to the rolling-window estimate; the training
         loop passes the held-out eval success instead when ``eval_interval > 0``.
-        When a new best is reached, the previous ``best.pt`` is demoted to
-        ``second_best.pt`` (copying the file preserves those exact weights, which
-        are no longer in memory once training has moved on).
+        When a new best is reached, the previous best artifact is demoted to the
+        second-best path. Copying the file preserves those exact weights, which
+        are no longer in memory once training has moved on.
         """
         if success_rate is None:
             success_rate = self._current_success_rate()
@@ -574,13 +616,17 @@ class LatentPPOTrainer:
             return  # no completed episodes yet
 
         if success_rate > self._best_success:
-            best_path = self.run_dir / "best.pt"
+            best_path = ppo_artifact_path(self.run_dir, self.checkpoint_base, "best")
             if best_path.exists():
-                shutil.copyfile(best_path, self.run_dir / "second_best.pt")
+                second_best_path = ppo_artifact_path(
+                    self.run_dir, self.checkpoint_base, "second_best"
+                )
+                shutil.copyfile(best_path, second_best_path)
                 logger.info(
-                    "New best success %.4f > %.4f; demoted previous best to second_best.pt",
+                    "New best success %.4f > %.4f; demoted previous best to %s",
                     success_rate,
                     self._best_success,
+                    second_best_path.name,
                 )
                 self._second_best_success = self._best_success
             self.save_checkpoint("best", success_rate=success_rate)

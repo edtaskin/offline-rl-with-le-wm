@@ -27,6 +27,10 @@ class LatentConfig:
     wandb_project: str = "ppo-training"
     wandb_entity: str | None = "imendezval-university-freiburg"
     save_dir: str = "runs"
+    # Optional BC-style checkpoint base. When set, artifacts are written as
+    # ``<stem>_best.pt``, ``<stem>_final.pt``, etc. When omitted, the legacy
+    # timestamped directory below ``save_dir`` is preserved.
+    checkpoint_path: str | None = None
 
     # ----- environment -----
     env_id: str = "swm/PushT-v1"

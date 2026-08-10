@@ -54,7 +54,6 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -72,7 +71,14 @@ from src.ppo.config import LatentConfig
 from src.ppo.dense_reward import DenseRewardShaper
 from src.ppo.env import LatentHistory
 from src.ppo.lewm_encoder import LeWMLatentEncoder
-from src.ppo.ppo import LatentPPOTrainer, _configure_logging, build_bc_ref_policy, logger
+from src.ppo.ppo import (
+    LatentPPOTrainer,
+    _configure_logging,
+    build_bc_ref_policy,
+    logger,
+    ppo_artifact_path,
+    ppo_output_paths,
+)
 from src.ppo.train import (
     _NULLABLE_STR_FIELDS,
     SMOKE_OVERRIDES,
@@ -925,8 +931,7 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
         self._second_best_success = -float("inf")
         self._eval_env = None  # real env, built lazily by the inherited eval
 
-        run_stamp = datetime.now().strftime("%d%m%Y-%H%M%S")
-        self.run_dir = Path(cfg.save_dir) / f"{cfg.exp_name}__seed{cfg.seed}" / run_stamp
+        self.run_dir, self.checkpoint_base = ppo_output_paths(cfg)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.writer = None
 
@@ -1040,7 +1045,13 @@ class LeWMDreamPPOTrainer(LatentPPOTrainer):
             "dream_episode_steps": self.cfg.dream_eval_steps or self.cfg.dream_episode_steps,
             "wm_frameskip": self.cfg.wm_frameskip,
         }
-        with (self.run_dir / "selection_log.jsonl").open("a", encoding="utf-8") as file:
+        selection_log = ppo_artifact_path(
+            self.run_dir,
+            self.checkpoint_base,
+            "selection_log",
+            suffix=".jsonl",
+        )
+        with selection_log.open("a", encoding="utf-8") as file:
             file.write(json.dumps(row) + "\n")
 
     def _run_selection(self, iteration: int) -> None:

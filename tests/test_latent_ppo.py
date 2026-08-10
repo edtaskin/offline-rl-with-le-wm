@@ -144,6 +144,38 @@ def test_training_observation_resolution_is_validated():
         raise AssertionError("expected a non-positive observation resolution to fail")
 
 
+def test_ppo_checkpoint_path_preserves_legacy_and_supports_explicit_bases():
+    from src.ppo.config import LatentConfig
+    from src.ppo.ppo import ppo_artifact_path, ppo_output_paths
+
+    legacy = LatentConfig(exp_name="example", seed=7, save_dir="runs/ppo")
+    run_dir, checkpoint_base = ppo_output_paths(legacy, run_stamp="01012026-120000")
+    assert checkpoint_base is None
+    assert run_dir == Path("runs/ppo/example__seed7/01012026-120000")
+    assert ppo_artifact_path(run_dir, checkpoint_base, "best") == run_dir / "best.pt"
+
+    explicit = LatentConfig(checkpoint_path="runs/ppo/example.pt")
+    run_dir, checkpoint_base = ppo_output_paths(explicit, run_stamp="ignored")
+    assert run_dir == Path("runs/ppo")
+    assert checkpoint_base == Path("runs/ppo/example.pt")
+    assert ppo_artifact_path(run_dir, checkpoint_base, "best") == Path(
+        "runs/ppo/example_best.pt"
+    )
+    assert ppo_artifact_path(
+        run_dir, checkpoint_base, "selection_log", suffix=".jsonl"
+    ) == Path("runs/ppo/example_selection_log.jsonl")
+
+
+def test_ppo_checkpoint_path_cli_accepts_dash_and_underscore_spellings():
+    import src.ppo.train as train
+
+    for flag in ("--checkpoint-path", "--checkpoint_path"):
+        parser = argparse.ArgumentParser()
+        train._add_args(parser)
+        args = parser.parse_args([flag, "runs/ppo/example.pt"])
+        assert args.checkpoint_path == "runs/ppo/example.pt"
+
+
 def test_projected_representation_is_a_valid_agent_contract():
     cfg = LatentConfig(
         latent_representation="projected",
@@ -624,6 +656,45 @@ class _FakeImageEnv(gym.Env):
 
     def render(self):
         return self._obs()
+
+
+def test_trainer_saves_to_explicit_checkpoint_base():
+    """An explicit base writes BC-style sibling artifacts without a timestamp."""
+    import src.ppo.ppo as latent_ppo
+    from src.ppo.config import LatentConfig
+
+    def fake_make_latent_env(*, seed=0, idx=0, max_episode_steps=6, **kwargs):
+        def thunk():
+            env = _FakeImageEnv(max_steps=max_episode_steps)
+            env.action_space.seed(seed + idx)
+            return env
+
+        return thunk
+
+    original = latent_ppo.make_latent_env
+    latent_ppo.make_latent_env = fake_make_latent_env
+    try:
+        with TemporaryDirectory() as temporary_dir:
+            checkpoint_base = Path(temporary_dir) / "explicit_ppo.pt"
+            cfg = LatentConfig(
+                device="cpu",
+                bc_checkpoint=None,
+                checkpoint_path=str(checkpoint_base),
+                num_envs=1,
+                num_chunks=1,
+            )
+            trainer = latent_ppo.LatentPPOTrainer(
+                cfg,
+                encoder=DummyImageEncoder(latent_dim=cfg.latent_dim),
+            )
+            saved = trainer.save_checkpoint("final")
+            assert saved == checkpoint_base.with_name("explicit_ppo_final.pt")
+            assert saved.is_file()
+            assert not checkpoint_base.exists()
+            for env in trainer.envs:
+                env.close()
+    finally:
+        latent_ppo.make_latent_env = original
 
 
 def test_trainer_end_to_end_fake_env(monkeypatch=None):
