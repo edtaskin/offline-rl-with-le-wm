@@ -214,6 +214,8 @@ def _push_run_artifacts(cfg: LatentConfig, run_dir: Path) -> None:
         raise ValueError("--push_to_hf requires --hf_repo_id (e.g. your-username/pusht-latent-ppo)")
     candidates = (
         ppo_artifact_path(run_dir, cfg.checkpoint_path, "best"),
+        ppo_artifact_path(run_dir, cfg.checkpoint_path, "second_best"),
+        ppo_artifact_path(run_dir, cfg.checkpoint_path, "best_heldout_real"),
         ppo_artifact_path(run_dir, cfg.checkpoint_path, "final"),
         ppo_artifact_path(
             run_dir,
