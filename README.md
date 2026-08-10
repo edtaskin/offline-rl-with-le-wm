@@ -93,9 +93,11 @@ run started from it is not interaction-free *end to end*. Use `pusht_bc_raw_cls_
 strict claim.
 
 A separate control ([`scripts/campaign/run_legacy_prior_control.sh`](scripts/campaign/run_legacy_prior_control.sh))
-re-runs the real-env arms from the earlier 256-wide prior that produced this project's best number
+re-runs the real-env arms from the earlier 100-epoch prior that produced this project's best number
 (92.0%), to separate "better prior" from "lucky seed". It is still running; seeds 2 and 3 score 85.3
-and 92.7, so the prior looks like a real effect, but three seeds are not yet in.
+and 92.7, so the prior looks like a real effect, but three seeds are not yet in. The two priors share
+one architecture and differ only in training length, so any effect here is about how long the prior
+was fit, not about its capacity.
 
 ## Does the world model tell the truth?
 
@@ -460,9 +462,9 @@ and are referenced from the CLI as `hf://offline-rl-with-le-wm/<repo>/<file>`.
 
 | Artifact | Path | Notes |
 |:---|:---|:---|
-| BC prior (campaign) | `bc/pusht-bc-raw-cls/` | 512-wide raw CLS, 1000 epochs; the prior for every arm in the results table |
-| BC prior (legacy) | `bc/pusht-bc-raw-cls-256-legacy/` | 256-wide, 100 epochs; the prior behind the 92% real-env PPO. Its stats file predates `observation_resolution` — evaluate with `--training-observation-resolution 224` |
-| PPO agents | `ppo/` | `rawcls_bc_best/<arm>/seed<N>/` for the raw-CLS campaign, `lewm-latent/<arm>/seed<N>/` for the projected campaign, `rawcls256_legacy/` for the prior control |
+| BC prior (campaign) | `bc/pusht-bc-raw-cls/` | 256-wide raw CLS, 1000 epochs; the prior for every arm in the results table |
+| BC prior (legacy) | `bc/pusht-bc-raw-cls-256-legacy/` | the same 256-wide architecture at 100 epochs — the two priors differ only in training length; the prior behind the 92% real-env PPO. Its stats file predates `observation_resolution` — evaluate with `--training-observation-resolution 224` |
+| PPO agents | `ppo/` | `rawcls_bc_best/<arm>/seed<N>/` for the campaign, `rawcls256_legacy/` for the prior control |
 | Latent decoder | `decoder_lewm_pusht/` | pixel bridge for imagination |
 | De-projector | `deprojector_lewm_pusht/` | latent-space bridge |
 | Success probe | `probes/is_objective_met_probe_baseline.pt` | declares success and termination in the dream |

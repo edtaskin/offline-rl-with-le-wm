@@ -12,6 +12,10 @@ import numpy as np
 
 from src.envs import PUSHT_FIXED_TARGET_POSE, PUSHT_RENDER_SHAPE
 from src.evaluation.agents import make_bc_evaluation_agent, make_ppo_evaluation_agent
+from src.evaluation.baseline_agents import (
+    make_cnn_bc_evaluation_agent,
+    make_state_bc_evaluation_agent,
+)
 from src.evaluation.pusht import (
     PushTEvalConfig,
     run_evaluation,
@@ -24,7 +28,12 @@ MAX_EPISODE_SEED = np.iinfo(np.int32).max
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Evaluate an agent on the canonical PushT env")
-    parser.add_argument("--agent-type", choices=["bc", "ppo"], required=True)
+    parser.add_argument(
+        "--agent-type",
+        choices=["bc", "ppo", "bc-state", "bc-cnn"],
+        required=True,
+        help="bc/ppo read frozen LeWM latents; bc-state and bc-cnn are the encoder baselines",
+    )
     parser.add_argument(
         "--checkpoint",
         required=True,
@@ -198,7 +207,7 @@ def _write_metrics(result, run_dir):
 
 
 def evaluate_from_args(args):
-    if args.agent_type == "bc" and args.stochastic:
+    if args.agent_type != "ppo" and args.stochastic:
         raise ValueError("BC evaluation is deterministic; --stochastic is only valid for PPO")
     if args.stochastic and args.execution_mode == "temporal-ensemble":
         raise ValueError("temporal ensembling requires deterministic chunk predictions")
@@ -212,6 +221,10 @@ def evaluate_from_args(args):
     }
     if args.agent_type == "bc":
         agent = make_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
+    elif args.agent_type == "bc-state":
+        agent = make_state_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
+    elif args.agent_type == "bc-cnn":
+        agent = make_cnn_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
     else:
         agent = make_ppo_evaluation_agent(
             deterministic=not args.stochastic,

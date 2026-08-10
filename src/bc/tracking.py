@@ -36,9 +36,9 @@ def sidecar_path(checkpoint_path, suffix):
     return f"{checkpoint_path}{suffix}"
 
 
-def write_run_config(args, dataset_stats=None, extra=None):
+def write_run_config(args, dataset_stats=None, extra=None, script="src/bc/train_bc_latent.py"):
     payload = {
-        "script": "src/bc/train_bc_latent.py",
+        "script": script,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "args": args_for_config(args),
     }
