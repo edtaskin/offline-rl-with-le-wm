@@ -12,7 +12,7 @@ from src.utils.hf_hub import resolve_artifact
 
 
 class DenseRewardClassifier(nn.Module):
-    """Architecture saved by scripts/probes/train_dense_reward_pusht.py."""
+    """Architecture saved by scripts/probes/train_dense_reward.py."""
 
     def __init__(
         self,
@@ -61,7 +61,7 @@ class DenseRewardStats:
 class DenseRewardShaper(nn.Module):
     """Map projected LeWM dynamics latents to a frozen classifier potential.
 
-    The classifier checkpoints from ``scripts/probes/train_dense_reward_pusht.py``
+    The classifier checkpoints from ``scripts/probes/train_dense_reward.py``
     are trained on ``wm.encode(...)[\"emb\"][:, 0]`` and imagined
     ``wm.predict(...)[:, -1]`` latents. Do not feed raw CLS policy latents here.
     """

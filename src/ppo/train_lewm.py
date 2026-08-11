@@ -169,7 +169,7 @@ class DreamConfig(LatentConfig):
     success_pos_tol: float = 20.0
     success_angle_tol: float = float(np.pi / 9)
 
-    # Learned dense reward from scripts/probes/train_dense_reward_pusht.py.
+    # Learned dense reward from scripts/probes/train_dense_reward.py.
     # Active when reward_mode == "dense". The classifier is evaluated on
     # projected LeWM dynamics latents, not raw CLS policy latents.
     # Learned sparse reward / success classifier. This is separate from
@@ -254,14 +254,14 @@ class DreamConfig(LatentConfig):
 class _StateProbe(nn.Module):
     """Frozen MLP probe: projected LeWM latent ``[B, 192]`` -> state feature.
 
-    Handles both payload flavors saved by ``train_probes_pusht.py``: regression
+    Handles both payload flavors saved by ``scripts/probes/train_state.py``: regression
     probes (de-standardized with ``y_mean``/``y_std``) and binary classifiers
     (sigmoid probability plus the F1-selected decision ``threshold``).
     """
 
     def __init__(self, payload: dict):
         super().__init__()
-        from scripts.probes.train_probes_pusht import ProbeMLP
+        from scripts.probes.train_state import ProbeMLP
 
         model = ProbeMLP(
             payload["input_dim"],
@@ -391,10 +391,10 @@ def _load_decoder(path: Path, device: torch.device) -> nn.Module:
     if not path.exists():
         raise FileNotFoundError(
             f"Missing decoder checkpoint: {path}. Train one with "
-            "scripts/decoder/train_decoder_pusht.py or download it from "
+            "scripts/decoder/train.py or download it from "
             "hf.co/offline-rl-with-le-wm/decoder_lewm_pusht."
         )
-    from scripts.decoder.train_decoder_pusht import LatentImageDecoder
+    from scripts.decoder.train import LatentImageDecoder
 
     payload = torch.load(path, map_location="cpu", weights_only=False)
     decoder = LatentImageDecoder(**payload["config"])
@@ -516,7 +516,7 @@ class LeWMDreamWorld:
             raise FileNotFoundError(
                 f"No usable probe under {probe_dir}: need objective_met (success/"
                 "sparse reward) and/or block_rel_objective (pose-distance reward). "
-                "Train them with scripts/probes/train_probes_pusht.py or download "
+                "Train them with scripts/probes/train_state.py or download "
                 "from hf.co/offline-rl-with-le-wm/probes."
             )
         if cfg.reward_mode == "pose_dense" and self.pose_probe is None:
