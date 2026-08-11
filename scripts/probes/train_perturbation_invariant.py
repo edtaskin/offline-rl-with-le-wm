@@ -6,7 +6,7 @@ Each training sample is encoded twice:
 
 The probe predicts the same physical target from both latents and is penalized
 when the two predictions disagree. LeWM stays frozen. The saved checkpoints use
-the same format as ``train_probes_pusht.py`` MLP probes, so rollout evaluators
+the same format as ``scripts/probes/train_state.py`` MLP probes, so rollout evaluators
 can load them with ``--probe-kind mlp``.
 """
 
@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.probes.train_probes_pusht import (  # noqa: E402
+from scripts.probes.train_state import (  # noqa: E402
     ANGLE_FEATURES,
     CLASSIFICATION_FEATURES,
     FEATURES,
@@ -868,7 +868,7 @@ def main() -> None:
         model_for_clean = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=cache_dir)
         clean_data = {}
         # Reuse the normal cache format so this can also seed regular probe training.
-        from scripts.probes.train_probes_pusht import encode_rows
+        from scripts.probes.train_state import encode_rows
 
         clean_data = encode_rows(
             model=model_for_clean,

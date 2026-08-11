@@ -31,8 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.probes import probe_rollouts_pusht as probe_eval  # noqa: E402
-from scripts.probes.train_invariant_probes_pusht import (  # noqa: E402
+from scripts.rollouts import state_probes as probe_eval  # noqa: E402
+from scripts.probes.train_perturbation_invariant import (  # noqa: E402
     DEFAULT_PERTURBATIONS,
     PERTURBATION_CHOICES,
     apply_perturbation,

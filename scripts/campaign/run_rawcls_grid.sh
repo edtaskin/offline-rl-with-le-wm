@@ -24,7 +24,7 @@
 # is reward_mode=pose_dense, which needs the block_rel_objective regression probe
 # under models/probes/pusht_lewm/. That probe is not published alongside the
 # objective_met classifier, so the matched dense pair cannot be run yet -- train
-# it with scripts/probes/train_probes_pusht.py to unlock a --only dream_pose arm.
+# it with scripts/probes/train_state.py to unlock a --only dream_pose arm.
 # Read the dense column as two different shaping schemes, not as one comparison.
 #
 # Selection: best.pt comes from real held-out success for the real arms and from

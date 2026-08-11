@@ -8,7 +8,7 @@ frame it was supposed to be, and the two are drawn side by side.
 
 This is the policy-driven counterpart to the existing fidelity tools, which all
 drive LeWM with ground-truth expert actions:
-``scripts/decoder/decode_rollouts_pusht.py`` (decoded rollouts against dataset
+``scripts/decoder/gt_rollout_video.py`` (decoded rollouts against dataset
 frames), ``scripts/deprojector/bridge_horizon.py`` (latent drift per bridge) and
 ``scripts/rq2/probe_horizon.py`` (probe reliability). Here the actions are the
 ones the agent would actually take, so what shows up is the drift the agent

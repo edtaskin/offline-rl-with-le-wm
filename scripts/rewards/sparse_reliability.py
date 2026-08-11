@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.probes import probe_rollouts_pusht as rollout_eval  # noqa: E402
+from scripts.rollouts import state_probes as rollout_eval  # noqa: E402
 
 
 def repo_path(path: str | Path) -> Path:

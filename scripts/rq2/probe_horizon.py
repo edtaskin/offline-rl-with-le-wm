@@ -10,7 +10,7 @@ actually uses:
 
 1. It resolves the ``objective_met`` classifier the *same way*
    :class:`src.ppo.train_lewm.LeWMDreamWorld` does, and pins
-   ``scripts/probes/probe_rollouts_pusht.py`` to that exact file. A curve about a
+   ``scripts/rollouts/state_probes.py`` to that exact file. A curve about a
    different probe than the one PPO optimized against would prove nothing.
 2. It rolls LeWM forward from ground-truth context with ground-truth expert
    actions -- so the reference state is known at every step -- and reads the
@@ -110,7 +110,7 @@ def run_probe_rollouts(args, classifier: Path, output_dir: Path) -> None:
     argv = [
         sys.executable,
         "-m",
-        "scripts.probes.probe_rollouts_pusht",
+        "scripts.rollouts.state_probes",
         "--probe-dir", str(args.probe_dir),
         "--classifier-checkpoint", str(classifier),
         "--dataset-path", args.dataset_path,

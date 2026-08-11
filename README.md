@@ -233,7 +233,11 @@ src/ppo/               real-environment and imagined PPO
 src/evaluation/        shared PushT evaluation protocol
 src/envs/              PushT environment wrappers
 scripts/campaign/      multi-arm and multi-seed launchers
-scripts/probes/        latent reward and success probes
+scripts/probes/        state, sparse-reward, dense-reward, invariant, and noisy-action probe training
+scripts/rewards/       sparse and dense reward classifier rollout reliability analyses
+scripts/rollouts/      state-probe, noisy-action, and perturbation rollout analyses
+scripts/decoder/       latent image decoder training and decoded rollout videos
+scripts/data/          auxiliary dataset generation scripts
 scripts/deprojector/   bridge training and diagnostics
 scripts/rq1/, rq2/     experiment analysis utilities
 scripts/ablations/     representation and robustness studies

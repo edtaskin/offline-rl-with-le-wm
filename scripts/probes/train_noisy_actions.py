@@ -1,9 +1,9 @@
 """Train PushT probes on noisy-action simulator states encoded by LeWM.
 
 If the noisy-action dataset is missing, this script first calls
-``generate_noisy_action_dataset_pusht.py`` with matching dataset-generation
+``scripts/data/noisy_actions_dataset.py`` with matching dataset-generation
 arguments. It then encodes the rendered WM-step frames with LeWM and trains the
-same linear/MLP probe formats used by ``train_probes_pusht.py``.
+same linear/MLP probe formats used by ``scripts/probes/train_state.py``.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.probes.train_probes_pusht import (  # noqa: E402
+from scripts.probes.train_state import (  # noqa: E402
     IMAGENET_MEAN,
     IMAGENET_STD,
     SplitConfig,
@@ -120,7 +120,7 @@ def generate_dataset_if_needed(args: argparse.Namespace, dataset_path: Path) -> 
         return
     cmd = [
         sys.executable,
-        str(REPO_ROOT / "scripts/probes/generate_noisy_action_dataset_pusht.py"),
+        str(REPO_ROOT / "scripts/data/noisy_actions_dataset.py"),
         "--expert-dataset",
         str(repo_path(args.expert_dataset)),
         "--output",

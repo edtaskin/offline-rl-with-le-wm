@@ -1,6 +1,6 @@
 """Visualize PushT LeWM rollouts under noisy expert actions.
 
-This extends ``decode_rollouts_pusht.py`` from pure expert futures to a
+This extends ``scripts/decoder/gt_rollout_video.py`` from pure expert futures to a
 counterfactual rollout: initialize from expert context frames, add noise to the
 future expert actions, step the real PushT simulator from the recorded state,
 and compare those simulated frames against decoded LeWM imagination driven by
@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.decoder.decode_rollouts_pusht import (
+from scripts.decoder.gt_rollout_video import (
     MetricAccumulator,
     action_stats,
     decode_embeddings,
@@ -49,7 +49,7 @@ from scripts.decoder.decode_rollouts_pusht import (
     save_metrics_csv,
     tensor_image_to_uint8,
 )
-from scripts.probes import probe_rollouts_pusht as probe_eval
+from scripts.rollouts import state_probes as probe_eval
 from src.envs import PUSHT_FIXED_TARGET_POSE, make_pusht_env
 
 

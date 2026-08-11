@@ -22,12 +22,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.decoder.decode_noisy_action_rollouts_pusht import (  # noqa: E402
+from scripts.rollouts.noisy_actions import (  # noqa: E402
     build_noisy_action_blocks,
     load_context_future_state,
     rollout_simulator,
 )
-from scripts.decoder.decode_rollouts_pusht import sample_starts  # noqa: E402
+from scripts.decoder.gt_rollout_video import sample_starts  # noqa: E402
 from src.envs import make_pusht_env  # noqa: E402
 
 

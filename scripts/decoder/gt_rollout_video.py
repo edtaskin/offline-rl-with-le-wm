@@ -1,6 +1,6 @@
 """Visualize PushT LeWM imagined rollouts with a trained latent image decoder.
 
-This is the image-space companion to rollout_probe_pusht.py. It initializes LeWM
+This is the image-space companion to scripts/rollouts/state_probes.py. It initializes LeWM
 from ground-truth context frames, rolls forward with ground-truth action blocks,
 decodes each imagined latent to an RGB frame, and saves:
 
@@ -37,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.decoder.train_decoder_pusht import LatentImageDecoder
+from scripts.decoder.train import LatentImageDecoder
 
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
@@ -211,7 +211,7 @@ def encode_future_embeddings(
 def load_decoder(path: Path, device: torch.device) -> nn.Module:
     if not path.exists():
         raise FileNotFoundError(
-            f"Missing decoder checkpoint: {path}. Train one with scripts/decoder/train_decoder_pusht.py first."
+            f"Missing decoder checkpoint: {path}. Train one with scripts/decoder/train.py first."
         )
     payload = torch.load(path, map_location="cpu", weights_only=False)
     config = payload["config"]

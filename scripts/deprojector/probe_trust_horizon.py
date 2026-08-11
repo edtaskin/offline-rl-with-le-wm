@@ -18,7 +18,7 @@ distinction that decides whether a shorter horizon actually helps.
 
 This is the subset of ``scripts/rq2/probe_horizon.py``'s measurement that needs
 only the published classifier: that script additionally drives
-``scripts/probes/probe_rollouts_pusht.py``, which requires the unpublished
+``scripts/rollouts/state_probes.py``, which requires the unpublished
 ``block_rel_*`` regression probes and does not accept the
 ``--classifier-checkpoint`` flag it is passed.
 
