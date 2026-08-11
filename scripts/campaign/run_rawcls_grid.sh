@@ -31,6 +31,15 @@
 # started here is not interaction-free end to end; RQ1 runs should use
 # pusht_bc_raw_cls_final.pth instead.
 #
+# --interaction-free drops the dream arms' diagnostic real-env eval, so dream
+# training consumes zero env steps (selection_log.jsonl records real_success=null
+# and env_steps_consumed=0 to prove it). Without it the dream arms still pick
+# best.pt from imagined success, but spend EVAL_EPISODES real episodes every 10
+# iterations to log the imagined-vs-real correlation -- charged to the budget.
+# The real arms are real-env by definition and the flag does not touch them, nor
+# the post-training canonical evaluation, which measures a finished checkpoint
+# rather than feeding anything back into training.
+#
 # Publishing: each run pushes best.pt, final.pt and (dream) selection_log.jsonl
 # under rawcls_bc_best/<arm>/seed<N>/ in the Hub repo. Destinations are checked
 # for collisions before any training starts, so nothing existing is overwritten.
@@ -45,6 +54,7 @@
 #   bash scripts/campaign/run_rawcls_grid.sh --seeds "1"          # one seed
 #   bash scripts/campaign/run_rawcls_grid.sh --only dream_sparse
 #   bash scripts/campaign/run_rawcls_grid.sh --only "real_sparse real_dense"
+#   bash scripts/campaign/run_rawcls_grid.sh --only dream_dense --interaction-free
 #   bash scripts/campaign/run_rawcls_grid.sh --dry-run            # print commands only
 #
 # --exp-prefix names the run dirs, the W&B runs and (by default) the Hub folder, so
@@ -60,6 +70,7 @@ ONLY="all"
 DRY_RUN=0
 NO_PUSH=0
 NO_EVAL=0
+INTERACTION_FREE=0
 TOTAL_TIMESTEPS=1000000
 DREAM_EPISODE_STEPS=20
 DREAM_EVAL_STEPS=20          # pinned, so the selection metric stays comparable
@@ -91,8 +102,9 @@ while [[ $# -gt 0 ]]; do
     --bc-stats) BC_STATS="$2"; shift 2 ;;
     --no-push) NO_PUSH=1; shift ;;
     --no-eval) NO_EVAL=1; shift ;;
+    --interaction-free) INTERACTION_FREE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -106,6 +118,13 @@ HF_NAMESPACE="${HF_NAMESPACE:-${EXP_PREFIX}_bc_best}"
 
 ARMS="real_sparse real_dense dream_sparse dream_dense"
 if [[ "$ONLY" != "all" ]]; then ARMS="$ONLY"; fi
+
+if [[ "$INTERACTION_FREE" -eq 1 ]]; then
+  echo "== interaction-free: dream training consumes zero env steps (no diagnostic real eval)"
+  if [[ "$ARMS" == *real_* ]]; then
+    echo "   note: real_* arms train in the simulator by definition and are unaffected"
+  fi
+fi
 
 # ---- preflight: the LeWM encoder is not downloaded on demand -----------------
 if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -206,6 +225,14 @@ for seed in $SEEDS; do
         if [[ -n "$DECODER_CHECKPOINT" ]]; then
           decoder_arg=(--decoder_checkpoint "$DECODER_CHECKPOINT")
         fi
+        # Diagnostic real-env eval: correlates imagined against real success at
+        # the same checkpoint, but costs env steps. --interaction-free trades the
+        # correlation away for a training run that never calls env.step; best.pt
+        # comes from imagined success either way.
+        real_eval_arg=(--record_real_eval --eval_interval 10 --eval_episodes "$EVAL_EPISODES")
+        if [[ "$INTERACTION_FREE" -eq 1 ]]; then
+          real_eval_arg=(--no-record_real_eval --eval_interval 0)
+        fi
         run python -m src.ppo.train_lewm \
           --exp_name "$exp" --seed "$seed" \
           --bridge "$BRIDGE" \
@@ -213,7 +240,7 @@ for seed in $SEEDS; do
           --dream_episode_steps "$DREAM_EPISODE_STEPS" \
           --dream_eval_steps "$DREAM_EVAL_STEPS" \
           --selection dream --dream_eval_interval 10 --dream_eval_episodes 96 \
-          --record_real_eval --eval_interval 10 --eval_episodes "$EVAL_EPISODES" \
+          "${real_eval_arg[@]}" \
           ${decoder_arg[@]+"${decoder_arg[@]}"} \
           "${COMMON[@]}" ${push[@]+"${push[@]}"}
         ;;

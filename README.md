@@ -170,6 +170,8 @@ For a raw-CLS policy, `--bridge` may be `decoder` or `deprojector`. A projected 
 the predictor output directly and does not use either bridge.
 
 Multi-arm and multi-seed launchers are available under [`scripts/campaign/`](scripts/campaign/).
+Their `--interaction-free` flag drops the dream arms' diagnostic real-environment evaluation, so
+dream training consumes zero environment steps; `best.pt` still comes from imagined success.
 
 ## Evaluate a checkpoint
 
