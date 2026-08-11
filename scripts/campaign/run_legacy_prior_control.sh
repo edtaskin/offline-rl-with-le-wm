@@ -5,7 +5,7 @@
 # `hf://offline-rl-with-le-wm/ppo/agent_real_env.pt` scored 0.920 on the canonical
 # protocol, trained from the legacy 256-wide raw-CLS BC. The rawcls campaign,
 # identical in every hyperparameter but starting from
-# bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best.pth, scores 0.833 and 0.720 at seeds
+# bc/rawcls-bc/seed42/pusht_raw_cls_bc_best.pth, scores 0.833 and 0.720 at seeds
 # 1 and 2. Two readings: the new prior is worse, or 0.920 was one lucky seed of a
 # noisy pipeline. Nothing distinguishes them, because the old number is n=1 from a
 # lineage whose bc_checkpoint reference has since been overwritten on the Hub.
@@ -41,7 +41,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-LEGACY_DIR="hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls-256-legacy"
+LEGACY_DIR="hf://offline-rl-with-le-wm/bc/rawcls-bc/seed42"
 
 # --only defaults to the two real arms rather than the grid's four: the dream arms
 # would answer a different question and cost another 3 hours.
@@ -56,7 +56,7 @@ fi
 
 exec bash scripts/campaign/run_rawcls_grid.sh \
   --exp-prefix legacy \
-  --bc-checkpoint "${LEGACY_DIR}/pusht_latent_bc.pth" \
-  --bc-stats "${LEGACY_DIR}/pusht_latent_bc_stats.pth" \
+  --bc-checkpoint "${LEGACY_DIR}/pusht_raw_cls_bc_best.pth" \
+  --bc-stats "${LEGACY_DIR}/pusht_raw_cls_bc_best_stats.pth" \
   ${ONLY_ARGS[@]+"${ONLY_ARGS[@]}"} \
   "$@"

@@ -16,6 +16,8 @@
 #   real_dense     real env,  block-pose distance shaping
 #   dream_sparse   LeWM,      1.0 on probe-declared success
 #   dream_dense    LeWM,      sparse + learned time-to-success classifier
+#   dream_success_potential
+#                  LeWM,      objective_met probability potential shaping
 #
 # REWARD AXIS IS NOT SYMMETRIC. "dense" means block-pose shaping in the real env
 # and the learned classifier in the dream; the dream's counterpart to real_dense
@@ -31,7 +33,8 @@
 # started here is not interaction-free end to end; RQ1 runs should use
 # pusht_bc_raw_cls_final.pth instead.
 #
-# Publishing: each run pushes best.pt, final.pt and (dream) selection_log.jsonl
+# Publishing: each run pushes available selection checkpoints (best.pt,
+# second_best.pt, best_heldout_real.pt), final.pt and (dream) selection_log.jsonl
 # under rawcls_bc_best/<arm>/seed<N>/ in the Hub repo. Destinations are checked
 # for collisions before any training starts, so nothing existing is overwritten.
 #
@@ -73,6 +76,17 @@ BC_CKPT="hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best.pt
 BC_STATS="hf://offline-rl-with-le-wm/bc/pusht-bc-raw-cls/pusht_bc_raw_cls_best_stats.pth"
 BRIDGE="deprojector"
 DECODER_CHECKPOINT=""      # empty -> DreamConfig default (repo-local path)
+SPARSE_REWARD_CHECKPOINT="hf://offline-rl-with-le-wm/sparse_reward_classifier"
+DENSE_REWARD_CHECKPOINT="hf://offline-rl-with-le-wm/dense_reward_classifier/dense_reward_classifier.pt"
+DENSE_REWARD_COEF="0.05"
+DENSE_REWARD_CLIP="0.5"
+DENSE_REWARD_WEIGHTS="1 0.75 0.4 0.1"
+BC_PENALTY_COEF="0.05"
+SUCCESS_POTENTIAL_COEF="1.0"
+SUCCESS_POTENTIAL_CLIP="1.0"
+SUCCESS_POTENTIAL_POSITIVE_ONLY=0
+ANNEAL_LR_ARG=()
+EVAL_VARIANTS=(best second_best best_heldout_real final)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -83,6 +97,17 @@ while [[ $# -gt 0 ]]; do
     --dream-eval-steps) DREAM_EVAL_STEPS="$2"; shift 2 ;;
     --bridge) BRIDGE="$2"; shift 2 ;;
     --decoder-checkpoint) DECODER_CHECKPOINT="$2"; shift 2 ;;
+    --sparse-reward-checkpoint) SPARSE_REWARD_CHECKPOINT="$2"; shift 2 ;;
+    --dense-reward-checkpoint) DENSE_REWARD_CHECKPOINT="$2"; shift 2 ;;
+    --dense-reward-coef) DENSE_REWARD_COEF="$2"; shift 2 ;;
+    --dense-reward-clip) DENSE_REWARD_CLIP="$2"; shift 2 ;;
+    --dense-reward-weights) DENSE_REWARD_WEIGHTS="$2"; shift 2 ;;
+    --bc-penalty-coef) BC_PENALTY_COEF="$2"; shift 2 ;;
+    --success-potential-coef) SUCCESS_POTENTIAL_COEF="$2"; shift 2 ;;
+    --success-potential-clip) SUCCESS_POTENTIAL_CLIP="$2"; shift 2 ;;
+    --success-potential-positive-only) SUCCESS_POTENTIAL_POSITIVE_ONLY=1; shift ;;
+    --anneal-lr|--anneal_lr) ANNEAL_LR_ARG=(--anneal_lr); shift ;;
+    --no-anneal-lr|--no-anneal_lr) ANNEAL_LR_ARG=(--no-anneal_lr); shift ;;
     --hf-repo) HF_REPO="$2"; shift 2 ;;
     --hf-namespace) HF_NAMESPACE="$2"; shift 2 ;;
     --exp-prefix) EXP_PREFIX="$2"; shift 2 ;;
@@ -135,11 +160,10 @@ dataset = repo_path(cfg.dataset_path)
 if not dataset.is_file():
     missing.append(f"expert dataset {dataset} (~46 GB; copy it or re-export it)")
 probe_dir = repo_path(cfg.probe_dir)
-if not any((probe_dir / name).is_file() for name in
-           ("objective_met/mlp_probe.pt", "is_objective_met_probe_baseline.pt")):
+if not cfg.sparse_reward_checkpoint.startswith("hf://") and not Path(cfg.sparse_reward_checkpoint).is_file():
     missing.append(
-        f"objective_met classifier under {probe_dir} "
-        "(hf.co/offline-rl-with-le-wm/probes/is_objective_met_probe_baseline.pt)"
+        f"sparse reward classifier {cfg.sparse_reward_checkpoint} "
+        "(or pass --sparse-reward-checkpoint hf://.../objective_met/mlp_probe.pt)"
     )
 for item in missing:
     print(f"missing: {item}", file=sys.stderr)
@@ -175,6 +199,7 @@ COMMON=(
   --observation-resolution 224
   --snapshot_interval 10
   --track --wandb_project "$WANDB_PROJECT"
+  ${ANNEAL_LR_ARG[@]+"${ANNEAL_LR_ARG[@]}"}
 )
 
 for seed in $SEEDS; do
@@ -200,21 +225,45 @@ for seed in $SEEDS; do
           --eval_interval 10 --eval_episodes "$EVAL_EPISODES" \
           "${COMMON[@]}" ${push[@]+"${push[@]}"}
         ;;
-      dream_sparse|dream_dense)
+      dream_sparse|dream_dense|dream_success_potential)
         reward="${arm#dream_}"
         decoder_arg=()
         if [[ -n "$DECODER_CHECKPOINT" ]]; then
           decoder_arg=(--decoder_checkpoint "$DECODER_CHECKPOINT")
         fi
+        dense_arg=()
+        if [[ "$reward" == "dense" ]]; then
+          dense_arg=(
+            --dense_reward_checkpoint "$DENSE_REWARD_CHECKPOINT"
+            --dense_reward_coef "$DENSE_REWARD_COEF"
+            --dense_reward_clip "$DENSE_REWARD_CLIP"
+            --dense_reward_weights "$DENSE_REWARD_WEIGHTS"
+            --dense_reward_mode potential
+          )
+        fi
+        success_potential_arg=()
+        if [[ "$reward" == "success_potential" ]]; then
+          success_potential_arg=(
+            --success_potential_coef "$SUCCESS_POTENTIAL_COEF"
+            --success_potential_clip "$SUCCESS_POTENTIAL_CLIP"
+          )
+          if [[ "$SUCCESS_POTENTIAL_POSITIVE_ONLY" -eq 1 ]]; then
+            success_potential_arg+=(--success_potential_positive_only)
+          fi
+        fi
         run python -m src.ppo.train_lewm \
           --exp_name "$exp" --seed "$seed" \
           --bridge "$BRIDGE" \
           --reward_mode "$reward" \
+          --sparse_reward_checkpoint "$SPARSE_REWARD_CHECKPOINT" \
+          --bc_penalty --bc_penalty_coef "$BC_PENALTY_COEF" \
           --dream_episode_steps "$DREAM_EPISODE_STEPS" \
           --dream_eval_steps "$DREAM_EVAL_STEPS" \
           --selection dream --dream_eval_interval 10 --dream_eval_episodes 96 \
           --record_real_eval --eval_interval 10 --eval_episodes "$EVAL_EPISODES" \
           ${decoder_arg[@]+"${decoder_arg[@]}"} \
+          ${dense_arg[@]+"${dense_arg[@]}"} \
+          ${success_potential_arg[@]+"${success_potential_arg[@]}"} \
           "${COMMON[@]}" ${push[@]+"${push[@]}"}
         ;;
       *) echo "unknown arm: $arm" >&2; exit 2 ;;
@@ -223,11 +272,11 @@ for seed in $SEEDS; do
     # ---- evaluation: same protocol for every arm, both checkpoints ----------
     if [[ "$NO_EVAL" -eq 1 ]]; then continue; fi
     if [[ "$DRY_RUN" -eq 1 ]]; then
-      echo "+ (eval) ${exp}__seed${seed} best/final"
+      echo "+ (eval) ${exp}__seed${seed} ${EVAL_VARIANTS[*]}"
       continue
     fi
     run_dir="$(ls -d runs/${exp}__seed${seed}/*/ | tail -1)"
-    for variant in best final; do
+    for variant in "${EVAL_VARIANTS[@]}"; do
       [[ -f "${run_dir}${variant}.pt" ]] || continue
       run env SDL_VIDEODRIVER=dummy python -m src.evaluation.evaluate_pusht \
         --agent-type ppo \
