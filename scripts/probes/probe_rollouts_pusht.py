@@ -189,6 +189,7 @@ class BinaryClassifierProbe:
 def load_probes(
     probe_dir: Path,
     probe_kind: str,
+    require_classifiers: bool = True,
 ) -> tuple[dict[str, LinearProbe | MLPProbe], dict[str, BinaryClassifierProbe]]:
     probes = {}
     for feature in REGRESSION_FEATURES:
@@ -201,7 +202,9 @@ def load_probes(
     for feature in CLASSIFICATION_FEATURES:
         path = probe_dir / feature / f"{probe_kind}_probe.pt"
         if not path.exists():
-            raise FileNotFoundError(f"Missing {probe_kind} classifier probe: {path}")
+            if require_classifiers:
+                raise FileNotFoundError(f"Missing {probe_kind} classifier probe: {path}")
+            continue
         classifiers[feature] = BinaryClassifierProbe(path)
     return probes, classifiers
 

@@ -58,6 +58,33 @@ def repo_path(path: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
+AXIS_COLOR = "0.35"
+TITLE_COLOR = "0.22"
+SPINE_COLOR = "0.65"
+GRID_COLOR = "0.86"
+
+
+def style_axis(
+    ax: plt.Axes,
+    *,
+    title: str | None = None,
+    xlabel: str | None = None,
+    ylabel: str | None = None,
+) -> None:
+    if title is not None:
+        ax.set_title(title, color=TITLE_COLOR, fontsize=12, fontweight="semibold", pad=10)
+    if xlabel is not None:
+        ax.set_xlabel(xlabel, color=AXIS_COLOR, labelpad=6)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel, color=AXIS_COLOR, labelpad=6)
+    ax.tick_params(axis="both", colors=AXIS_COLOR, labelsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_color(SPINE_COLOR)
+    ax.spines["left"].set_color(SPINE_COLOR)
+    ax.grid(True, alpha=0.45, color=GRID_COLOR)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -115,6 +142,11 @@ def parse_args() -> argparse.Namespace:
         "--no-normalize-actions",
         action="store_true",
         help="Disable dataset z-score normalization before feeding noisy action blocks to LeWM.",
+    )
+    parser.add_argument(
+        "--plot-existing",
+        action="store_true",
+        help="For evaluate_rollouts, regenerate plots from noisy_probe_rollout_metrics.csv without rerunning LeWM.",
     )
     return parser.parse_args()
 
@@ -468,6 +500,50 @@ def save_noisy_probe_csv(
                         )
 
 
+def read_noisy_probe_csv(path: Path) -> tuple[np.ndarray, dict[float, dict[str, dict[str, np.ndarray]]]]:
+    values: dict[float, dict[str, dict[str, dict[int, float]]]] = {}
+    env_by_step: dict[int, int] = {}
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            if "noise_std" in row:
+                noise_std = float(row["noise_std"])
+            else:
+                condition = str(row["action_condition"])
+                if condition.startswith("std_"):
+                    noise_std = float(condition.removeprefix("std_").replace("p", "."))
+                else:
+                    continue
+            source = str(row["source"])
+            metric = str(row["metric"])
+            model_step = int(row["model_step"])
+            env_by_step[model_step] = int(float(row["env_step"]))
+            values.setdefault(noise_std, {}).setdefault(source, {}).setdefault(metric, {})[model_step] = float(row["value"])
+
+    steps = sorted(env_by_step)
+    env_steps = np.asarray([env_by_step[step] for step in steps], dtype=np.int64)
+    results: dict[float, dict[str, dict[str, np.ndarray]]] = {}
+    for noise_std, groups in values.items():
+        results[noise_std] = {}
+        for source, metric_values in groups.items():
+            results[noise_std][source] = {
+                metric: np.asarray([by_step.get(step, np.nan) for step in steps], dtype=np.float32)
+                for metric, by_step in metric_values.items()
+            }
+        results[noise_std].setdefault("imagined", {})
+        results[noise_std].setdefault("encoded_gt", {})
+    return env_steps, results
+
+
+def plot_existing_noisy_outputs(output_dir: Path) -> None:
+    csv_path = output_dir / "noisy_probe_rollout_metrics.csv"
+    if not csv_path.exists():
+        print(f"skipped noisy-action plots, missing {csv_path}")
+        return
+    env_steps, results = read_noisy_probe_csv(csv_path)
+    save_noisy_probe_plots(output_dir, env_steps, results)
+    print(f"regenerated noisy-action plots from {csv_path}")
+
+
 def plot_noise_metric(
     path: Path,
     env_steps: np.ndarray,
@@ -492,13 +568,17 @@ def plot_noise_metric(
                 alpha=0.75,
                 label=f"encoded sim std={noise_std:g}",
             )
-    ax.set_title(title)
-    ax.set_xlabel("Environment steps after context")
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.25)
+    style_axis(
+        ax,
+        title=title,
+        xlabel="rollout horizon (environment steps)",
+        ylabel=ylabel,
+    )
     if ylim is not None:
         ax.set_ylim(*ylim)
-    ax.legend(fontsize=8)
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(handles, labels, fontsize=8, frameon=False)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -510,20 +590,35 @@ def save_noisy_probe_plots(
     results: dict[float, dict[str, dict[str, np.ndarray]]],
 ) -> None:
     specs = [
-        ("agent_pos_rmse_px", "Agent Position RMSE by Noise", "RMSE (px)", None),
-        ("block_pos_rmse_px", "Block Position RMSE by Noise", "RMSE (px)", None),
-        ("block_angle_rmse_deg", "Block Angle RMSE by Noise", "RMSE (deg)", None),
-        ("block_rel_objective_xy_rmse_px", "T Relative to Objective XY RMSE by Noise", "RMSE (px)", None),
-        ("block_rel_objective_angle_rmse_deg", "T Relative to Objective Angle RMSE by Noise", "RMSE (deg)", None),
-        ("block_rel_agent_xy_rmse_px", "T Relative to Agent XY RMSE by Noise", "RMSE (px)", None),
-        ("block_rel_agent_angle_rmse_deg", "T Relative to Agent Angle RMSE by Noise", "RMSE (deg)", None),
-        ("objective_met_mean_probability", "Mean P(Objective Met) by Noise", "Probability", None),
-        ("objective_met_false_positive_rate", "Objective-Met FPR by Noise", "Rate", (0.0, 1.05)),
-        ("objective_met_recall", "Objective-Met Recall by Noise", "Rate", (0.0, 1.05)),
-        ("objective_met_precision", "Objective-Met Precision by Noise", "Rate", (0.0, 1.05)),
-        ("objective_met_positive_count", "Objective-Met Support by Noise", "Count", None),
-        ("latent_rmse", "Imagined vs Encoded Sim Latent RMSE by Noise", "Latent RMSE", None),
-        ("latent_cosine", "Imagined vs Encoded Sim Latent Cosine by Noise", "Mean cosine", (-1.0, 1.0)),
+        ("agent_pos_rmse_px", "How noisy actions affect agent-state recovery", "agent position error (px)", None),
+        ("block_pos_rmse_px", "How noisy actions affect block-state recovery", "block position error (px)", None),
+        ("block_angle_rmse_deg", "How noisy actions affect block orientation", "block angle error (degrees)", None),
+        ("block_rel_objective_xy_rmse_px", "How noisy actions affect T-to-goal geometry", "T-to-goal position error (px)", None),
+        (
+            "block_rel_objective_angle_rmse_deg",
+            "How noisy actions affect T-to-goal orientation",
+            "T-to-goal angle error (degrees)",
+            None,
+        ),
+        ("block_rel_agent_xy_rmse_px", "How noisy actions affect T-to-agent geometry", "T-to-agent position error (px)", None),
+        (
+            "block_rel_agent_angle_rmse_deg",
+            "How noisy actions affect T-to-agent orientation",
+            "T-to-agent angle error (degrees)",
+            None,
+        ),
+        ("objective_met_mean_probability", "Sparse success probability under noisy actions", "mean success probability", None),
+        ("objective_met_false_positive_rate", "False positives under noisy actions", "false-positive rate", (0.0, 1.05)),
+        ("objective_met_recall", "Recall under noisy actions", "recall", (0.0, 1.05)),
+        ("objective_met_precision", "Precision under noisy actions", "precision", (0.0, 1.05)),
+        ("objective_met_positive_count", "Success samples under noisy actions", "number of success states", None),
+        ("latent_rmse", "How far noisy-action imagination drifts from simulation", "latent RMSE to encoded simulated future", None),
+        (
+            "latent_cosine",
+            "How similar are noisy-action rollouts to simulated futures?",
+            "cosine similarity to encoded simulated future",
+            (0.0, 1.0),
+        ),
     ]
     for metric, title, ylabel, ylim in specs:
         plot_noise_metric(
@@ -536,6 +631,67 @@ def save_noisy_probe_plots(
             include_encoded_gt=not metric.startswith("latent_"),
             ylim=ylim,
         )
+        if metric == "latent_cosine":
+            plot_noise_metric(
+                output_dir / f"{metric}_by_noise_yaxis05.png",
+                env_steps,
+                results,
+                metric,
+                title,
+                ylabel,
+                include_encoded_gt=False,
+                ylim=(0.5, 1.0),
+            )
+    plot_noisy_normalized_degradation(output_dir, env_steps, results)
+
+
+def plot_noisy_normalized_degradation(
+    output_dir: Path,
+    env_steps: np.ndarray,
+    results: dict[float, dict[str, dict[str, np.ndarray]]],
+) -> None:
+    specs = [
+        ("agent_pos_rmse_px", "agent-state", "extra error over encoded simulation"),
+        ("block_pos_rmse_px", "block-state", "extra error over encoded simulation"),
+        ("block_angle_rmse_deg", "block orientation", "extra error over encoded simulation"),
+        ("block_rel_objective_xy_rmse_px", "T-to-goal geometry", "extra error over encoded simulation"),
+        ("block_rel_objective_angle_rmse_deg", "T-to-goal orientation", "extra error over encoded simulation"),
+        ("block_rel_agent_xy_rmse_px", "T-to-agent geometry", "extra error over encoded simulation"),
+        ("block_rel_agent_angle_rmse_deg", "T-to-agent orientation", "extra error over encoded simulation"),
+    ]
+    if 0.0 not in results:
+        print("skipped normalized noisy-action plots: missing std=0 baseline")
+        return
+    for metric, state_name, ylabel in specs:
+        if metric not in results[0.0]["imagined"]:
+            continue
+        baseline = np.asarray(results[0.0]["imagined"][metric], dtype=np.float32)
+        fig, ax = plt.subplots(figsize=(7, 4), constrained_layout=True)
+        for noise_std, groups in sorted(results.items()):
+            if metric not in groups["imagined"]:
+                continue
+            imagined = np.asarray(groups["imagined"][metric], dtype=np.float32)
+            degradation = np.divide(
+                imagined - baseline,
+                np.maximum(baseline, 1e-8),
+                out=np.full_like(imagined, np.nan),
+                where=np.isfinite(imagined) & np.isfinite(baseline),
+            )
+            ax.plot(env_steps, 100.0 * degradation, linewidth=2.0, label=f"std={noise_std:g}")
+        ax.axhline(0.0, color="0.25", linewidth=1.0, alpha=0.65)
+        style_axis(
+            ax,
+            title=f"Percent loss in {state_name} recoverability vs expert actions",
+            xlabel="rollout horizon (environment steps)",
+            ylabel="extra error over std=0 imagined rollout (%)",
+        )
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, fontsize=8, frameon=False)
+        path = output_dir / "normalized_degradation" / f"{metric}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
 
 
 def evaluate_one_noise(
@@ -618,28 +774,29 @@ def evaluate_one_noise(
 
     imagined_pred = probe_eval.probe_predictions(probes, pred_emb)
     encoded_gt_pred = probe_eval.probe_predictions(probes, gt_emb)
-    imagined_class_pred = probe_eval.classifier_predictions(classifier_probes, pred_emb)
-    encoded_gt_class_pred = probe_eval.classifier_predictions(classifier_probes, gt_emb)
 
     imagined_curves = probe_eval.compute_curves(imagined_pred, states, args)
     encoded_gt_curves = probe_eval.compute_curves(encoded_gt_pred, states, args)
-    objective_threshold = classifier_probes["objective_met"].threshold
-    imagined_curves.update(
-        probe_eval.binary_curve_metrics(
-            imagined_class_pred["objective_met"],
-            states,
-            args,
-            threshold=objective_threshold,
+    if "objective_met" in classifier_probes:
+        imagined_class_pred = probe_eval.classifier_predictions(classifier_probes, pred_emb)
+        encoded_gt_class_pred = probe_eval.classifier_predictions(classifier_probes, gt_emb)
+        objective_threshold = classifier_probes["objective_met"].threshold
+        imagined_curves.update(
+            probe_eval.binary_curve_metrics(
+                imagined_class_pred["objective_met"],
+                states,
+                args,
+                threshold=objective_threshold,
+            )
         )
-    )
-    encoded_gt_curves.update(
-        probe_eval.binary_curve_metrics(
-            encoded_gt_class_pred["objective_met"],
-            states,
-            args,
-            threshold=objective_threshold,
+        encoded_gt_curves.update(
+            probe_eval.binary_curve_metrics(
+                encoded_gt_class_pred["objective_met"],
+                states,
+                args,
+                threshold=objective_threshold,
+            )
         )
-    )
     imagined_curves["latent_rmse"] = probe_eval.latent_curve(pred_emb, gt_emb)
     imagined_curves["latent_cosine"] = probe_eval.latent_cosine_curve(pred_emb, gt_emb)
     return {"imagined": imagined_curves, "encoded_gt": encoded_gt_curves}
@@ -650,6 +807,9 @@ def run_evaluate_rollouts(args: argparse.Namespace) -> None:
         args.output_dir or f"models/rollout_probe/{Path(args.probe_dir).name}_{args.probe_kind}_noisy_actions"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.plot_existing:
+        plot_existing_noisy_outputs(output_dir)
+        return
     device = torch.device(args.device)
 
     dataset_path = repo_path(args.dataset_path)
@@ -657,7 +817,7 @@ def run_evaluate_rollouts(args: argparse.Namespace) -> None:
     probe_dir = repo_path(args.probe_dir)
     noise_stds = parse_noise_stds(args.noise_stds)
 
-    probes, classifier_probes = probe_eval.load_probes(probe_dir, args.probe_kind)
+    probes, classifier_probes = probe_eval.load_probes(probe_dir, args.probe_kind, require_classifiers=False)
     model = swm.wm.utils.load_pretrained(args.checkpoint, cache_dir=checkpoint_cache_dir)
     model = model.to(device).eval()
     model.requires_grad_(False)
@@ -732,7 +892,9 @@ def run_evaluate_rollouts(args: argparse.Namespace) -> None:
         "num_trajectories": len(sampled),
         "history_size": history_size,
         "noise_stds": noise_stds,
-        "objective_met_threshold": classifier_probes["objective_met"].threshold,
+        "objective_met_threshold": (
+            classifier_probes["objective_met"].threshold if "objective_met" in classifier_probes else None
+        ),
         "env_steps": env_steps.tolist(),
         "action_noise": {
             "mode": args.action_noise_mode,
