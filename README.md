@@ -230,124 +230,30 @@ The PushT LeWM analysis utilities live under `scripts/` and are launched from th
 repository root with `python -m`. Every script exposes its full CLI with
 `--help`, and relative paths are resolved from the repository root.
 
-State probes decode task variables from frozen LeWM latents. Use
-`--probes all` or select specific heads such as `agent_pos`, `block_pos`,
-`block_angle`, `block_rel_objective`, `block_rel_agent`, and `objective_met`.
+| Purpose | Entrypoint | Useful flags |
+|---|---|---|
+| State probes | `scripts.probes.train_state` | `--probes all`, `--latent-cache`, `--max-samples` |
+| Sparse reward probe | `scripts.probes.train_sparse_reward` | `--include-imagined-rollouts`, `--imagined-fraction`, `--threshold-policy target_fpr`, `--target-fpr`, `--threshold-source imagined_val`, `--hard-negative-mining` |
+| Dense reward probe | `scripts.probes.train_dense_reward` | `--horizons 2 5 10 16`, `--include-imagined-rollouts`, `--imagined-fraction`, `--target-fpr`, `--hard-negative-mining`, `--monotonic-outputs` |
+| Reward reliability | `scripts.rewards.sparse_reliability`, `scripts.rewards.dense_reliability` | `--horizon`, `--plot-existing` |
+| State rollout probing | `scripts.rollouts.state_probes` | `--probe-dir`, `--probe-kind`, `--horizon` |
+| Decoder | `scripts.decoder.train`, `scripts.decoder.gt_rollout_video` | `--decoder-checkpoint`, `--horizon` |
+| Noisy actions | `scripts.data.noisy_actions_dataset`, `scripts.probes.train_noisy_actions`, `scripts.rollouts.noisy_actions` | `--noise-stds`, `--training-sources direct_and_imagined`, `visualize`, `evaluate_rollouts` |
+| Perturbations | `scripts.probes.train_perturbation_invariant`, `scripts.rollouts.perturbations` | `--perturbations all`, `--consistency-weight`, `--plot-existing` |
+
+Typical commands:
 
 ```bash
-python -m scripts.probes.train_state \
-  --probes all \
-  --latent-cache models/probes/pusht_lewm_1M/latents.npz \
-  --output-dir models/probes/pusht_lewm_1M
-
-python -m scripts.rollouts.state_probes \
-  --probe-dir models/probes/pusht_lewm_1M \
-  --probe-kind mlp \
-  --horizon 40
-```
-
-The sparse reward classifier is the `objective_met` probe with a dedicated
-entrypoint. It uses the same trajectory-aware splits and latent cache as
-`train_state`, but trains only `objective_met`. It can train on encoded dataset
-latents only, or mix in LeWM imagined rollout latents generated with
-ground-truth actions. For reward use, prefer selecting the deployed threshold by
-target false-positive rate, optionally using imagined validation rollouts as the
-threshold source.
-
-```bash
-python -m scripts.probes.train_sparse_reward \
-  --latent-cache models/probes/pusht_lewm_1M/latents.npz \
-  --output-dir models/probes/pusht_sparse_reward \
-  --max-samples 1000000 \
-  --include-imagined-rollouts \
-  --imagined-fraction 0.5 \
-  --imagined-rollout-horizon 20 \
-  --eval-imagined-rollouts \
-  --threshold-policy target_fpr \
-  --target-fpr 0.05 \
-  --threshold-source imagined_val \
-  --hard-negative-mining \
-  --hard-negative-fraction 0.25 \
-  --hard-negative-epochs 10 \
-  --device cuda
-
-python -m scripts.rewards.sparse_reliability \
-  --probe-dir models/probes/pusht_sparse_reward \
-  --probe-kind mlp \
-  --horizon 20
-```
-
-Dense reward training predicts whether success will occur within several future
-world-model horizons, defaulting to `2 5 10 16`. Useful controls are
-`--include-imagined-rollouts`, `--imagined-fraction`, `--hard-negative-mining`,
-`--target-fpr`, and `--monotonic-outputs`. The imagined-rollout options mix
-encoded dataset latents with LeWM rollout latents generated from ground-truth
-actions; this is useful when the reward will be consumed inside imagined PPO.
-The FPR and hard-negative options are for making positive dense heads less
-trigger-happy when false positives would create exploitable reward.
-
-```bash
-python -m scripts.probes.train_dense_reward \
-  --latent-cache models/probes/pusht_lewm_1M/latents.npz \
-  --output-dir models/probes/pusht_dense_reward \
-  --horizons 2 5 10 16 \
-  --include-imagined-rollouts \
-  --imagined-fraction 0.5 \
-  --imagined-rollout-horizon 20 \
-  --device cuda
-
-python -m scripts.rewards.dense_reliability \
-  --dense-reward-checkpoint models/probes/pusht_dense_reward/dense_reward_classifier.pt
-```
-
-Decoder scripts train a diagnostic latent-to-image decoder and visualize decoded
-LeWM imagination against ground-truth futures:
-
-```bash
-python -m scripts.decoder.train \
-  --output-dir models/latent_decoder/pusht_lewm
-
-python -m scripts.decoder.gt_rollout_video \
-  --decoder-checkpoint models/latent_decoder/pusht_lewm/decoder_best.pt \
-  --horizon 10
-```
-
-Noisy-action and perturbation analyses stress the world model away from clean
-expert futures. `noisy_actions visualize` makes side-by-side decoded-vs-simulated
-videos; `evaluate_rollouts` skips videos and plots probe errors over action
-noise. `--plot-existing` regenerates plots from existing CSVs without rerunning
-LeWM.
-
-```bash
+python -m scripts.probes.train_state --probes all --latent-cache models/probes/pusht_lewm_1M/latents.npz
+python -m scripts.probes.train_sparse_reward --include-imagined-rollouts --imagined-fraction 0.5 --threshold-policy target_fpr --target-fpr 0.05 --threshold-source imagined_val
+python -m scripts.probes.train_dense_reward --horizons 2 5 10 16 --include-imagined-rollouts --imagined-fraction 0.5
+python -m scripts.rewards.sparse_reliability --probe-dir models/probes/pusht_sparse_reward --probe-kind mlp
+python -m scripts.rewards.dense_reliability --dense-reward-checkpoint models/probes/pusht_dense_reward/dense_reward_classifier.pt
+python -m scripts.decoder.train --output-dir models/latent_decoder/pusht_lewm
+python -m scripts.decoder.gt_rollout_video --decoder-checkpoint models/latent_decoder/pusht_lewm/decoder_best.pt
 python -m scripts.rollouts.noisy_actions evaluate_rollouts \
-  --probe-dir models/probes/pusht_lewm_1M \
-  --probe-kind mlp \
   --noise-stds 0,0.05,0.1,0.2,0.4
-
-python -m scripts.probes.train_perturbation_invariant \
-  --perturbations all \
-  --consistency-weight 0.5
-
-python -m scripts.rollouts.perturbations \
-  --probe-dir models/probes/pusht_lewm_invariant \
-  --probe-kind mlp
-```
-
-Noisy-action probes can be trained from encoded simulator futures, imagined
-rollout latents, or a mixture. If the HDF5 dataset is missing,
-`train_noisy_actions` calls the dataset generator with matching generation args.
-
-```bash
-python -m scripts.data.noisy_actions_dataset \
-  --output models/probes/pusht_noisy_actions/noisy_action_dataset.h5 \
-  --num-trajectories 512 \
-  --horizon 50 \
-  --noise-stds 0,0.05,0.1,0.2,0.4
-
-python -m scripts.probes.train_noisy_actions \
-  --dataset models/probes/pusht_noisy_actions/noisy_action_dataset.h5 \
-  --training-sources direct_and_imagined \
-  --imagined-fraction 0.5
+python -m scripts.rollouts.perturbations --probe-dir models/probes/pusht_lewm_invariant --probe-kind mlp
 ```
 
 ## Repository layout
