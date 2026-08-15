@@ -65,6 +65,30 @@ def _block_local_centroid(unwrapped):
     return weighted / total_area if total_area > 0 else np.zeros(2)
 
 
+def _block_geometry_within_bounds(unwrapped, block_pos, rotation, low, high):
+    """Whether the complete rotated block geometry lies inside ``[low, high]``."""
+
+    block_pos = np.asarray(block_pos, dtype=np.float64)
+    low = np.asarray(low, dtype=np.float64)
+    high = np.asarray(high, dtype=np.float64)
+    for shape in unwrapped.block.shapes:
+        get_vertices = getattr(shape, "get_vertices", None)
+        if get_vertices is not None:  # pymunk.Poly
+            local = np.asarray([tuple(vertex) for vertex in get_vertices()])
+            world = block_pos + local @ rotation.T
+            if np.any(world < low) or np.any(world > high):
+                return False
+        else:  # pymunk.Circle
+            offset = np.asarray(
+                tuple(getattr(shape, "offset", (0.0, 0.0))), dtype=np.float64
+            )
+            center = block_pos + rotation @ offset
+            radius = float(getattr(shape, "radius", 0.0))
+            if np.any(center - radius < low) or np.any(center + radius > high):
+                return False
+    return True
+
+
 def green_t_center(env):
     """World-space centroid of the rendered green goal ("green T") marker.
 
@@ -304,26 +328,32 @@ class PushTRenderObservationWrapper(gym.ObservationWrapper):
 
 
 class PushTBlockStartNearGoalWrapper(gym.Wrapper):
-    """Start each episode with the block near the green T (goal) center.
+    """Start each episode with the block at a controlled goal distance.
 
     On every ``reset`` the block is repositioned so its centroid lands at a
-    uniform-random point inside a disk of radius ``radius`` pixels around the
+    uniform-area point between ``min_radius`` and ``radius`` pixels around the
     green T center (see :func:`green_t_center` / :func:`block_center`); the block
-    *angle* and the agent are left untouched. This shortens the block-transport
-    distance -- the main driver of PushT difficulty -- into a controllable range.
+    *angle* and the agent are left untouched. ``min_radius=0`` gives the
+    historical disk, while a positive value gives an annulus for OOD starts.
 
-    The block origin is clipped to stay ``bounds_margin`` pixels inside the
-    workspace. Runs *after* any goal alignment/sync, so the disk is centered on
-    the final (possibly fixed) goal.
+    By default the block origin is clipped to stay ``bounds_margin`` pixels
+    inside the workspace, preserving the historical behavior. Setting
+    ``clip_out_of_bounds=False`` instead rejects samples unless the complete
+    rotated block geometry fits within that margin, preventing boundary piles
+    and immediate wall collisions in an annular OOD suite. Runs *after* any
+    goal alignment/sync, so sampling is centered on the final (possibly fixed)
+    goal.
     """
 
     def __init__(
         self,
         env,
         radius=50.0,
+        min_radius=0.0,
         bounds_margin=20.0,
         min_agent_clearance=0.0,
         max_sample_attempts=100,
+        clip_out_of_bounds=True,
         workspace_low=PUSHT_WORKSPACE_LOW,
         workspace_high=PUSHT_WORKSPACE_HIGH,
     ):
@@ -331,11 +361,17 @@ class PushTBlockStartNearGoalWrapper(gym.Wrapper):
         self.radius = float(radius)
         if self.radius < 0.0:
             raise ValueError("radius must be non-negative")
+        self.min_radius = float(min_radius)
+        if self.min_radius < 0.0:
+            raise ValueError("min_radius must be non-negative")
+        if self.min_radius > self.radius:
+            raise ValueError("min_radius must not exceed radius")
         self.bounds_margin = float(bounds_margin)
         # Optional: reject samples whose block centroid lands within this distance
         # of the agent (avoids spawning the block on top of the pusher). 0 = off.
         self.min_agent_clearance = float(min_agent_clearance)
         self.max_sample_attempts = max(1, int(max_sample_attempts))
+        self.clip_out_of_bounds = bool(clip_out_of_bounds)
         self.workspace_low = np.asarray(workspace_low, dtype=np.float64)
         self.workspace_high = np.asarray(workspace_high, dtype=np.float64)
         self._low = self.workspace_low + self.bounds_margin
@@ -348,10 +384,26 @@ class PushTBlockStartNearGoalWrapper(gym.Wrapper):
         rot = _rotation_matrix(block_angle)
         best = None
         for _ in range(self.max_sample_attempts):
-            radius = self.radius * np.sqrt(self._rng.random())
+            radius = np.sqrt(
+                self._rng.uniform(self.min_radius**2, self.radius**2)
+            )
             theta = self._rng.uniform(0.0, 2.0 * np.pi)
-            target_centroid = goal_center + radius * np.array([np.cos(theta), np.sin(theta)])
-            block_pos = np.clip(target_centroid - rot @ local_centroid, self._low, self._high)
+            target_centroid = goal_center + radius * np.array(
+                [np.cos(theta), np.sin(theta)]
+            )
+            raw_block_pos = target_centroid - rot @ local_centroid
+            if self.clip_out_of_bounds:
+                block_pos = np.clip(raw_block_pos, self._low, self._high)
+            else:
+                if not _block_geometry_within_bounds(
+                    self.unwrapped,
+                    raw_block_pos,
+                    rot,
+                    self._low,
+                    self._high,
+                ):
+                    continue
+                block_pos = raw_block_pos
             best = block_pos
             resulting_centroid = block_pos + rot @ local_centroid
             if (
@@ -359,7 +411,11 @@ class PushTBlockStartNearGoalWrapper(gym.Wrapper):
                 or np.linalg.norm(resulting_centroid - agent_xy) >= self.min_agent_clearance
             ):
                 return block_pos
-        return best  # clearance unsatisfiable in bounds; use the last sample
+        if best is None:
+            raise RuntimeError(
+                "could not sample a feasible block start within the requested annulus"
+            )
+        return best  # clearance unsatisfiable in bounds; use the last feasible sample
 
     def _reposition_block(self, observation, info):
         env = self.unwrapped
@@ -381,7 +437,7 @@ class PushTBlockStartNearGoalWrapper(gym.Wrapper):
         }
         # The fixed-target wrapper computed its reset metrics before this outer
         # wrapper moved the block. Refresh them so reset info describes the state
-        # the policy actually sees (canonical_v2 stratifies on these values).
+        # the policy actually sees (canonical_v2/OOD stratify on these values).
         wrapper = self.env
         while hasattr(wrapper, "env") and not isinstance(
             wrapper, PushTAlignSampledGoalToFixedTargetWrapper
@@ -393,7 +449,9 @@ class PushTBlockStartNearGoalWrapper(gym.Wrapper):
             info = dict(info)
         info["green_t_center"] = goal_center
         info["block_pose"] = np.array(list(state[2:4]) + [state[4]])
-        info["block_goal_dist"] = float(np.linalg.norm(block_center(env) - goal_center))
+        current_block_center = block_center(env)
+        info["block_center"] = current_block_center
+        info["block_goal_dist"] = float(np.linalg.norm(current_block_center - goal_center))
         if "agent_block_dist" in info:
             info["agent_block_dist"] = float(np.linalg.norm(state[:2] - state[2:4]))
         return observation, info
@@ -450,7 +508,9 @@ def make_pusht_env(
     fixed_target_agent_block_coef=0.0,
     block_start_near_goal=False,
     block_start_radius=50.0,
+    block_start_min_radius=0.0,
     block_start_min_agent_clearance=0.0,
+    block_start_clip_out_of_bounds=True,
     reward_mode="dense",
     **kwargs,
 ):
@@ -478,7 +538,9 @@ def make_pusht_env(
         env = PushTBlockStartNearGoalWrapper(
             env,
             radius=block_start_radius,
+            min_radius=block_start_min_radius,
             min_agent_clearance=block_start_min_agent_clearance,
+            clip_out_of_bounds=block_start_clip_out_of_bounds,
         )
     if reward_mode != "dense":
         env = PushTRewardModeWrapper(env, reward_mode=reward_mode)

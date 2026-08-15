@@ -36,6 +36,7 @@ try:
     )
     from src.envs.pusht_wrappers import (  # noqa: E402
         PushTRewardModeWrapper,
+        _block_geometry_within_bounds,
         _polygon_area_centroid,
     )
 
@@ -131,6 +132,46 @@ def test_block_start_reproducible_with_seed():
     b = env.reset(seed=7)[0]["state"][2:4].copy()
     assert np.allclose(a, b), (a, b)
     env.close()
+
+
+def test_block_start_annulus_is_unclipped_and_within_bounds():
+    """OOD starts stay in the requested centroid annulus without boundary clipping."""
+    if not _HAVE_ENV:
+        return
+    env = make_pusht_env(
+        render_obs=False,
+        align_sampled_goal_to_fixed_target=True,
+        block_start_near_goal=True,
+        block_start_min_radius=200.0,
+        block_start_radius=260.0,
+        block_start_clip_out_of_bounds=False,
+        resolution=96,
+    )
+    try:
+        for seed in range(30):
+            _, info = env.reset(seed=seed)
+            distance = float(info["block_goal_dist"])
+            origin = np.asarray(info["block_pose"][:2])
+            angle = float(info["block_pose"][2])
+            rotation = np.array(
+                [
+                    [np.cos(angle), -np.sin(angle)],
+                    [np.sin(angle), np.cos(angle)],
+                ]
+            )
+            assert 198.0 <= distance <= 262.0, (seed, distance)
+            # The raw geometry respects a 20 px margin. Allow the single
+            # physics tick performed by ``_set_state`` to consume that margin,
+            # but require the full T to remain in the actual workspace.
+            assert _block_geometry_within_bounds(
+                env.unwrapped,
+                origin,
+                rotation,
+                np.zeros(2),
+                np.full(2, 512.0),
+            ), (seed, origin)
+    finally:
+        env.close()
 
 
 def test_near_goal_reset_refreshes_fixed_target_metrics():

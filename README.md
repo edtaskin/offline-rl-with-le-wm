@@ -224,6 +224,14 @@ normalized success-by-step AUC for checkpoint tie-breaking. The terminal summary
 per-stratum rows, while `metrics.json` retains their full metrics. Existing campaign helpers remain on v1 until
 their stored results are explicitly regenerated with v2.
 
+Use `--protocol canonical_ood` for a separate extrapolation stress test. It balances the same six
+translation-by-rotation cells over a feasible, unclipped 200--260 px block-centroid annulus, with
+translation bands 200--220, 220--240, and 240--260 px. The evaluator supplies these radii
+automatically and names cells explicitly, for example `ood_200_220_aligned` and
+`ood_240_260_misaligned`. Since the expert data contains little support beyond 200 px, keep
+`canonical_v2` as the primary checkpoint-selection protocol and report `canonical_ood` alongside
+it rather than optimizing checkpoint selection for OOD starts.
+
 See the [evaluation protocol reference](src/evaluation/README.md) for the stratum boundaries,
 metric formulas, and recommended checkpoint-selection order.
 

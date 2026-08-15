@@ -23,7 +23,8 @@ FINAL_METRIC_KEYS = (
 
 CANONICAL_V1 = "canonical_v1"
 CANONICAL_V2 = "canonical_v2"
-EVALUATION_PROTOCOLS = (CANONICAL_V1, CANONICAL_V2, "custom")
+CANONICAL_OOD = "canonical_ood"
+EVALUATION_PROTOCOLS = (CANONICAL_V1, CANONICAL_V2, CANONICAL_OOD, "custom")
 
 # canonical_v2 deliberately balances the Cartesian product of these bands.
 # Translation is the geometric block-centroid-to-goal-centroid distance. Using
@@ -32,6 +33,11 @@ EVALUATION_PROTOCOLS = (CANONICAL_V1, CANONICAL_V2, "custom")
 CANONICAL_V2_DISTANCE_THRESHOLDS = (70.0, 140.0)
 CANONICAL_V2_ANGLE_THRESHOLDS = (float(np.pi / 4),)
 CANONICAL_V2_COMPLETION_BUDGETS = (50, 100, 200, 300)
+CANONICAL_OOD_MIN_RADIUS = 200.0
+CANONICAL_OOD_MAX_RADIUS = 260.0
+CANONICAL_OOD_DISTANCE_THRESHOLDS = (220.0, 240.0)
+CANONICAL_OOD_ANGLE_THRESHOLDS = CANONICAL_V2_ANGLE_THRESHOLDS
+CANONICAL_OOD_COMPLETION_BUDGETS = CANONICAL_V2_COMPLETION_BUDGETS
 _DISTANCE_BAND_NAMES = ("near", "mid", "far")
 _ANGLE_BAND_NAMES = ("aligned", "misaligned")
 CANONICAL_V2_STRATA = tuple(
@@ -39,6 +45,17 @@ CANONICAL_V2_STRATA = tuple(
     for distance in _DISTANCE_BAND_NAMES
     for angle in _ANGLE_BAND_NAMES
 )
+CANONICAL_OOD_STRATA = tuple(
+    f"ood_{lower}_{upper}_{angle}"
+    for lower, upper in ((200, 220), (220, 240), (240, 260))
+    for angle in _ANGLE_BAND_NAMES
+)
+
+
+def protocol_strata(protocol: str) -> tuple[str, ...]:
+    """Return the ordered six-cell label set for a stratified protocol."""
+
+    return CANONICAL_OOD_STRATA if protocol == CANONICAL_OOD else CANONICAL_V2_STRATA
 
 
 class EvaluationAgent(Protocol):
@@ -60,9 +77,9 @@ class PushTEvalConfig:
     # well-separated episode seeds derived from ``seed``. Other callers may omit
     # it and retain the legacy arithmetic ``seed + i * seed_stride`` schedule.
     episode_seeds: tuple[int, ...] | None = None
-    # canonical_v2 records the stratum assigned while constructing its fixed
-    # seed suite. Keeping it beside the seeds makes the benchmark auditable and
-    # lets run_episode verify that a reset still produces the expected state.
+    # Stratified protocols record the cell assigned while constructing their
+    # fixed seed suite. Keeping it beside the seeds makes the benchmark
+    # auditable and lets run_episode verify that a reset still matches.
     episode_strata: tuple[str, ...] | None = None
     # Gap between consecutive episode seeds. Consecutive integer seeds collide in
     # the underlying PushT reset roughly 17% of the time, which silently turns
@@ -78,6 +95,8 @@ class PushTEvalConfig:
     fixed_target_max_reset_attempts: int = 100
     agent_block_coef: float = 0.0
     block_start_radius: float | None = None
+    block_start_min_radius: float = 0.0
+    block_start_clip_out_of_bounds: bool = True
     record_video: bool = False
     video_dir: str = "runs/eval_videos"
     video_fps: int = 10
@@ -115,7 +134,7 @@ class PushTEvalConfig:
                 raise ValueError(
                     "episode_strata must contain exactly one label per episode"
                 )
-            unknown = set(self.episode_strata) - set(CANONICAL_V2_STRATA)
+            unknown = set(self.episode_strata) - set(protocol_strata(self.protocol))
             if unknown:
                 raise ValueError(f"unknown episode strata: {sorted(unknown)}")
         for name, thresholds in (
@@ -142,6 +161,17 @@ class PushTEvalConfig:
             raise ValueError(
                 "PushT stratification requires two distance thresholds and one angle threshold"
             )
+        if self.block_start_radius is not None and self.block_start_radius < 0:
+            raise ValueError("block_start_radius must be non-negative")
+        if self.block_start_min_radius < 0:
+            raise ValueError("block_start_min_radius must be non-negative")
+        if self.block_start_radius is None and self.block_start_min_radius > 0:
+            raise ValueError("block_start_min_radius requires block_start_radius")
+        if (
+            self.block_start_radius is not None
+            and self.block_start_min_radius > self.block_start_radius
+        ):
+            raise ValueError("block_start_min_radius must not exceed block_start_radius")
         if self.protocol == CANONICAL_V2:
             if not self.fixed_target_block_success:
                 raise ValueError(
@@ -151,6 +181,10 @@ class PushTEvalConfig:
                 self.block_start_radius, 200.0
             ):
                 raise ValueError("canonical_v2 requires block_start_radius=200")
+            if not np.isclose(self.block_start_min_radius, 0.0):
+                raise ValueError("canonical_v2 requires block_start_min_radius=0")
+            if not self.block_start_clip_out_of_bounds:
+                raise ValueError("canonical_v2 requires clipped disk sampling")
             if tuple(self.distance_thresholds) != CANONICAL_V2_DISTANCE_THRESHOLDS:
                 raise ValueError(
                     "canonical_v2 requires its fixed distance thresholds"
@@ -161,12 +195,40 @@ class PushTEvalConfig:
                 raise ValueError("canonical_v2 requires its fixed completion budgets")
             if self.max_episode_steps != CANONICAL_V2_COMPLETION_BUDGETS[-1]:
                 raise ValueError("canonical_v2 requires max_episode_steps=300")
+        if self.protocol == CANONICAL_OOD:
+            if not self.fixed_target_block_success:
+                raise ValueError(
+                    "canonical_ood requires fixed_target_block_success=True"
+                )
+            if self.block_start_radius is None or not np.isclose(
+                self.block_start_radius, CANONICAL_OOD_MAX_RADIUS
+            ):
+                raise ValueError(
+                    f"canonical_ood requires block_start_radius={CANONICAL_OOD_MAX_RADIUS:g}"
+                )
+            if not np.isclose(
+                self.block_start_min_radius, CANONICAL_OOD_MIN_RADIUS
+            ):
+                raise ValueError(
+                    "canonical_ood requires "
+                    f"block_start_min_radius={CANONICAL_OOD_MIN_RADIUS:g}"
+                )
+            if self.block_start_clip_out_of_bounds:
+                raise ValueError("canonical_ood requires unclipped annulus sampling")
+            if tuple(self.distance_thresholds) != CANONICAL_OOD_DISTANCE_THRESHOLDS:
+                raise ValueError(
+                    "canonical_ood requires its fixed distance thresholds"
+                )
+            if tuple(self.angle_thresholds) != CANONICAL_OOD_ANGLE_THRESHOLDS:
+                raise ValueError("canonical_ood requires its fixed angle thresholds")
+            if tuple(self.completion_budgets) != CANONICAL_OOD_COMPLETION_BUDGETS:
+                raise ValueError("canonical_ood requires its fixed completion budgets")
+            if self.max_episode_steps != CANONICAL_OOD_COMPLETION_BUDGETS[-1]:
+                raise ValueError("canonical_ood requires max_episode_steps=300")
         if self.max_episode_steps < 1:
             raise ValueError("max_episode_steps must be at least 1")
         if self.observation_resolution < 1:
             raise ValueError("observation_resolution must be positive")
-        if self.block_start_radius is not None and self.block_start_radius < 0:
-            raise ValueError("block_start_radius must be non-negative")
         if self.record_video and self.video_fps <= 0:
             raise ValueError("video_fps must be positive")
 
@@ -273,7 +335,7 @@ class RepeatedEvaluationResult:
 
 @dataclass(frozen=True)
 class StratifiedEpisodeSuite:
-    """Fixed simulator reset seeds selected to fill canonical_v2 strata."""
+    """Fixed simulator reset seeds selected to fill six start-pose strata."""
 
     seeds: tuple[int, ...]
     strata: tuple[str, ...]
@@ -304,6 +366,7 @@ def difficulty_stratum(
     initial_metrics: dict[str, float],
     distance_thresholds=CANONICAL_V2_DISTANCE_THRESHOLDS,
     angle_thresholds=CANONICAL_V2_ANGLE_THRESHOLDS,
+    stratum_labels=CANONICAL_V2_STRATA,
 ) -> str:
     """Assign one start state to a translation x rotation difficulty cell."""
 
@@ -320,23 +383,32 @@ def difficulty_stratum(
     distance_index = int(np.searchsorted(distance_thresholds, distance, side="right"))
     angle_index = int(np.searchsorted(angle_thresholds, angle, side="right"))
     if distance_index >= len(_DISTANCE_BAND_NAMES):
-        raise ValueError("canonical_v2 supports exactly three distance bands")
+        raise ValueError("stratified PushT evaluation supports three distance bands")
     if angle_index >= len(_ANGLE_BAND_NAMES):
-        raise ValueError("canonical_v2 supports exactly two angle bands")
-    return f"{_DISTANCE_BAND_NAMES[distance_index]}_{_ANGLE_BAND_NAMES[angle_index]}"
+        raise ValueError("stratified PushT evaluation supports two angle bands")
+    if len(stratum_labels) != len(_DISTANCE_BAND_NAMES) * len(_ANGLE_BAND_NAMES):
+        raise ValueError("stratum_labels must contain exactly six labels")
+    return stratum_labels[distance_index * len(_ANGLE_BAND_NAMES) + angle_index]
 
 
-def stratified_episode_quotas(episodes: int) -> dict[str, int]:
-    """Allocate an equal deterministic quota across canonical_v2's six cells."""
+def stratified_episode_quotas(
+    episodes: int,
+    strata=CANONICAL_V2_STRATA,
+) -> dict[str, int]:
+    """Allocate an equal deterministic quota across the six start-pose cells."""
 
-    if episodes < len(CANONICAL_V2_STRATA):
+    strata = tuple(strata)
+    if len(strata) != 6:
+        raise ValueError("strata must contain exactly six labels")
+    if episodes < len(strata):
         raise ValueError(
-            f"canonical_v2 requires at least {len(CANONICAL_V2_STRATA)} episodes"
+            "stratified PushT evaluation requires at least "
+            f"{len(strata)} episodes"
         )
-    base, remainder = divmod(int(episodes), len(CANONICAL_V2_STRATA))
+    base, remainder = divmod(int(episodes), len(strata))
     return {
         stratum: base + int(index < remainder)
-        for index, stratum in enumerate(CANONICAL_V2_STRATA)
+        for index, stratum in enumerate(strata)
     }
 
 
@@ -357,6 +429,8 @@ def make_evaluation_env(
         fixed_target_agent_block_coef=config.agent_block_coef,
         block_start_near_goal=config.block_start_radius is not None,
         block_start_radius=config.block_start_radius or 0.0,
+        block_start_min_radius=config.block_start_min_radius,
+        block_start_clip_out_of_bounds=config.block_start_clip_out_of_bounds,
         render_obs=render_observations,
         resolution=config.observation_resolution,
     )
@@ -381,10 +455,11 @@ def select_stratified_episode_seeds(
     """
 
     config.validate()
-    quotas = stratified_episode_quotas(config.episodes)
+    strata = protocol_strata(config.protocol)
+    quotas = stratified_episode_quotas(config.episodes, strata)
     accepted: list[int] = []
     labels: list[str] = []
-    counts = {stratum: 0 for stratum in CANONICAL_V2_STRATA}
+    counts = {stratum: 0 for stratum in strata}
     seen: set[int] = set()
     owns_env = env is None
     if env is None:
@@ -410,10 +485,23 @@ def select_stratified_episode_seeds(
             # allowed to inflate it.
             if success_from_info(info, False) > 0.5:
                 continue
+            metrics = scalar_metrics(info)
+            if config.protocol == CANONICAL_OOD:
+                distance = metrics.get("block_goal_dist")
+                if distance is None or not (
+                    CANONICAL_OOD_MIN_RADIUS
+                    <= distance
+                    <= CANONICAL_OOD_MAX_RADIUS
+                ):
+                    # The sampler targets the exact annulus, but setting the
+                    # physics state advances one tick. Reject any rare start
+                    # nudged outside the benchmark's measured-state contract.
+                    continue
             label = difficulty_stratum(
-                scalar_metrics(info),
+                metrics,
                 config.distance_thresholds,
                 config.angle_thresholds,
+                strata,
             )
             if counts[label] >= quotas[label]:
                 continue
@@ -429,11 +517,11 @@ def select_stratified_episode_seeds(
     if counts != quotas:
         missing = {
             label: quotas[label] - counts[label]
-            for label in CANONICAL_V2_STRATA
+            for label in strata
             if counts[label] < quotas[label]
         }
         raise RuntimeError(
-            "candidate seed pool could not fill canonical_v2 strata; "
+            f"candidate seed pool could not fill {config.protocol} strata; "
             f"missing={missing}, examined={examined}"
         )
     return StratifiedEpisodeSuite(
@@ -462,10 +550,20 @@ def run_episode(env, agent: EvaluationAgent, config: PushTEvalConfig, episode_in
             initial_metrics,
             config.distance_thresholds,
             config.angle_thresholds,
+            protocol_strata(config.protocol),
         )
+    if config.protocol == CANONICAL_OOD:
+        distance = initial_metrics.get("block_goal_dist")
+        if distance is None or not (
+            CANONICAL_OOD_MIN_RADIUS <= distance <= CANONICAL_OOD_MAX_RADIUS
+        ):
+            raise RuntimeError(
+                "canonical_ood reset lies outside its 200-260px centroid annulus: "
+                f"seed={episode_seed}, distance={distance}"
+            )
     if expected_stratum is not None and stratum != expected_stratum:
         raise RuntimeError(
-            "evaluation reset no longer matches its canonical_v2 stratum: "
+            "evaluation reset no longer matches its assigned start stratum: "
             f"seed={episode_seed}, expected={expected_stratum}, observed={stratum}"
         )
     agent.reset(episode_seed)
@@ -552,12 +650,16 @@ def _success_auc(episodes, horizon: int) -> float:
 def summarize_strata(episodes, completion_budgets=()) -> list[dict[str, Any]]:
     """Return detailed per-cell metrics without nesting them in scalar summary."""
 
+    observed = {episode.stratum for episode in episodes if episode.stratum is not None}
+    known_order = CANONICAL_V2_STRATA + CANONICAL_OOD_STRATA
+    labels = [label for label in known_order if label in observed]
+    labels.extend(sorted(observed - set(known_order)))
     grouped = {
         label: [episode for episode in episodes if episode.stratum == label]
-        for label in CANONICAL_V2_STRATA
+        for label in labels
     }
     rows = []
-    for label in CANONICAL_V2_STRATA:
+    for label in labels:
         group = grouped[label]
         if not group:
             continue
@@ -625,9 +727,9 @@ def summarize_results(episodes, completion_budgets=()):
         rates = np.asarray([row["success_rate"] for row in strata], dtype=float)
         summary["balanced_success_rate"] = float(rates.mean())
         summary["worst_stratum_success_rate"] = float(rates.min())
+        hard_labels = (CANONICAL_OOD_STRATA[-1], CANONICAL_V2_STRATA[-1])
         hard = next(
-            (row for row in strata if row["stratum"] == "far_misaligned"),
-            None,
+            (row for row in strata if row["stratum"] in hard_labels), None
         )
         if hard is not None:
             summary["hard_success_rate"] = float(hard["success_rate"])
