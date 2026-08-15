@@ -191,7 +191,12 @@ def bc_training_observation_resolution(stats):
     return _square_resolution(stats.get("source_image_shape"))
 
 
-def load_bc_components(checkpoint, stats_path=None, device="auto"):
+def load_bc_components(
+    checkpoint,
+    stats_path=None,
+    device="auto",
+    encoder_checkpoint=None,
+):
     device = resolve_device(device)
     stats_reference = stats_path or infer_bc_stats_path(checkpoint)
     checkpoint_path, resolved_stats_path = resolve_artifacts([checkpoint, stats_reference])
@@ -209,6 +214,7 @@ def load_bc_components(checkpoint, stats_path=None, device="auto"):
     normalization = stats.get("image_normalization", LEWM_IMAGE_NORMALIZATION)
     encoder = LeWMEncoder.from_checkpoint(
         device=device,
+        checkpoint_path=encoder_checkpoint,
         latent_dim=contract["latent_dim"],
         normalization=normalization,
         latent_representation=representation,
@@ -225,13 +231,21 @@ def load_bc_components(checkpoint, stats_path=None, device="auto"):
     return BCComponents(encoder=encoder, policy=policy, contract=contract, stats=stats)
 
 
-def load_ppo_components(checkpoint, device="auto", encoder=None):
+def load_ppo_components(
+    checkpoint,
+    device="auto",
+    encoder=None,
+    encoder_checkpoint=None,
+):
     """Load a PPO checkpoint into an evaluable agent.
 
     ``encoder`` lets a caller reuse an already-built frozen ViT across many
     checkpoints from the same run (the RQ1 budget curve evaluates dozens of
-    snapshots); it must match ``contract['latent_dim']``. Left as ``None`` the
-    encoder is rebuilt from the checkpoint's own config, as before.
+    snapshots); it must match ``contract['latent_dim']``. Otherwise an explicit
+    ``encoder_checkpoint`` is used when supplied, and ``None`` delegates to the
+    machine-local ``STABLEWM_HOME`` default. The path recorded in the PPO
+    checkpoint remains provenance metadata and is deliberately not used for
+    filesystem resolution because it may name the training machine.
     """
     device = resolve_device(device)
     checkpoint_path = resolve_artifact(checkpoint)
@@ -258,7 +272,7 @@ def load_ppo_components(checkpoint, device="auto", encoder=None):
     if encoder is None:
         encoder = LeWMEncoder.from_checkpoint(
             device=device,
-            checkpoint_path=config.get("encoder_checkpoint"),
+            checkpoint_path=encoder_checkpoint,
             latent_dim=contract["latent_dim"],
             normalization=config.get("image_normalization", LEWM_IMAGE_NORMALIZATION),
             latent_representation=representation,
@@ -296,8 +310,14 @@ def make_bc_evaluation_agent(
     execution_mode="open-loop",
     replan_interval=1,
     temporal_ensemble_decay=0.01,
+    encoder_checkpoint=None,
 ):
-    components = components or load_bc_components(checkpoint, stats_path, device)
+    components = components or load_bc_components(
+        checkpoint,
+        stats_path,
+        device,
+        encoder_checkpoint=encoder_checkpoint,
+    )
     resolved_device = next(components.policy.parameters()).device
 
     def predict_chunk(stacked, deterministic):
@@ -333,12 +353,17 @@ def make_ppo_evaluation_agent(
     *,
     components=None,
     device="auto",
+    encoder_checkpoint=None,
     deterministic=True,
     execution_mode="open-loop",
     replan_interval=1,
     temporal_ensemble_decay=0.01,
 ):
-    components = components or load_ppo_components(checkpoint, device)
+    components = components or load_ppo_components(
+        checkpoint,
+        device,
+        encoder_checkpoint=encoder_checkpoint,
+    )
     resolved_device = next(components.agent.parameters()).device
 
     def predict_chunk(stacked, use_deterministic):

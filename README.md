@@ -185,6 +185,7 @@ python -m src.evaluation.evaluate_pusht \
   --episodes 150 \
   --max-episode-steps 300 \
   --seed 42 \
+  --visualize-starts \
   --video
 ```
 
@@ -194,6 +195,7 @@ For a PPO checkpoint, point `--checkpoint` at the selected artifact:
 python -m src.evaluation.evaluate_pusht \
   --agent-type ppo \
   --checkpoint runs/ppo/pusht_real_ppo_best.pt \
+  --protocol canonical_v2 \
   --block-start-radius 200 \
   --episodes 150 \
   --max-episode-steps 300 \
@@ -201,9 +203,29 @@ python -m src.evaluation.evaluate_pusht \
   --video
 ```
 
+Latent BC/PPO evaluation loads the official encoder from
+`$STABLEWM_HOME/checkpoints/pusht/lewm_object.ckpt`. Pass
+`--encoder-checkpoint /explicit/local/lewm_object.ckpt` to override it. Absolute encoder paths
+recorded as training provenance inside PPO checkpoints are not used for evaluation, since they may
+refer to another machine.
+
 Each evaluation creates a timestamped directory under `runs/evaluations/`. `metrics.json` records
 the sampled episode seeds, configuration, rewards, and success rate; `--video` also writes episode
-videos. Omitting `--block-start-radius` evaluates unrestricted block starts around the fixed target.
+videos. `--visualize-starts` writes a color-coded `start_locations.png` for the exact deterministic
+suite. Omitting `--block-start-radius` evaluates unrestricted block starts around the fixed target.
+
+The default `canonical_v1` protocol preserves historical results. Opt into `canonical_v2` to
+select one fixed suite balanced across six initial-pose cells: block-centroid translation of 0--70,
+70--140, or more than 140 pixels, crossed with angular error below or above 45 degrees. With 150
+episodes this gives 25 starts per cell and rejects states that already satisfy the task. Its
+metrics additionally contain each episode's initial pose metrics and stratum, per-stratum success,
+balanced success, worst/hard-cell success, cumulative success by 50/100/200/300 steps, and
+normalized success-by-step AUC for checkpoint tie-breaking. The terminal summary prints all six
+per-stratum rows, while `metrics.json` retains their full metrics. Existing campaign helpers remain on v1 until
+their stored results are explicitly regenerated with v2.
+
+See the [evaluation protocol reference](src/evaluation/README.md) for the stratum boundaries,
+metric formulas, and recommended checkpoint-selection order.
 
 ## Optional logging and publishing
 

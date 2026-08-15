@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import gymnasium as gym
 import numpy as np
 import torch
+from PIL import Image
 
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 from src.evaluation.agents import (
@@ -23,12 +24,25 @@ from src.evaluation.evaluate_pusht import (
     sample_episode_seeds,
 )
 from src.evaluation.pusht import (
+    CANONICAL_V1,
+    CANONICAL_V2,
+    CANONICAL_V2_ANGLE_THRESHOLDS,
+    CANONICAL_V2_COMPLETION_BUDGETS,
+    CANONICAL_V2_DISTANCE_THRESHOLDS,
+    CANONICAL_V2_STRATA,
+    EpisodeResult,
     PushTEvalConfig,
+    StratifiedEpisodeSuite,
     aggregate_evaluation_results,
+    difficulty_stratum,
     make_evaluation_env,
     run_evaluation,
     run_repeated_evaluation,
+    select_stratified_episode_seeds,
+    stratified_episode_quotas,
+    summarize_results,
 )
+from src.evaluation.start_visualization import write_start_location_visualization
 
 
 class FakePushTEnv(gym.Env):
@@ -54,6 +68,52 @@ class FakePushTEnv(gym.Env):
             "block_state_dist": float(3 - self.step_index),
         }
         return observation, reward, terminated, False, info
+
+
+class StratifiedResetEnv(FakePushTEnv):
+    """Reset-only fixture that cycles deterministically through all six cells."""
+
+    STARTS = (
+        (30.0, 0.1),
+        (30.0, 1.0),
+        (100.0, 0.1),
+        (100.0, 1.0),
+        (180.0, 0.1),
+        (180.0, 1.0),
+    )
+
+    def reset(self, seed=None, options=None):
+        observation, _ = super().reset(seed=seed, options=options)
+        distance, angle = self.STARTS[int(seed or 0) % len(self.STARTS)]
+        return observation, {
+            "block_goal_dist": distance,
+            "block_angle_dist": angle,
+            "agent_block_dist": 50.0,
+            "success": float(int(seed or 0) == 0),
+        }
+
+
+class StartPoseRenderEnv:
+    def __init__(self):
+        self.reset_seeds = []
+        self.current_seed = 0
+
+    def reset(self, seed=None, options=None):
+        self.current_seed = int(seed or 0)
+        self.reset_seeds.append(self.current_seed)
+        pose = np.array(
+            [64.0 + self.current_seed, 96.0 + self.current_seed, 0.1 * self.current_seed]
+        )
+        return np.zeros((8, 8, 3), dtype=np.uint8), {
+            "block_pose": pose,
+            "block_center": pose[:2] + np.array([0.0, 4.0]),
+            "green_t_center": np.array([128.0, 128.0]),
+        }
+
+    def render(self):
+        frame = np.full((32, 32, 3), 235, dtype=np.uint8)
+        frame[14:18, 14:18] = [144, 238, 144]
+        return frame
 
 
 class ConstantAgent:
@@ -84,11 +144,14 @@ class EvaluationRunnerTests(unittest.TestCase):
         parser = build_parser()
         self.assertEqual(parser.get_default("episodes"), 150)
         self.assertEqual(parser.get_default("seed"), 42)
+        self.assertEqual(parser.get_default("protocol"), CANONICAL_V1)
         self.assertNotIn("repeats", {action.dest for action in parser._actions})
         self.assertNotIn("seed_stride", {action.dest for action in parser._actions})
         self.assertEqual(
             parser.get_default("observation_resolution"), PUSHT_RENDER_SHAPE[0]
         )
+        self.assertIsNone(parser.get_default("encoder_checkpoint"))
+        self.assertFalse(parser.get_default("visualize_starts"))
 
     def test_sampled_episode_seeds_are_reproducible_unique_and_well_separated(self):
         seeds = sample_episode_seeds(42, 150)
@@ -101,6 +164,88 @@ class EvaluationRunnerTests(unittest.TestCase):
             min(right - left for left, right in zip(ordered, ordered[1:])),
             7,
         )
+
+    def test_canonical_v2_strata_and_quotas_are_stable(self):
+        self.assertEqual(
+            difficulty_stratum(
+                {
+                    "block_goal_dist": 69.9,
+                    "block_pos_dist": 180.0,
+                    "block_angle_dist": 0.1,
+                }
+            ),
+            "near_aligned",
+        )
+        self.assertEqual(
+            difficulty_stratum(
+                {"block_goal_dist": 70.0, "block_angle_dist": np.pi / 4}
+            ),
+            "mid_misaligned",
+        )
+        self.assertEqual(stratified_episode_quotas(150), {
+            label: 25 for label in CANONICAL_V2_STRATA
+        })
+
+    def test_canonical_v2_rejects_an_incompatible_environment_contract(self):
+        with self.assertRaisesRegex(ValueError, "fixed_target_block_success"):
+            PushTEvalConfig(
+                protocol=CANONICAL_V2,
+                fixed_target_block_success=False,
+                block_start_radius=200.0,
+                distance_thresholds=CANONICAL_V2_DISTANCE_THRESHOLDS,
+                angle_thresholds=CANONICAL_V2_ANGLE_THRESHOLDS,
+                completion_budgets=CANONICAL_V2_COMPLETION_BUDGETS,
+            ).validate()
+
+    def test_canonical_v2_selects_a_fixed_balanced_seed_suite(self):
+        config = PushTEvalConfig(
+            protocol=CANONICAL_V2,
+            episodes=12,
+            block_start_radius=200.0,
+            distance_thresholds=CANONICAL_V2_DISTANCE_THRESHOLDS,
+            angle_thresholds=CANONICAL_V2_ANGLE_THRESHOLDS,
+            completion_budgets=CANONICAL_V2_COMPLETION_BUDGETS,
+        )
+        first = select_stratified_episode_seeds(
+            config, range(100), env=StratifiedResetEnv()
+        )
+        second = select_stratified_episode_seeds(
+            config, range(100), env=StratifiedResetEnv()
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first.seeds), 12)
+        self.assertEqual(first.candidates_examined, 13)
+        self.assertNotIn(0, first.seeds)
+        self.assertEqual(first.counts, {label: 2 for label in CANONICAL_V2_STRATA})
+
+    def test_canonical_v2_summary_balances_cells_and_tracks_budgets(self):
+        episodes = []
+        for index, label in enumerate(CANONICAL_V2_STRATA):
+            success = float(index < 3)
+            length = (25, 75, 150)[index] if success else 300
+            episodes.append(
+                EpisodeResult(
+                    episode=index,
+                    seed=index,
+                    episode_return=0.0,
+                    length=length,
+                    success=success,
+                    terminated=bool(success),
+                    truncated=not bool(success),
+                    stratum=label,
+                )
+            )
+
+        summary = summarize_results(episodes, CANONICAL_V2_COMPLETION_BUDGETS)
+        self.assertEqual(summary["balanced_success_rate"], 0.5)
+        self.assertEqual(summary["hard_success_rate"], 0.0)
+        self.assertAlmostEqual(summary["success_by_50"], 1 / 6)
+        self.assertAlmostEqual(summary["success_by_100"], 2 / 6)
+        self.assertAlmostEqual(summary["success_by_200"], 3 / 6)
+        self.assertAlmostEqual(summary["success_by_300"], 3 / 6)
+        self.assertNotIn("success_at_50", summary)
+        self.assertAlmostEqual(summary["balanced_success_auc"], 13 / 36)
 
     def test_cli_samples_episode_seeds_from_one_master_seed(self):
         with TemporaryDirectory() as temporary_dir:
@@ -137,6 +282,99 @@ class EvaluationRunnerTests(unittest.TestCase):
                 evaluate_from_args(args)
 
         self.assertEqual(agent.reset_seeds, sample_episode_seeds(7, 2))
+
+    def test_cli_wires_canonical_v2_suite_into_evaluation(self):
+        with TemporaryDirectory() as temporary_dir:
+            args = build_parser().parse_args(
+                [
+                    "--protocol",
+                    CANONICAL_V2,
+                    "--agent-type",
+                    "bc",
+                    "--checkpoint",
+                    "test.pt",
+                    "--episodes",
+                    "6",
+                    "--output-root",
+                    temporary_dir,
+                ]
+            )
+            suite = StratifiedEpisodeSuite(
+                seeds=tuple(range(6, 12)),
+                strata=CANONICAL_V2_STRATA,
+                candidates_examined=6,
+                counts={label: 1 for label in CANONICAL_V2_STRATA},
+            )
+
+            def evaluate_fake_env(agent, config, env=None):
+                self.assertIsNone(env)
+                return run_evaluation(agent, config, env=StratifiedResetEnv())
+
+            agent = ConstantAgent([0.0, 0.0])
+            with (
+                patch(
+                    "src.evaluation.evaluate_pusht.make_bc_evaluation_agent",
+                    return_value=agent,
+                ),
+                patch(
+                    "src.evaluation.evaluate_pusht.select_stratified_episode_seeds",
+                    return_value=suite,
+                ),
+                patch(
+                    "src.evaluation.evaluate_pusht.run_evaluation",
+                    side_effect=evaluate_fake_env,
+                ),
+            ):
+                result = evaluate_from_args(args)
+
+        self.assertEqual(result.config.protocol, CANONICAL_V2)
+        self.assertEqual(result.config.block_start_radius, 200.0)
+        self.assertEqual(result.config.episode_seeds, suite.seeds)
+        self.assertEqual(result.config.episode_strata, suite.strata)
+        self.assertIn("balanced_success_rate", result.summary)
+
+    def test_evaluation_prints_per_stratum_cumulative_success(self):
+        agent = ConstantAgent([0.0, 0.0])
+        agent.metadata = {"training_observation_resolution": 8}
+        config = PushTEvalConfig(
+            episodes=6,
+            episode_seeds=tuple(range(6, 12)),
+            episode_strata=CANONICAL_V2_STRATA,
+            observation_resolution=8,
+            distance_thresholds=CANONICAL_V2_DISTANCE_THRESHOLDS,
+            angle_thresholds=CANONICAL_V2_ANGLE_THRESHOLDS,
+            completion_budgets=(1, 3),
+        )
+
+        with patch("builtins.print") as print_line:
+            result = run_evaluation(agent, config, env=StratifiedResetEnv())
+
+        output = "\n".join(" ".join(map(str, call.args)) for call in print_line.call_args_list)
+        self.assertIn("Starting-stratum summary:", output)
+        self.assertIn("near_aligned:", output)
+        self.assertIn("far_misaligned:", output)
+        self.assertIn("success_by_3=1.000", output)
+        self.assertIn("success_by_3", result.strata[0])
+
+    def test_start_visualization_replays_exact_episode_seeds(self):
+        with TemporaryDirectory() as temporary_dir:
+            env = StartPoseRenderEnv()
+            output_path = Path(temporary_dir) / "start_locations.png"
+            result_path = write_start_location_visualization(
+                PushTEvalConfig(
+                    episodes=2,
+                    episode_seeds=(3, 9),
+                ),
+                output_path,
+                env=env,
+                resolution=128,
+            )
+
+            with Image.open(result_path) as image:
+                self.assertEqual(image.width, 128)
+                self.assertGreater(image.height, image.width)
+
+        self.assertEqual(env.reset_seeds, [3, 9])
 
     def test_cli_rejects_unknown_legacy_training_resolution(self):
         args = build_parser().parse_args(
@@ -504,7 +742,14 @@ class LatentChunkAgentTests(unittest.TestCase):
             torch.save(
                 {
                     "agent": {},
-                    "config": {**contract, "init_log_std": -2.0},
+                    "config": {
+                        **contract,
+                        "init_log_std": -2.0,
+                        "encoder_checkpoint": (
+                            "/home/training-machine/.stable_worldmodel/checkpoints/"
+                            "pusht/lewm_object.ckpt"
+                        ),
+                    },
                     "contract": contract,
                 },
                 checkpoint,
@@ -528,6 +773,52 @@ class LatentChunkAgentTests(unittest.TestCase):
             self.assertEqual(components.contract["latent_representation"], "projected")
             self.assertEqual(
                 load_encoder.call_args.kwargs["latent_representation"], "projected"
+            )
+            self.assertIsNone(load_encoder.call_args.kwargs["checkpoint_path"])
+
+    def test_ppo_loader_uses_explicit_encoder_checkpoint(self):
+        with TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            checkpoint = root / "ppo.pt"
+            encoder_checkpoint = root / "lewm_object.ckpt"
+            contract = {
+                "frame_stack": 1,
+                "frame_stride": 1,
+                "action_chunk_size": 1,
+                "latent_dim": 3,
+                "hidden_dim": 4,
+                "action_dim": 2,
+            }
+            torch.save(
+                {
+                    "agent": {},
+                    "config": {**contract, "init_log_std": -2.0},
+                    "contract": contract,
+                },
+                checkpoint,
+            )
+            frozen_encoder = MagicMock(spec=torch.nn.Module)
+            fake_agent = MagicMock(spec=torch.nn.Module)
+            fake_agent.load_state_dict.return_value = ([], [])
+            with (
+                patch(
+                    "src.evaluation.agents.LeWMEncoder.from_checkpoint",
+                    return_value=frozen_encoder,
+                ) as load_encoder,
+                patch(
+                    "src.evaluation.agents.build_latent_agent",
+                    return_value=fake_agent,
+                ),
+            ):
+                load_ppo_components(
+                    str(checkpoint),
+                    device="cpu",
+                    encoder_checkpoint=str(encoder_checkpoint),
+                )
+
+            self.assertEqual(
+                load_encoder.call_args.kwargs["checkpoint_path"],
+                str(encoder_checkpoint),
             )
 
 

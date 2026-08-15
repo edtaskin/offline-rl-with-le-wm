@@ -1,10 +1,17 @@
-"""Canonical PushT evaluator for BC and latent PPO checkpoints."""
+"""Canonical PushT evaluator for BC and latent PPO checkpoints.
+
+``canonical_v2`` balances initial block poses across translation/rotation
+strata and reports both success and completion-speed metrics. Their exact
+boundaries, formulas, and intended interpretation are documented in
+``src/evaluation/README.md``.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,9 +24,16 @@ from src.evaluation.baseline_agents import (
     make_state_bc_evaluation_agent,
 )
 from src.evaluation.pusht import (
+    CANONICAL_V1,
+    CANONICAL_V2,
+    CANONICAL_V2_ANGLE_THRESHOLDS,
+    CANONICAL_V2_COMPLETION_BUDGETS,
+    CANONICAL_V2_DISTANCE_THRESHOLDS,
     PushTEvalConfig,
     run_evaluation,
+    select_stratified_episode_seeds,
 )
+from src.evaluation.start_visualization import write_start_location_visualization
 
 
 MIN_EPISODE_SEED_GAP = 7
@@ -28,6 +42,15 @@ MAX_EPISODE_SEED = np.iinfo(np.int32).max
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Evaluate an agent on the canonical PushT env")
+    parser.add_argument(
+        "--protocol",
+        choices=[CANONICAL_V1, CANONICAL_V2],
+        default=CANONICAL_V1,
+        help=(
+            "canonical_v1 preserves the distribution-matched seed suite; "
+            "canonical_v2 balances six translation x rotation start strata"
+        ),
+    )
     parser.add_argument(
         "--agent-type",
         choices=["bc", "ppo", "bc-state", "bc-cnn"],
@@ -38,6 +61,14 @@ def build_parser():
         "--checkpoint",
         required=True,
         help="hf:// artifact reference or experimental local path outside checkpoints/",
+    )
+    parser.add_argument(
+        "--encoder-checkpoint",
+        default=None,
+        help=(
+            "explicit local LeWM object checkpoint for latent BC/PPO; "
+            "omitting it uses $STABLEWM_HOME/checkpoints/pusht/lewm_object.ckpt"
+        ),
     )
     parser.add_argument(
         "--stats",
@@ -111,6 +142,14 @@ def build_parser():
     parser.add_argument("--output-root", default="runs/evaluations")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--capture-traces", action="store_true")
+    parser.add_argument(
+        "--visualize-starts",
+        action="store_true",
+        help=(
+            "save start_locations.png with every deterministic block start, "
+            "orientation, difficulty stratum, and distance threshold"
+        ),
+    )
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="offline-rl-lewm")
     parser.add_argument("--wandb-entity", default=None)
@@ -198,6 +237,9 @@ def _write_metrics(result, run_dir):
         "video_dir": str(Path(run_dir) / "videos")
         if result.config.record_video
         else None,
+        "start_locations_path": str(Path(run_dir) / "start_locations.png")
+        if result.config.visualize_starts
+        else None,
     }
     with metrics_path.open("w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2, sort_keys=True)
@@ -211,7 +253,10 @@ def evaluate_from_args(args):
         raise ValueError("BC evaluation is deterministic; --stochastic is only valid for PPO")
     if args.stochastic and args.execution_mode == "temporal-ensemble":
         raise ValueError("temporal ensembling requires deterministic chunk predictions")
-    episode_seeds = sample_episode_seeds(args.seed, args.episodes)
+    if args.encoder_checkpoint is not None and args.agent_type not in {"bc", "ppo"}:
+        raise ValueError(
+            "--encoder-checkpoint is only valid for latent BC/PPO agents"
+        )
     agent_kwargs = {
         "checkpoint": args.checkpoint,
         "device": args.device,
@@ -220,13 +265,18 @@ def evaluate_from_args(args):
         "temporal_ensemble_decay": args.temporal_ensemble_decay,
     }
     if args.agent_type == "bc":
-        agent = make_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
+        agent = make_bc_evaluation_agent(
+            stats_path=args.stats,
+            encoder_checkpoint=args.encoder_checkpoint,
+            **agent_kwargs,
+        )
     elif args.agent_type == "bc-state":
         agent = make_state_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
     elif args.agent_type == "bc-cnn":
         agent = make_cnn_bc_evaluation_agent(stats_path=args.stats, **agent_kwargs)
     else:
         agent = make_ppo_evaluation_agent(
+            encoder_checkpoint=args.encoder_checkpoint,
             deterministic=not args.stochastic,
             **agent_kwargs,
         )
@@ -260,32 +310,79 @@ def evaluate_from_args(args):
             "Pass the model's training resolution, or use "
             "--allow-resolution-mismatch for an intentional transfer experiment."
         )
-    run_dir = create_run_directory(
-        args.output_root,
-        args.agent_type,
-        args.checkpoint,
-        run_name=args.run_name,
-    )
-    print(f"Evaluation run directory: {run_dir}")
+    block_start_radius = args.block_start_radius
+    if args.protocol == CANONICAL_V2:
+        if block_start_radius is None:
+            block_start_radius = 200.0
+        if not np.isclose(block_start_radius, 200.0):
+            raise ValueError(
+                "canonical_v2 is defined for --block-start-radius 200"
+            )
     config = PushTEvalConfig(
         env_id=args.env_id,
         episodes=args.episodes,
         seed=args.seed,
-        episode_seeds=tuple(episode_seeds),
+        protocol=args.protocol,
         max_episode_steps=args.max_episode_steps,
         observation_resolution=args.observation_resolution,
         fixed_target_pose=tuple(args.fixed_target_pose),
         fixed_target_block_success=args.fixed_target_block_success,
         fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
         agent_block_coef=args.agent_block_coef,
-        block_start_radius=args.block_start_radius,
+        block_start_radius=block_start_radius,
         record_video=args.video,
-        video_dir=str(run_dir / "videos"),
         video_fps=args.video_fps,
         video_resolution=args.video_resolution,
         capture_traces=args.capture_traces,
         allow_resolution_mismatch=args.allow_resolution_mismatch,
+        visualize_starts=args.visualize_starts,
+        distance_thresholds=(
+            CANONICAL_V2_DISTANCE_THRESHOLDS
+            if args.protocol == CANONICAL_V2
+            else ()
+        ),
+        angle_thresholds=(
+            CANONICAL_V2_ANGLE_THRESHOLDS
+            if args.protocol == CANONICAL_V2
+            else ()
+        ),
+        completion_budgets=(
+            CANONICAL_V2_COMPLETION_BUDGETS
+            if args.protocol == CANONICAL_V2
+            else ()
+        ),
     )
+    if args.protocol == CANONICAL_V2:
+        candidate_count = max(10_000, args.episodes * 200)
+        candidates = sample_episode_seeds(args.seed, candidate_count)
+        suite = select_stratified_episode_seeds(config, candidates)
+        config = replace(
+            config,
+            episode_seeds=suite.seeds,
+            episode_strata=suite.strata,
+        )
+        print(
+            "canonical_v2 suite | "
+            f"examined={suite.candidates_examined} | counts={suite.counts}"
+        )
+    else:
+        episode_seeds = sample_episode_seeds(args.seed, args.episodes)
+        config = replace(config, episode_seeds=tuple(episode_seeds))
+
+    run_dir = create_run_directory(
+        args.output_root,
+        args.agent_type,
+        args.checkpoint,
+        run_name=args.run_name,
+    )
+    config = replace(config, video_dir=str(run_dir / "videos"))
+    print(f"Evaluation run directory: {run_dir}")
+    if config.visualize_starts:
+        write_start_location_visualization(
+            config,
+            run_dir / "start_locations.png",
+        )
+    episode_seeds = config.episode_seeds or ()
     preview = ", ".join(str(seed) for seed in episode_seeds[:5])
     if len(episode_seeds) > 5:
         preview += ", ..."
