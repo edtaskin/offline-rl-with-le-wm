@@ -133,6 +133,32 @@ def test_block_start_reproducible_with_seed():
     env.close()
 
 
+def test_near_goal_reset_refreshes_fixed_target_metrics():
+    """Reset info describes the repositioned block, not the pre-wrapper state."""
+    if not _HAVE_ENV:
+        return
+    env = make_pusht_env(
+        render_obs=False,
+        align_sampled_goal_to_fixed_target=True,
+        block_start_near_goal=True,
+        block_start_radius=200.0,
+        resolution=96,
+    )
+    try:
+        _, info = env.reset(seed=17)
+        state = np.asarray(env.unwrapped._get_obs(), dtype=np.float64)
+        pos_dist = np.linalg.norm(state[2:4] - PUSHT_FIXED_TARGET_POSE[:2])
+        angle_delta = state[4] - PUSHT_FIXED_TARGET_POSE[2]
+        angle_dist = abs(np.arctan2(np.sin(angle_delta), np.cos(angle_delta)))
+        assert np.isclose(info["block_pos_dist"], pos_dist)
+        assert np.isclose(info["block_angle_dist"], angle_dist)
+        assert np.isclose(
+            info["block_state_dist"], np.linalg.norm([pos_dist, angle_dist])
+        )
+    finally:
+        env.close()
+
+
 def test_sparse_reward_is_binary_and_matches_success():
     """Sparse reward is in {0,1} and equals the success indicator each step."""
     if not _HAVE_ENV:

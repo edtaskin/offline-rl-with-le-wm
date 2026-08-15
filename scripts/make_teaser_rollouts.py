@@ -165,10 +165,9 @@ def build_parser():
 def build_agents(args):
     """Load both policies, sharing one frozen LeWM encoder.
 
-    Sharing is not only an optimization here: PPO checkpoints record the
-    ``encoder_checkpoint`` path of the machine they were trained on, which does
-    not exist on any other machine, and ``load_ppo_components`` would try to load
-    it. Handing it an encoder built from the local checkpoint skips that path.
+    Sharing avoids rebuilding the same frozen ViT. Evaluation resolves an
+    encoder from its explicit argument or the machine-local ``STABLEWM_HOME``;
+    a training-machine path retained in PPO metadata is never dereferenced.
     """
     bc_components = load_bc_components(args.bc_checkpoint, args.bc_stats, args.device)
     try:

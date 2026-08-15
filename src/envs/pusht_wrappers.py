@@ -379,7 +379,18 @@ class PushTBlockStartNearGoalWrapper(gym.Wrapper):
             "proprio": np.concatenate((state[:2], state[-2:])),
             "state": state,
         }
-        info = dict(info)
+        # The fixed-target wrapper computed its reset metrics before this outer
+        # wrapper moved the block. Refresh them so reset info describes the state
+        # the policy actually sees (canonical_v2 stratifies on these values).
+        wrapper = self.env
+        while hasattr(wrapper, "env") and not isinstance(
+            wrapper, PushTAlignSampledGoalToFixedTargetWrapper
+        ):
+            wrapper = wrapper.env
+        if isinstance(wrapper, PushTAlignSampledGoalToFixedTargetWrapper):
+            info = wrapper._augment_info(info)
+        else:
+            info = dict(info)
         info["green_t_center"] = goal_center
         info["block_pose"] = np.array(list(state[2:4]) + [state[4]])
         info["block_goal_dist"] = float(np.linalg.norm(block_center(env) - goal_center))

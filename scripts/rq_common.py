@@ -249,7 +249,8 @@ def read_selection_log(run_dir: Path) -> list[dict]:
 
 
 # ------------------------------------------------------------------- evaluation
-CANONICAL_EVAL = {
+CANONICAL_EVAL_V1 = {
+    "protocol": "canonical_v1",
     "episodes": 150,
     "seed": 42,
     "max_episode_steps": 300,
@@ -257,6 +258,15 @@ CANONICAL_EVAL = {
     # evaluation has to sample starts from the same distribution.
     "block_start_radius": 200.0,
 }
+
+# Opt-in until the existing RQ1 artifacts have been re-evaluated. Keeping the
+# historical alias on v1 prevents old result rows from silently changing their
+# benchmark definition when a campaign is resumed.
+CANONICAL_EVAL_V2 = {
+    **CANONICAL_EVAL_V1,
+    "protocol": "canonical_v2",
+}
+CANONICAL_EVAL = CANONICAL_EVAL_V1
 
 
 def canonical_eval_argv(
@@ -267,6 +277,8 @@ def canonical_eval_argv(
     run_name: str,
     stats: str | None = None,
     device: str = "auto",
+    encoder_checkpoint: str | Path | None = None,
+    protocol: str = CANONICAL_EVAL["protocol"],
     episodes: int = CANONICAL_EVAL["episodes"],
     seed: int = CANONICAL_EVAL["seed"],
     block_start_radius: float = CANONICAL_EVAL["block_start_radius"],
@@ -288,9 +300,12 @@ def canonical_eval_argv(
         "--output-root", str(output_root),
         "--run-name", run_name,
         "--device", device,
+        "--protocol", protocol,
     ]
     if stats:
         argv += ["--stats", str(stats)]
+    if encoder_checkpoint:
+        argv += ["--encoder-checkpoint", str(encoder_checkpoint)]
     return argv + list(extra)
 
 
@@ -306,6 +321,7 @@ def run_canonical_eval(*args, **kwargs):
 def evaluate_agent(
     agent,
     *,
+    protocol: str = CANONICAL_EVAL["protocol"],
     episodes: int = CANONICAL_EVAL["episodes"],
     seed: int = CANONICAL_EVAL["seed"],
     block_start_radius: float = CANONICAL_EVAL["block_start_radius"],
@@ -318,16 +334,48 @@ def evaluate_agent(
     minus argparse and the run-directory shell. Used where one encoder is
     amortized over many checkpoints (the budget curve).
     """
+    from dataclasses import replace
+
     from src.evaluation.evaluate_pusht import sample_episode_seeds
-    from src.evaluation.pusht import PushTEvalConfig, run_evaluation
+    from src.evaluation.pusht import (
+        CANONICAL_V2,
+        CANONICAL_V2_ANGLE_THRESHOLDS,
+        CANONICAL_V2_COMPLETION_BUDGETS,
+        CANONICAL_V2_DISTANCE_THRESHOLDS,
+        PushTEvalConfig,
+        run_evaluation,
+        select_stratified_episode_seeds,
+    )
 
     config = PushTEvalConfig(
         episodes=episodes,
         seed=seed,
-        episode_seeds=tuple(sample_episode_seeds(seed, episodes)),
+        protocol=protocol,
         max_episode_steps=max_episode_steps,
         block_start_radius=block_start_radius,
+        distance_thresholds=(
+            CANONICAL_V2_DISTANCE_THRESHOLDS if protocol == CANONICAL_V2 else ()
+        ),
+        angle_thresholds=(
+            CANONICAL_V2_ANGLE_THRESHOLDS if protocol == CANONICAL_V2 else ()
+        ),
+        completion_budgets=(
+            CANONICAL_V2_COMPLETION_BUDGETS if protocol == CANONICAL_V2 else ()
+        ),
     )
+    if protocol == CANONICAL_V2:
+        candidates = sample_episode_seeds(seed, max(10_000, episodes * 200))
+        suite = select_stratified_episode_seeds(config, candidates)
+        config = replace(
+            config,
+            episode_seeds=suite.seeds,
+            episode_strata=suite.strata,
+        )
+    else:
+        config = replace(
+            config,
+            episode_seeds=tuple(sample_episode_seeds(seed, episodes)),
+        )
     return run_evaluation(agent, config)
 
 
