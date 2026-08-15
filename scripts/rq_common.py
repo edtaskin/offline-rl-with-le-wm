@@ -266,6 +266,12 @@ CANONICAL_EVAL_V2 = {
     **CANONICAL_EVAL_V1,
     "protocol": "canonical_v2",
 }
+CANONICAL_EVAL_OOD = {
+    **CANONICAL_EVAL_V1,
+    "protocol": "canonical_ood",
+    "block_start_min_radius": 200.0,
+    "block_start_radius": 260.0,
+}
 CANONICAL_EVAL = CANONICAL_EVAL_V1
 
 
@@ -281,7 +287,8 @@ def canonical_eval_argv(
     protocol: str = CANONICAL_EVAL["protocol"],
     episodes: int = CANONICAL_EVAL["episodes"],
     seed: int = CANONICAL_EVAL["seed"],
-    block_start_radius: float = CANONICAL_EVAL["block_start_radius"],
+    block_start_radius: float | None = None,
+    block_start_min_radius: float | None = None,
     max_episode_steps: int = CANONICAL_EVAL["max_episode_steps"],
     extra: tuple[str, ...] = (),
 ) -> list[str]:
@@ -290,6 +297,15 @@ def canonical_eval_argv(
     Built as a literal argv (rather than a hand-made namespace) so that what the
     poster reports and what the documented command does cannot come apart.
     """
+    protocol_defaults = (
+        CANONICAL_EVAL_OOD
+        if protocol == CANONICAL_EVAL_OOD["protocol"]
+        else CANONICAL_EVAL
+    )
+    if block_start_radius is None:
+        block_start_radius = protocol_defaults["block_start_radius"]
+    if block_start_min_radius is None:
+        block_start_min_radius = protocol_defaults.get("block_start_min_radius", 0.0)
     argv = [
         "--agent-type", agent_type,
         "--checkpoint", str(checkpoint),
@@ -302,6 +318,8 @@ def canonical_eval_argv(
         "--device", device,
         "--protocol", protocol,
     ]
+    if block_start_min_radius > 0:
+        argv += ["--block-start-min-radius", str(block_start_min_radius)]
     if stats:
         argv += ["--stats", str(stats)]
     if encoder_checkpoint:
@@ -324,7 +342,8 @@ def evaluate_agent(
     protocol: str = CANONICAL_EVAL["protocol"],
     episodes: int = CANONICAL_EVAL["episodes"],
     seed: int = CANONICAL_EVAL["seed"],
-    block_start_radius: float = CANONICAL_EVAL["block_start_radius"],
+    block_start_radius: float | None = None,
+    block_start_min_radius: float | None = None,
     max_episode_steps: int = CANONICAL_EVAL["max_episode_steps"],
 ):
     """Canonical evaluation for an already-constructed evaluation agent.
@@ -338,6 +357,12 @@ def evaluate_agent(
 
     from src.evaluation.evaluate_pusht import sample_episode_seeds
     from src.evaluation.pusht import (
+        CANONICAL_OOD,
+        CANONICAL_OOD_ANGLE_THRESHOLDS,
+        CANONICAL_OOD_COMPLETION_BUDGETS,
+        CANONICAL_OOD_DISTANCE_THRESHOLDS,
+        CANONICAL_OOD_MAX_RADIUS,
+        CANONICAL_OOD_MIN_RADIUS,
         CANONICAL_V2,
         CANONICAL_V2_ANGLE_THRESHOLDS,
         CANONICAL_V2_COMPLETION_BUDGETS,
@@ -347,24 +372,47 @@ def evaluate_agent(
         select_stratified_episode_seeds,
     )
 
+    if block_start_radius is None:
+        block_start_radius = (
+            CANONICAL_OOD_MAX_RADIUS if protocol == CANONICAL_OOD else 200.0
+        )
+    if block_start_min_radius is None:
+        block_start_min_radius = (
+            CANONICAL_OOD_MIN_RADIUS if protocol == CANONICAL_OOD else 0.0
+        )
+
+    if protocol == CANONICAL_V2:
+        distance_thresholds = CANONICAL_V2_DISTANCE_THRESHOLDS
+        angle_thresholds = CANONICAL_V2_ANGLE_THRESHOLDS
+        completion_budgets = CANONICAL_V2_COMPLETION_BUDGETS
+    elif protocol == CANONICAL_OOD:
+        distance_thresholds = CANONICAL_OOD_DISTANCE_THRESHOLDS
+        angle_thresholds = CANONICAL_OOD_ANGLE_THRESHOLDS
+        completion_budgets = CANONICAL_OOD_COMPLETION_BUDGETS
+    else:
+        distance_thresholds = ()
+        angle_thresholds = ()
+        completion_budgets = ()
+
     config = PushTEvalConfig(
         episodes=episodes,
         seed=seed,
         protocol=protocol,
         max_episode_steps=max_episode_steps,
         block_start_radius=block_start_radius,
-        distance_thresholds=(
-            CANONICAL_V2_DISTANCE_THRESHOLDS if protocol == CANONICAL_V2 else ()
-        ),
-        angle_thresholds=(
-            CANONICAL_V2_ANGLE_THRESHOLDS if protocol == CANONICAL_V2 else ()
-        ),
-        completion_budgets=(
-            CANONICAL_V2_COMPLETION_BUDGETS if protocol == CANONICAL_V2 else ()
-        ),
+        block_start_min_radius=block_start_min_radius,
+        block_start_clip_out_of_bounds=protocol != CANONICAL_OOD,
+        distance_thresholds=distance_thresholds,
+        angle_thresholds=angle_thresholds,
+        completion_budgets=completion_budgets,
     )
-    if protocol == CANONICAL_V2:
-        candidates = sample_episode_seeds(seed, max(10_000, episodes * 200))
+    if protocol in {CANONICAL_V2, CANONICAL_OOD}:
+        candidates = sample_episode_seeds(
+            seed,
+            max(30_000, episodes * 400)
+            if protocol == CANONICAL_OOD
+            else max(10_000, episodes * 200),
+        )
         suite = select_stratified_episode_seeds(config, candidates)
         config = replace(
             config,

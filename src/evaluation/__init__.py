@@ -1,4 +1,11 @@
 from src.evaluation.pusht import (
+    CANONICAL_OOD,
+    CANONICAL_OOD_ANGLE_THRESHOLDS,
+    CANONICAL_OOD_COMPLETION_BUDGETS,
+    CANONICAL_OOD_DISTANCE_THRESHOLDS,
+    CANONICAL_OOD_MAX_RADIUS,
+    CANONICAL_OOD_MIN_RADIUS,
+    CANONICAL_OOD_STRATA,
     CANONICAL_V1,
     CANONICAL_V2,
     CANONICAL_V2_ANGLE_THRESHOLDS,
@@ -13,6 +20,7 @@ from src.evaluation.pusht import (
     aggregate_evaluation_results,
     difficulty_stratum,
     make_repeat_seeds,
+    protocol_strata,
     run_evaluation,
     run_repeated_evaluation,
     select_stratified_episode_seeds,
@@ -20,6 +28,13 @@ from src.evaluation.pusht import (
 )
 
 __all__ = [
+    "CANONICAL_OOD",
+    "CANONICAL_OOD_ANGLE_THRESHOLDS",
+    "CANONICAL_OOD_COMPLETION_BUDGETS",
+    "CANONICAL_OOD_DISTANCE_THRESHOLDS",
+    "CANONICAL_OOD_MAX_RADIUS",
+    "CANONICAL_OOD_MIN_RADIUS",
+    "CANONICAL_OOD_STRATA",
     "CANONICAL_V1",
     "CANONICAL_V2",
     "CANONICAL_V2_ANGLE_THRESHOLDS",
@@ -34,6 +49,7 @@ __all__ = [
     "aggregate_evaluation_results",
     "difficulty_stratum",
     "make_repeat_seeds",
+    "protocol_strata",
     "run_evaluation",
     "run_repeated_evaluation",
     "select_stratified_episode_seeds",

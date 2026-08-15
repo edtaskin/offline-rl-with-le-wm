@@ -16,10 +16,13 @@ from src.envs.pusht_wrappers import (
     green_t_center,
 )
 from src.evaluation.pusht import (
+    CANONICAL_OOD,
+    CANONICAL_OOD_STRATA,
     CANONICAL_V2_STRATA,
     PushTEvalConfig,
     difficulty_stratum,
     make_evaluation_env,
+    protocol_strata,
     scalar_metrics,
 )
 
@@ -34,6 +37,28 @@ _STRATUM_COLORS = {
     "far_aligned": (204, 121, 167),
     "far_misaligned": (213, 94, 0),
     _UNSTRATIFIED: (0, 114, 178),
+}
+_STRATUM_COLORS.update(
+    {
+        ood_label: _STRATUM_COLORS[v2_label]
+        for v2_label, ood_label in zip(CANONICAL_V2_STRATA, CANONICAL_OOD_STRATA)
+    }
+)
+_STRATUM_DISPLAY_LABELS = {
+    label: label for label in CANONICAL_V2_STRATA
+} | {
+    label: f"OOD {lower}–{upper}px, {angle}"
+    for label, (lower, upper, angle) in zip(
+        CANONICAL_OOD_STRATA,
+        (
+            (200, 220, "aligned"),
+            (200, 220, "misaligned"),
+            (220, 240, "aligned"),
+            (220, 240, "misaligned"),
+            (240, 260, "aligned"),
+            (240, 260, "misaligned"),
+        ),
+    )
 }
 
 
@@ -84,6 +109,7 @@ def _stratum_from_reset(config, info, expected: str | None) -> str:
             scalar_metrics(info),
             config.distance_thresholds,
             config.angle_thresholds,
+            protocol_strata(config.protocol),
         )
         if expected is not None and observed != expected:
             raise RuntimeError(
@@ -170,10 +196,13 @@ def write_start_location_visualization(
 
     header_height = 48
     observed_labels = {record[2] for record in records}
-    labels = [label for label in CANONICAL_V2_STRATA if label in observed_labels]
+    labels = [
+        label for label in protocol_strata(config.protocol) if label in observed_labels
+    ]
     if not labels:
         labels = [_UNSTRATIFIED]
-    legend_rows = (len(labels) + 1) // 2
+    legend_columns = 1 if config.protocol == CANONICAL_OOD else 2
+    legend_rows = (len(labels) + legend_columns - 1) // legend_columns
     footer_height = 66 + legend_rows * 26
     canvas = Image.new("RGB", (resolution, header_height + resolution + footer_height), "white")
     canvas.paste(background_image, (0, header_height))
@@ -184,10 +213,18 @@ def write_start_location_visualization(
         fill=(20, 20, 20),
         font=_font(22),
     )
+    workspace_overlay = Image.new(
+        "RGBA", (resolution, resolution), (0, 0, 0, 0)
+    )
+    workspace_draw = ImageDraw.Draw(workspace_overlay)
 
     goal_xy = _world_to_image(goal_center_xy, resolution)
     scale = resolution / float(PUSHT_WORKSPACE_HIGH[0] - PUSHT_WORKSPACE_LOW[0])
     ring_specs = [(float(radius), False) for radius in config.distance_thresholds]
+    if config.block_start_min_radius > 0 and not any(
+        np.isclose(config.block_start_min_radius, radius) for radius, _ in ring_specs
+    ):
+        ring_specs.append((float(config.block_start_min_radius), True))
     if config.block_start_radius is not None and not any(
         np.isclose(config.block_start_radius, radius) for radius, _ in ring_specs
     ):
@@ -196,11 +233,11 @@ def write_start_location_visualization(
         radius_px = float(radius) * scale
         bounds = (
             goal_xy[0] - radius_px,
-            header_height + goal_xy[1] - radius_px,
+            goal_xy[1] - radius_px,
             goal_xy[0] + radius_px,
-            header_height + goal_xy[1] + radius_px,
+            goal_xy[1] + radius_px,
         )
-        draw.ellipse(
+        workspace_draw.ellipse(
             bounds,
             outline=(25, 25, 25) if is_cap else (90, 90, 90),
             width=3 if is_cap else 2,
@@ -210,25 +247,24 @@ def write_start_location_visualization(
     ray_length = max(9, int(round(resolution / 45)))
     for _, pose, label in records:
         x, y = _world_to_image(pose[:2], resolution)
-        y += header_height
         color = _STRATUM_COLORS[label]
         cross_lines = (
             (x - cross_radius, y - cross_radius, x + cross_radius, y + cross_radius),
             (x - cross_radius, y + cross_radius, x + cross_radius, y - cross_radius),
         )
         for line in cross_lines:
-            draw.line(line, fill=(20, 20, 20), width=5)
-            draw.line(line, fill=color, width=3)
+            workspace_draw.line(line, fill=(20, 20, 20), width=5)
+            workspace_draw.line(line, fill=color, width=3)
         endpoint = (
             x + ray_length * float(np.cos(pose[2])),
             y + ray_length * float(np.sin(pose[2])),
         )
-        draw.line((x, y, *endpoint), fill=(20, 20, 20), width=4)
-        draw.line((x, y, *endpoint), fill=color, width=2)
+        workspace_draw.line((x, y, *endpoint), fill=(20, 20, 20), width=4)
+        workspace_draw.line((x, y, *endpoint), fill=color, width=2)
 
-    goal_x, goal_y = goal_xy[0], header_height + goal_xy[1]
+    goal_x, goal_y = goal_xy
     goal_radius = max(6, int(round(resolution / 64)))
-    draw.ellipse(
+    workspace_draw.ellipse(
         (
             goal_x - goal_radius,
             goal_y - goal_radius,
@@ -239,12 +275,16 @@ def write_start_location_visualization(
         outline=(20, 20, 20),
         width=3,
     )
-    draw.text(
+    workspace_draw.text(
         (goal_x + goal_radius + 4, goal_y - goal_radius),
         "goal",
         fill=(20, 20, 20),
         font=_font(12),
     )
+    plotted_workspace = Image.alpha_composite(
+        background_image.convert("RGBA"), workspace_overlay
+    ).convert("RGB")
+    canvas.paste(plotted_workspace, (0, header_height))
 
     counts = Counter(label for _, _, label in records)
     footer_y = header_height + resolution + 8
@@ -253,7 +293,12 @@ def write_start_location_visualization(
     draw.text((12, footer_y), detail, fill=(35, 35, 35), font=_font(13))
     if threshold_text:
         ring_text = f"rings = {threshold_text}px strata"
-        if config.block_start_radius is not None:
+        if config.block_start_min_radius > 0 and config.block_start_radius is not None:
+            ring_text += (
+                f"; bounds = {int(config.block_start_min_radius)}-"
+                f"{int(config.block_start_radius)}px annulus"
+            )
+        elif config.block_start_radius is not None:
             ring_text += f"; outer = {int(config.block_start_radius)}px sampling cap"
         draw.text(
             (12, footer_y + 18),
@@ -262,16 +307,16 @@ def write_start_location_visualization(
             font=_font(13),
         )
     for index, label in enumerate(labels):
-        column = index % 2
-        row = index // 2
-        x = 12 + column * (resolution // 2)
+        column = index % legend_columns
+        row = index // legend_columns
+        x = 12 + column * (resolution // legend_columns)
         y = footer_y + 45 + row * 26
         color = _STRATUM_COLORS[label]
         draw.line((x, y + 7, x + 16, y + 7), fill=(20, 20, 20), width=7)
         draw.line((x, y + 7, x + 16, y + 7), fill=color, width=5)
         draw.text(
             (x + 24, y),
-            f"{label} (n={counts[label]})",
+            f"{_STRATUM_DISPLAY_LABELS.get(label, label)} (n={counts[label]})",
             fill=(25, 25, 25),
             font=_font(14),
         )

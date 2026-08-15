@@ -1,9 +1,10 @@
 """Canonical PushT evaluator for BC and latent PPO checkpoints.
 
-``canonical_v2`` balances initial block poses across translation/rotation
-strata and reports both success and completion-speed metrics. Their exact
-boundaries, formulas, and intended interpretation are documented in
-``src/evaluation/README.md``.
+``canonical_v2`` balances in-support initial block poses across
+translation/rotation strata. ``canonical_ood`` applies the same evaluation
+logic to a feasible 200--260 px annulus outside the training start radius.
+Their exact boundaries, formulas, and intended interpretation are documented
+in ``src/evaluation/README.md``.
 """
 
 from __future__ import annotations
@@ -24,6 +25,12 @@ from src.evaluation.baseline_agents import (
     make_state_bc_evaluation_agent,
 )
 from src.evaluation.pusht import (
+    CANONICAL_OOD,
+    CANONICAL_OOD_ANGLE_THRESHOLDS,
+    CANONICAL_OOD_COMPLETION_BUDGETS,
+    CANONICAL_OOD_DISTANCE_THRESHOLDS,
+    CANONICAL_OOD_MAX_RADIUS,
+    CANONICAL_OOD_MIN_RADIUS,
     CANONICAL_V1,
     CANONICAL_V2,
     CANONICAL_V2_ANGLE_THRESHOLDS,
@@ -44,11 +51,12 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Evaluate an agent on the canonical PushT env")
     parser.add_argument(
         "--protocol",
-        choices=[CANONICAL_V1, CANONICAL_V2],
+        choices=[CANONICAL_V1, CANONICAL_V2, CANONICAL_OOD],
         default=CANONICAL_V1,
         help=(
             "canonical_v1 preserves the distribution-matched seed suite; "
-            "canonical_v2 balances six translation x rotation start strata"
+            "canonical_v2 balances six in-support start strata; canonical_ood "
+            "balances six feasible strata in the 200-260px centroid annulus"
         ),
     )
     parser.add_argument(
@@ -135,6 +143,15 @@ def build_parser():
         type=float,
         default=None,
         help="sample block starts within this goal radius; omit for unrestricted starts",
+    )
+    parser.add_argument(
+        "--block-start-min-radius",
+        type=float,
+        default=None,
+        help=(
+            "optional inner centroid radius; canonical_ood fixes this at 200 "
+            "and samples an annulus rather than a disk"
+        ),
     )
     parser.add_argument("--video", action="store_true")
     parser.add_argument("--video-fps", type=int, default=10)
@@ -311,13 +328,39 @@ def evaluate_from_args(args):
             "--allow-resolution-mismatch for an intentional transfer experiment."
         )
     block_start_radius = args.block_start_radius
+    block_start_min_radius = args.block_start_min_radius
+    block_start_clip_out_of_bounds = True
     if args.protocol == CANONICAL_V2:
         if block_start_radius is None:
             block_start_radius = 200.0
+        if block_start_min_radius is None:
+            block_start_min_radius = 0.0
         if not np.isclose(block_start_radius, 200.0):
             raise ValueError(
                 "canonical_v2 is defined for --block-start-radius 200"
             )
+    elif args.protocol == CANONICAL_OOD:
+        if block_start_radius is None:
+            block_start_radius = CANONICAL_OOD_MAX_RADIUS
+        if block_start_min_radius is None:
+            block_start_min_radius = CANONICAL_OOD_MIN_RADIUS
+        block_start_clip_out_of_bounds = False
+    elif block_start_min_radius is None:
+        block_start_min_radius = 0.0
+
+    if args.protocol == CANONICAL_V2:
+        distance_thresholds = CANONICAL_V2_DISTANCE_THRESHOLDS
+        angle_thresholds = CANONICAL_V2_ANGLE_THRESHOLDS
+        completion_budgets = CANONICAL_V2_COMPLETION_BUDGETS
+    elif args.protocol == CANONICAL_OOD:
+        distance_thresholds = CANONICAL_OOD_DISTANCE_THRESHOLDS
+        angle_thresholds = CANONICAL_OOD_ANGLE_THRESHOLDS
+        completion_budgets = CANONICAL_OOD_COMPLETION_BUDGETS
+    else:
+        distance_thresholds = ()
+        angle_thresholds = ()
+        completion_budgets = ()
+
     config = PushTEvalConfig(
         env_id=args.env_id,
         episodes=args.episodes,
@@ -330,30 +373,24 @@ def evaluate_from_args(args):
         fixed_target_max_reset_attempts=args.fixed_target_max_reset_attempts,
         agent_block_coef=args.agent_block_coef,
         block_start_radius=block_start_radius,
+        block_start_min_radius=block_start_min_radius,
+        block_start_clip_out_of_bounds=block_start_clip_out_of_bounds,
         record_video=args.video,
         video_fps=args.video_fps,
         video_resolution=args.video_resolution,
         capture_traces=args.capture_traces,
         allow_resolution_mismatch=args.allow_resolution_mismatch,
         visualize_starts=args.visualize_starts,
-        distance_thresholds=(
-            CANONICAL_V2_DISTANCE_THRESHOLDS
-            if args.protocol == CANONICAL_V2
-            else ()
-        ),
-        angle_thresholds=(
-            CANONICAL_V2_ANGLE_THRESHOLDS
-            if args.protocol == CANONICAL_V2
-            else ()
-        ),
-        completion_budgets=(
-            CANONICAL_V2_COMPLETION_BUDGETS
-            if args.protocol == CANONICAL_V2
-            else ()
-        ),
+        distance_thresholds=distance_thresholds,
+        angle_thresholds=angle_thresholds,
+        completion_budgets=completion_budgets,
     )
-    if args.protocol == CANONICAL_V2:
-        candidate_count = max(10_000, args.episodes * 200)
+    if args.protocol in {CANONICAL_V2, CANONICAL_OOD}:
+        candidate_count = (
+            max(30_000, args.episodes * 400)
+            if args.protocol == CANONICAL_OOD
+            else max(10_000, args.episodes * 200)
+        )
         candidates = sample_episode_seeds(args.seed, candidate_count)
         suite = select_stratified_episode_seeds(config, candidates)
         config = replace(
@@ -362,7 +399,7 @@ def evaluate_from_args(args):
             episode_strata=suite.strata,
         )
         print(
-            "canonical_v2 suite | "
+            f"{args.protocol} suite | "
             f"examined={suite.candidates_examined} | counts={suite.counts}"
         )
     else:

@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -7,6 +8,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 from PIL import Image
+
+from scripts.rq_common import CANONICAL_EVAL_OOD, canonical_eval_argv
 
 from src.bc.models.policy.latent_bc_policy import LatentBCPolicy
 from src.evaluation.agents import (
@@ -24,6 +27,13 @@ from src.evaluation.evaluate_pusht import (
     sample_episode_seeds,
 )
 from src.evaluation.pusht import (
+    CANONICAL_OOD,
+    CANONICAL_OOD_ANGLE_THRESHOLDS,
+    CANONICAL_OOD_COMPLETION_BUDGETS,
+    CANONICAL_OOD_DISTANCE_THRESHOLDS,
+    CANONICAL_OOD_MAX_RADIUS,
+    CANONICAL_OOD_MIN_RADIUS,
+    CANONICAL_OOD_STRATA,
     CANONICAL_V1,
     CANONICAL_V2,
     CANONICAL_V2_ANGLE_THRESHOLDS,
@@ -40,6 +50,7 @@ from src.evaluation.pusht import (
     run_repeated_evaluation,
     select_stratified_episode_seeds,
     stratified_episode_quotas,
+    summarize_strata,
     summarize_results,
 )
 from src.evaluation.start_visualization import write_start_location_visualization
@@ -91,6 +102,27 @@ class StratifiedResetEnv(FakePushTEnv):
             "agent_block_dist": 50.0,
             "success": float(int(seed or 0) == 0),
         }
+
+
+class OODStratifiedResetEnv(StratifiedResetEnv):
+    STARTS = (
+        (210.0, 0.1),
+        (210.0, 1.0),
+        (230.0, 0.1),
+        (230.0, 1.0),
+        (250.0, 0.1),
+        (250.0, 1.0),
+    )
+
+
+class OODBoundaryResetEnv(OODStratifiedResetEnv):
+    """Fixture with one post-reset start just inside the training-support disk."""
+
+    def reset(self, seed=None, options=None):
+        observation, info = super().reset(seed=seed, options=options)
+        if int(seed or 0) == 6:
+            info["block_goal_dist"] = 199.9
+        return observation, info
 
 
 class StartPoseRenderEnv:
@@ -145,6 +177,10 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertEqual(parser.get_default("episodes"), 150)
         self.assertEqual(parser.get_default("seed"), 42)
         self.assertEqual(parser.get_default("protocol"), CANONICAL_V1)
+        protocol_action = next(
+            action for action in parser._actions if action.dest == "protocol"
+        )
+        self.assertIn(CANONICAL_OOD, protocol_action.choices)
         self.assertNotIn("repeats", {action.dest for action in parser._actions})
         self.assertNotIn("seed_stride", {action.dest for action in parser._actions})
         self.assertEqual(
@@ -152,6 +188,20 @@ class EvaluationRunnerTests(unittest.TestCase):
         )
         self.assertIsNone(parser.get_default("encoder_checkpoint"))
         self.assertFalse(parser.get_default("visualize_starts"))
+
+    def test_rq_helper_wires_canonical_ood_defaults(self):
+        argv = canonical_eval_argv(
+            "ppo",
+            "checkpoint.pt",
+            output_root="runs/test",
+            run_name="ood-test",
+            protocol=CANONICAL_EVAL_OOD["protocol"],
+        )
+        args = build_parser().parse_args(argv)
+
+        self.assertEqual(args.protocol, CANONICAL_OOD)
+        self.assertEqual(args.block_start_min_radius, 200.0)
+        self.assertEqual(args.block_start_radius, 260.0)
 
     def test_sampled_episode_seeds_are_reproducible_unique_and_well_separated(self):
         seeds = sample_episode_seeds(42, 150)
@@ -185,6 +235,19 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertEqual(stratified_episode_quotas(150), {
             label: 25 for label in CANONICAL_V2_STRATA
         })
+        self.assertEqual(
+            difficulty_stratum(
+                {"block_goal_dist": 230.0, "block_angle_dist": 1.0},
+                CANONICAL_OOD_DISTANCE_THRESHOLDS,
+                CANONICAL_OOD_ANGLE_THRESHOLDS,
+                CANONICAL_OOD_STRATA,
+            ),
+            "ood_220_240_misaligned",
+        )
+        self.assertEqual(
+            stratified_episode_quotas(150, CANONICAL_OOD_STRATA),
+            {label: 25 for label in CANONICAL_OOD_STRATA},
+        )
 
     def test_canonical_v2_rejects_an_incompatible_environment_contract(self):
         with self.assertRaisesRegex(ValueError, "fixed_target_block_success"):
@@ -196,6 +259,20 @@ class EvaluationRunnerTests(unittest.TestCase):
                 angle_thresholds=CANONICAL_V2_ANGLE_THRESHOLDS,
                 completion_budgets=CANONICAL_V2_COMPLETION_BUDGETS,
             ).validate()
+
+    def test_canonical_ood_requires_an_unclipped_200_to_260_annulus(self):
+        config = PushTEvalConfig(
+            protocol=CANONICAL_OOD,
+            block_start_min_radius=CANONICAL_OOD_MIN_RADIUS,
+            block_start_radius=CANONICAL_OOD_MAX_RADIUS,
+            block_start_clip_out_of_bounds=False,
+            distance_thresholds=CANONICAL_OOD_DISTANCE_THRESHOLDS,
+            angle_thresholds=CANONICAL_OOD_ANGLE_THRESHOLDS,
+            completion_budgets=CANONICAL_OOD_COMPLETION_BUDGETS,
+        )
+        config.validate()
+        with self.assertRaisesRegex(ValueError, "unclipped annulus"):
+            replace(config, block_start_clip_out_of_bounds=True).validate()
 
     def test_canonical_v2_selects_a_fixed_balanced_seed_suite(self):
         config = PushTEvalConfig(
@@ -218,6 +295,67 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertEqual(first.candidates_examined, 13)
         self.assertNotIn(0, first.seeds)
         self.assertEqual(first.counts, {label: 2 for label in CANONICAL_V2_STRATA})
+
+    def test_canonical_ood_selects_a_fixed_balanced_seed_suite(self):
+        config = PushTEvalConfig(
+            protocol=CANONICAL_OOD,
+            episodes=12,
+            block_start_min_radius=CANONICAL_OOD_MIN_RADIUS,
+            block_start_radius=CANONICAL_OOD_MAX_RADIUS,
+            block_start_clip_out_of_bounds=False,
+            distance_thresholds=CANONICAL_OOD_DISTANCE_THRESHOLDS,
+            angle_thresholds=CANONICAL_OOD_ANGLE_THRESHOLDS,
+            completion_budgets=CANONICAL_OOD_COMPLETION_BUDGETS,
+        )
+        suite = select_stratified_episode_seeds(
+            config, range(100), env=OODStratifiedResetEnv()
+        )
+
+        self.assertEqual(len(suite.seeds), 12)
+        self.assertEqual(suite.candidates_examined, 13)
+        self.assertNotIn(0, suite.seeds)
+        self.assertEqual(suite.counts, {label: 2 for label in CANONICAL_OOD_STRATA})
+
+    def test_canonical_ood_rejects_post_reset_drift_outside_annulus(self):
+        config = PushTEvalConfig(
+            protocol=CANONICAL_OOD,
+            episodes=6,
+            block_start_min_radius=CANONICAL_OOD_MIN_RADIUS,
+            block_start_radius=CANONICAL_OOD_MAX_RADIUS,
+            block_start_clip_out_of_bounds=False,
+            distance_thresholds=CANONICAL_OOD_DISTANCE_THRESHOLDS,
+            angle_thresholds=CANONICAL_OOD_ANGLE_THRESHOLDS,
+            completion_budgets=CANONICAL_OOD_COMPLETION_BUDGETS,
+        )
+        suite = select_stratified_episode_seeds(
+            config, range(100), env=OODBoundaryResetEnv()
+        )
+
+        self.assertNotIn(6, suite.seeds)
+        self.assertEqual(suite.candidates_examined, 13)
+
+    def test_canonical_ood_summary_uses_protocol_specific_hard_stratum(self):
+        episodes = [
+            EpisodeResult(
+                episode=index,
+                seed=index,
+                episode_return=0.0,
+                length=300,
+                success=float(index < 5),
+                terminated=bool(index < 5),
+                truncated=not bool(index < 5),
+                stratum=label,
+            )
+            for index, label in enumerate(CANONICAL_OOD_STRATA)
+        ]
+
+        summary = summarize_results(episodes, CANONICAL_OOD_COMPLETION_BUDGETS)
+
+        self.assertEqual(summary["hard_success_rate"], 0.0)
+        self.assertEqual(
+            [row["stratum"] for row in summarize_strata(episodes)],
+            list(CANONICAL_OOD_STRATA),
+        )
 
     def test_canonical_v2_summary_balances_cells_and_tracks_budgets(self):
         episodes = []
@@ -333,6 +471,59 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertEqual(result.config.episode_strata, suite.strata)
         self.assertIn("balanced_success_rate", result.summary)
 
+    def test_cli_wires_canonical_ood_annulus_into_evaluation(self):
+        with TemporaryDirectory() as temporary_dir:
+            args = build_parser().parse_args(
+                [
+                    "--protocol",
+                    CANONICAL_OOD,
+                    "--agent-type",
+                    "bc",
+                    "--checkpoint",
+                    "test.pt",
+                    "--episodes",
+                    "6",
+                    "--output-root",
+                    temporary_dir,
+                ]
+            )
+            suite = StratifiedEpisodeSuite(
+                seeds=tuple(range(6, 12)),
+                strata=CANONICAL_OOD_STRATA,
+                candidates_examined=6,
+                counts={label: 1 for label in CANONICAL_OOD_STRATA},
+            )
+
+            def evaluate_fake_env(agent, config, env=None):
+                self.assertIsNone(env)
+                return run_evaluation(agent, config, env=OODStratifiedResetEnv())
+
+            agent = ConstantAgent([0.0, 0.0])
+            with (
+                patch(
+                    "src.evaluation.evaluate_pusht.make_bc_evaluation_agent",
+                    return_value=agent,
+                ),
+                patch(
+                    "src.evaluation.evaluate_pusht.select_stratified_episode_seeds",
+                    return_value=suite,
+                ),
+                patch(
+                    "src.evaluation.evaluate_pusht.run_evaluation",
+                    side_effect=evaluate_fake_env,
+                ),
+            ):
+                result = evaluate_from_args(args)
+
+        self.assertEqual(result.config.protocol, CANONICAL_OOD)
+        self.assertEqual(result.config.block_start_min_radius, 200.0)
+        self.assertEqual(result.config.block_start_radius, 260.0)
+        self.assertFalse(result.config.block_start_clip_out_of_bounds)
+        self.assertEqual(
+            result.config.distance_thresholds,
+            CANONICAL_OOD_DISTANCE_THRESHOLDS,
+        )
+
     def test_evaluation_prints_per_stratum_cumulative_success(self):
         agent = ConstantAgent([0.0, 0.0])
         agent.metadata = {"training_observation_resolution": 8}
@@ -375,6 +566,29 @@ class EvaluationRunnerTests(unittest.TestCase):
                 self.assertGreater(image.height, image.width)
 
         self.assertEqual(env.reset_seeds, [3, 9])
+
+    def test_start_visualization_clips_sampling_rings_to_workspace(self):
+        with TemporaryDirectory() as temporary_dir:
+            plain_path = Path(temporary_dir) / "plain.png"
+            ring_path = Path(temporary_dir) / "ring.png"
+            base_config = PushTEvalConfig(episodes=2, episode_seeds=(3, 9))
+            write_start_location_visualization(
+                base_config,
+                plain_path,
+                env=StartPoseRenderEnv(),
+                resolution=128,
+            )
+            write_start_location_visualization(
+                replace(base_config, block_start_radius=260.0),
+                ring_path,
+                env=StartPoseRenderEnv(),
+                resolution=128,
+            )
+
+            with Image.open(plain_path) as plain, Image.open(ring_path) as ring:
+                plain_header = np.asarray(plain)[:48]
+                ring_header = np.asarray(ring)[:48]
+                self.assertTrue(np.array_equal(plain_header, ring_header))
 
     def test_cli_rejects_unknown_legacy_training_resolution(self):
         args = build_parser().parse_args(
@@ -535,6 +749,28 @@ class EvaluationRunnerTests(unittest.TestCase):
             kwargs = make_env.call_args.kwargs
             self.assertTrue(kwargs["align_sampled_goal_to_fixed_target"])
             self.assertFalse(kwargs["block_start_near_goal"])
+        finally:
+            env.close()
+
+    @patch("src.evaluation.pusht.make_pusht_env")
+    def test_canonical_ood_env_uses_unclipped_annulus(self, make_env):
+        make_env.return_value = FakePushTEnv()
+        config = PushTEvalConfig(
+            protocol=CANONICAL_OOD,
+            block_start_min_radius=CANONICAL_OOD_MIN_RADIUS,
+            block_start_radius=CANONICAL_OOD_MAX_RADIUS,
+            block_start_clip_out_of_bounds=False,
+            distance_thresholds=CANONICAL_OOD_DISTANCE_THRESHOLDS,
+            angle_thresholds=CANONICAL_OOD_ANGLE_THRESHOLDS,
+            completion_budgets=CANONICAL_OOD_COMPLETION_BUDGETS,
+        )
+        env = make_evaluation_env(config)
+        try:
+            kwargs = make_env.call_args.kwargs
+            self.assertTrue(kwargs["block_start_near_goal"])
+            self.assertEqual(kwargs["block_start_min_radius"], 200.0)
+            self.assertEqual(kwargs["block_start_radius"], 260.0)
+            self.assertFalse(kwargs["block_start_clip_out_of_bounds"])
         finally:
             env.close()
 
